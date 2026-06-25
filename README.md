@@ -202,7 +202,7 @@ gl-portable-backup/
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [GNU General Public License v3.0 or later](LICENSE).
 
 ## Author
 

@@ -7,6 +7,7 @@
 
 /* GL Portable Backup
  * Copyright (c) 2026 RemoteToHome Consulting — https://remotetohome.io
+ * Licensed under the GNU General Public License v3.0 or later.
  */
 
 var BACKEND = '/usr/sbin/gl-portable-backup';

@@ -7,7 +7,7 @@ LUCI_PKGARCH:=all
 PKGARCH:=all
 
 PKG_MAINTAINER:=RemoteToHome Consulting <https://remotetohome.io>
-PKG_LICENSE:=Apache-2.0
+PKG_LICENSE:=GPL-3.0-or-later
 
 include $(TOPDIR)/feeds/luci/luci.mk
 

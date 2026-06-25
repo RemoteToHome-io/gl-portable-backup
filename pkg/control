@@ -5,6 +5,6 @@ Source: luci-app-gl-portable-backup
 Section: luci
 Architecture: all
 Maintainer: RemoteToHome Consulting <https://remotetohome.io>
-License: Apache-2.0
+License: GPL-3.0-or-later
 Installed-Size: {{ISIZE}}
 Description: Portable configuration backup and restore for GL.iNet routers
