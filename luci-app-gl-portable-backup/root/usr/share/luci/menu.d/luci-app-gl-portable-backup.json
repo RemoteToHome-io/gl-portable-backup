@@ -1,0 +1,14 @@
+{
+	"admin/system/gl-portable-backup": {
+		"title": "GL Portable Backup",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "gl-portable-backup/backup"
+		},
+		"depends": {
+			"acl": [ "luci-app-gl-portable-backup" ],
+			"uci": { "network": true }
+		}
+	}
+}

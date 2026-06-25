@@ -1,0 +1,33 @@
+{
+	"luci-app-gl-portable-backup": {
+		"description": "Grant access to GL Portable Backup",
+		"read": {
+			"file": {
+				"/usr/sbin/gl-portable-backup": [ "exec" ],
+				"/bin/sh": [ "exec" ],
+				"/etc/board.json": [ "read" ],
+				"/etc/config/*": [ "read" ],
+				"/etc/glversion": [ "read" ],
+				"/etc/openwrt_release": [ "read" ],
+				"/etc/shadow": [ "read" ],
+				"/usr/lib/opkg/status": [ "read" ],
+				"/usr/libexec/opkg-call list-installed": [ "exec" ],
+				"/usr/libexec/opkg-call list-available": [ "exec" ],
+				"/tmp/gl-backup-*": [ "read" ]
+			},
+			"uci": [ "network", "wireless", "system", "gl_ddns", "glconfig" ]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/gl-portable-backup": [ "exec" ],
+				"/bin/sh": [ "exec" ],
+				"/sbin/reboot": [ "exec" ],
+				"/tmp/*": [ "write" ],
+				"/usr/libexec/opkg-call install *": [ "exec" ]
+			},
+			"uci": [ "network", "wireless", "system", "firewall", "dhcp",
+				 "gl_ddns", "glconfig", "gl-cloud", "gl_led", "wireguard_server",
+				 "ovpnserver", "zerotier", "tailscale" ]
+		}
+	}
+}

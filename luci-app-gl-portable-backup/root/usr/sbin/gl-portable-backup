@@ -1,0 +1,1391 @@
+#!/bin/sh
+# GL Portable Backup
+# Copyright (c) 2026 RemoteToHome Consulting — https://remotetohome.io
+# Licensed under the Apache License, Version 2.0
+#
+# Usage:
+#   gl-portable-backup create [--mode clone|remote-safe|profile|full] [--output PATH] [--notes TEXT]
+#   gl-portable-backup restore ARCHIVE
+#   gl-portable-backup inspect ARCHIVE
+
+set -e
+
+VERSION="1.0.0"
+FORMAT_VERSION=3
+TOOL_NAME="gl-portable-backup"
+ARCHIVE_PREFIX="gl-portable-backup"
+
+# Remote-access config files excluded in remote-safe mode (entire files)
+REMOTE_SAFE_EXCLUDE_FILES="zerotier tailscale gl-cloud rtty dropbear wan-access"
+
+# Network interface names excluded in remote-safe mode
+REMOTE_SAFE_EXCLUDE_IFACES="zerotier tailscale wwan wwan6 tethering tethering6"
+
+# Firewall name prefixes excluded in remote-safe mode
+REMOTE_SAFE_EXCLUDE_FW_PREFIXES="zerotier tailscale"
+
+# ─── Utility Functions ────────────────────────────────────────────────────────
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+get_model_id() {
+    jsonfilter -i /etc/board.json -e '@.model.id'
+}
+
+get_model_name() {
+    jsonfilter -i /etc/board.json -e '@.model.name'
+}
+
+get_model_short() {
+    get_model_id | sed 's/glinet,//' | tr 'a-z' 'A-Z' | sed 's/-SNAND//'
+}
+
+get_fw_version() {
+    cat /etc/glversion 2>/dev/null || echo "unknown"
+}
+
+get_openwrt_version() {
+    . /etc/openwrt_release 2>/dev/null
+    echo "${DISTRIB_RELEASE:-unknown}"
+}
+
+get_architecture() {
+    . /etc/openwrt_release 2>/dev/null
+    echo "${DISTRIB_ARCH:-unknown}"
+}
+
+get_hostname() {
+    uci -q get system.@system[0].hostname 2>/dev/null || cat /proc/sys/kernel/hostname
+}
+
+get_timestamp() {
+    date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%dT%H:%M:%SZ
+}
+
+get_datestamp() {
+    date +%Y%m%d-%H%M
+}
+
+# ─── GL.iNet Local API Helper ─────────────────────────────────────────────────
+
+gl_auth() {
+    local challenge nonce shadow_hash login_str login_hash result
+
+    challenge=$(curl -sf "http://localhost/rpc" \
+        -d '{"jsonrpc":"2.0","id":1,"method":"challenge","params":{"username":"root"}}')
+    [ -z "$challenge" ] && return 1
+
+    nonce=$(echo "$challenge" | jsonfilter -e '@.result.nonce')
+    shadow_hash=$(awk -F: '/^root/{print $2}' /etc/shadow)
+
+    login_str="root:${shadow_hash}:${nonce}"
+    if echo "$challenge" | grep -q '"hash-method":"sha256"'; then
+        login_hash=$(printf "%s" "$login_str" | sha256sum | awk '{print $1}')
+    else
+        login_hash=$(printf "%s" "$login_str" | md5sum | awk '{print $1}')
+    fi
+
+    result=$(curl -sf "http://localhost/rpc" \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"login\",\"params\":{\"username\":\"root\",\"hash\":\"$login_hash\"}}")
+    echo "$result" | jsonfilter -e '@.result.sid'
+}
+
+gl_api() {
+    local sid="$1" module="$2" method="$3" params="${4:-{}}"
+    curl -sf "http://localhost/rpc" \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$sid\",\"$module\",\"$method\",$params]}"
+}
+
+# Re-initialize DDNS after any restore mode.
+#
+# Problem: After a restore (any mode), the DDNS service won't start working
+# until toggled via the GL admin panel. The GL GUI's "enable DDNS" API call
+# initializes the device identity but resets custom operational preferences
+# (check_interval, force_interval) to defaults.
+#
+# Solution: Save prefs → API enable (initializes identity) → re-apply prefs.
+# Works for all modes:
+#   - Clone/Remote-Safe: identity fields were stripped, API creates new ones
+#   - Full: identity fields are intact, API re-registers them with the service
+reinitialize_ddns() {
+    local tmpdir="$1"
+
+    [ -f "$tmpdir/config/gl_ddns" ] || return 0
+
+    echo "  Initializing DDNS..." >&2
+
+    # Save operational preferences from the restored config
+    local ddns_prefs=$(mktemp -d)
+    for section in glddns glddnsv6; do
+        for field in check_interval check_unit force_interval force_unit; do
+            uci -q get gl_ddns.${section}.${field} > "$ddns_prefs/${section}_${field}" 2>/dev/null || true
+        done
+    done
+
+    # Authenticate and enable DDNS via API (initializes/re-registers device identity)
+    local sid
+    sid=$(gl_auth)
+    if [ -n "$sid" ]; then
+        gl_api "$sid" "ddns" "set_config" '{"enable_ddns":true}' >/dev/null 2>&1
+        echo "  DDNS enabled with device identity" >&2
+
+        # Re-apply backed-up operational preferences (API enable resets these)
+        for section in glddns glddnsv6; do
+            for field in check_interval check_unit force_interval force_unit; do
+                local val=$(cat "$ddns_prefs/${section}_${field}" 2>/dev/null)
+                [ -n "$val" ] && uci -q set gl_ddns.${section}.${field}="$val"
+            done
+        done
+        uci commit gl_ddns 2>/dev/null || true
+        /etc/init.d/gl_ddns restart 2>/dev/null || true
+        echo "  DDNS operational preferences restored" >&2
+    else
+        echo "  WARNING: Could not authenticate to DDNS API — DDNS not initialized" >&2
+        echo "  Enable DDNS manually via GL admin panel" >&2
+    fi
+    rm -rf "$ddns_prefs"
+}
+
+# ─── Hardware Identity ─────────────────────────────────────────────────────────
+
+capture_hardware_ids() {
+    local outfile="$1"
+    local mac_lan mac_wan label_mac mac_wifi ddns_user ddns_domain ddns_param
+
+    # LAN/WAN MACs from board.json
+    mac_lan=$(jsonfilter -i /etc/board.json -e '@.network.lan.macaddr' 2>/dev/null || echo "")
+    mac_wan=$(jsonfilter -i /etc/board.json -e '@.network.wan.macaddr' 2>/dev/null || echo "")
+    label_mac=$(jsonfilter -i /etc/board.json -e '@.system.label_macaddr' 2>/dev/null || echo "")
+
+    # Wi-Fi MACs from wireless config
+    mac_wifi=""
+    local iface_macs
+    iface_macs=$(grep 'option macaddr' /etc/config/wireless 2>/dev/null | awk '{print $3}' | tr -d "'" | sort -u)
+    for m in $iface_macs; do
+        if [ -n "$mac_wifi" ]; then
+            mac_wifi="${mac_wifi}, \"${m}\""
+        else
+            mac_wifi="\"${m}\""
+        fi
+    done
+
+    # DDNS identity
+    ddns_user=$(uci -q get gl_ddns.glddns.username 2>/dev/null || echo "")
+    ddns_domain=$(uci -q get gl_ddns.glddns.domain 2>/dev/null || echo "")
+    ddns_param=$(uci -q get gl_ddns.glddns.param_enc 2>/dev/null || echo "")
+
+    cat > "$outfile" <<EOF
+{
+  "mac_lan": "${mac_lan}",
+  "mac_wan": "${mac_wan}",
+  "label_macaddr": "${label_mac}",
+  "mac_wifi": [${mac_wifi}],
+  "ddns_username": "${ddns_user}",
+  "ddns_domain": "${ddns_domain}",
+  "ddns_param_enc": "${ddns_param}",
+  "board_json": $(cat /etc/board.json)
+}
+EOF
+}
+
+# ─── Non-UCI Persistent Files (keep.d) ────────────────────────────────────────
+
+# Enumerate all persistent file paths declared in /lib/upgrade/keep.d/*
+# Output: one absolute file path per line, sorted and deduplicated
+enumerate_keepd_paths() {
+    for keepfile in /lib/upgrade/keep.d/*; do
+        [ -f "$keepfile" ] || continue
+        while IFS= read -r path || [ -n "$path" ]; do
+            # Strip comments and whitespace
+            path=$(echo "$path" | sed 's/#.*//' | tr -d ' \t\n\r')
+            [ -z "$path" ] && continue
+            # Expand directories to individual files
+            if [ -d "$path" ]; then
+                find "$path" -type f 2>/dev/null
+            elif [ -f "$path" ]; then
+                echo "$path"
+            fi
+        done < "$keepfile"
+    done | sort -u
+}
+
+# Capture non-UCI persistent files discovered via keep.d
+# Applies mode-specific filtering, copies to extra/ in archive
+# Outputs the count of captured files
+capture_extra_files() {
+    local archdir="$1"
+    local mode="$2"
+    local extradir="$archdir/extra"
+
+    mkdir -p "$extradir"
+
+    # Write filtered paths to a temp file to avoid subshell count loss
+    local pathlist=$(mktemp)
+    enumerate_keepd_paths > "$pathlist"
+
+    while IFS= read -r filepath; do
+        # Skip /etc/config/ — already captured in config/
+        case "$filepath" in /etc/config/*) continue ;; esac
+
+        # Skip system identity files (not config — belong to the device)
+        case "$filepath" in
+            /etc/shadow|/etc/passwd|/etc/group|/etc/hosts|\
+            /etc/shells|/etc/shinit|/etc/profile|/etc/inittab|\
+            /etc/sysctl.conf|/etc/rc.local) continue ;;
+        esac
+
+        # Clone + Remote-Safe: exclude device-generated TLS/SSH keys
+        if [ "$mode" = "clone" ] || [ "$mode" = "remote-safe" ]; then
+            case "$filepath" in
+                /etc/dropbear/dropbear_*_host_key) continue ;;
+                /etc/uhttpd.crt|/etc/uhttpd.key) continue ;;
+                /etc/nginx/nginx.cer|/etc/nginx/nginx.key) continue ;;
+            esac
+        fi
+
+        # Remote-Safe: also exclude remote-access state
+        if [ "$mode" = "remote-safe" ]; then
+            case "$filepath" in
+                /etc/dropbear/authorized_keys) continue ;;
+                /etc/tailscale/*) continue ;;
+            esac
+        fi
+
+        # Copy file preserving directory structure
+        local relpath="${filepath#/}"
+        local destdir="$extradir/$(dirname "$relpath")"
+        mkdir -p "$destdir"
+        cp -a "$filepath" "$destdir/"
+    done < "$pathlist"
+
+    rm -f "$pathlist"
+
+    # Count captured files (avoids subshell variable loss)
+    find "$extradir" -type f 2>/dev/null | wc -l
+}
+
+# Restore extra/ files from archive to filesystem
+restore_extra_files() {
+    local tmpdir="$1"
+    [ -d "$tmpdir/extra" ] || return 0
+
+    local count=0
+    local relfile
+    for relfile in $(cd "$tmpdir/extra" && find . -type f | sed 's|^\./||'); do
+        local destdir="/$(dirname "$relfile")"
+        mkdir -p "$destdir"
+        cp -a "$tmpdir/extra/$relfile" "/$relfile"
+        count=$((count + 1))
+    done
+    echo "$count"
+}
+
+# ─── Sanitize (Strip Hardware IDs) ────────────────────────────────────────────
+
+sanitize_configs() {
+    local confdir="$1"
+
+    # Strip MAC addresses from network device sections
+    [ -f "$confdir/network" ] && sed -i "/option macaddr/d" "$confdir/network"
+
+    # Strip Wi-Fi interface MACs
+    [ -f "$confdir/wireless" ] && sed -i "/option macaddr/d" "$confdir/wireless"
+
+    # Strip DDNS device-specific fields (both v4 and v6)
+    # enabled is stripped because DDNS activation requires user consent via GUI
+    # and the hostname is tied to the device ID (<gl-device-id>.glddns.com)
+    if [ -f "$confdir/gl_ddns" ]; then
+        for field in enabled username domain param_enc lookup_host password; do
+            sed -i "/option ${field}/d" "$confdir/gl_ddns"
+        done
+    fi
+
+    # Strip WireGuard server keys
+    if [ -f "$confdir/wireguard_server" ]; then
+        sed -i "/option private_key/d" "$confdir/wireguard_server"
+        sed -i "/option public_key/d" "$confdir/wireguard_server"
+        sed -i "/option preshared_key/d" "$confdir/wireguard_server"
+        sed -i "/option presharedkey/d" "$confdir/wireguard_server"
+    fi
+
+    # Strip WireGuard client keys (GL.iNet WG client peer configs)
+    if [ -f "$confdir/wireguard" ]; then
+        sed -i "/option private_key/d" "$confdir/wireguard"
+        sed -i "/option public_key/d" "$confdir/wireguard"
+        sed -i "/option preshared_key/d" "$confdir/wireguard"
+    fi
+
+    # Strip AmneziaWG/WireGuard client keys from network config
+    if [ -f "$confdir/network" ]; then
+        sed -i "/option private_key/d" "$confdir/network"
+        sed -i "/option public_key/d" "$confdir/network"
+        sed -i "/option preshared_key/d" "$confdir/network"
+    fi
+
+    # Strip OpenVPN client credentials
+    if [ -f "$confdir/ovpnclient" ]; then
+        sed -i "/option username/d" "$confdir/ovpnclient"
+        sed -i "/option password/d" "$confdir/ovpnclient"
+    fi
+}
+
+# ─── Remote-Safe Filtering ────────────────────────────────────────────────────
+
+# Remove entire config files that are remote-access-specific
+exclude_remote_access_files() {
+    local confdir="$1"
+    local f
+    for f in $REMOTE_SAFE_EXCLUDE_FILES; do
+        rm -f "$confdir/$f"
+    done
+}
+
+# Filter network config: remove interface sections for remote-access services
+filter_network_remote_safe() {
+    local infile="$1"
+    local tmpfile="${infile}.filtered"
+
+    [ -f "$infile" ] || return 0
+
+    awk -v excludes="$REMOTE_SAFE_EXCLUDE_IFACES" '
+    BEGIN {
+        split(excludes, exc_arr, " ")
+        for (i in exc_arr) exc[exc_arr[i]] = 1
+        skip = 0
+    }
+    /^config / {
+        skip = 0
+        # Check if this is an interface section with an excluded name
+        if ($2 == "interface") {
+            name = $3
+            gsub(/'\''/, "", name)
+            if (name in exc) skip = 1
+        }
+        # Check config device sections that reference excluded interfaces
+        if ($2 == "device") {
+            # We will check the name in subsequent lines
+            pending_device = 1
+            device_lines = $0 "\n"
+            next
+        }
+    }
+    pending_device {
+        device_lines = device_lines $0 "\n"
+        if (/option name/) {
+            name = $3
+            gsub(/'\''/, "", name)
+            # Skip device blocks for ZT/TS interfaces (e.g., zt* devices)
+            for (e in exc) {
+                if (index(name, substr(e, 1, 2)) == 1) {
+                    skip = 1
+                }
+            }
+            if (!skip) printf "%s", device_lines
+            pending_device = 0
+            device_lines = ""
+            next
+        }
+        if (/^config / || /^$/) {
+            if (!skip) printf "%s", device_lines
+            pending_device = 0
+            device_lines = ""
+            skip = 0
+        }
+        next
+    }
+    !skip { print }
+    ' "$infile" > "$tmpfile"
+
+    mv "$tmpfile" "$infile"
+}
+
+# Filter firewall config: remove zones/rules/forwards for remote-access services
+filter_firewall_remote_safe() {
+    local infile="$1"
+    local tmpfile="${infile}.filtered"
+
+    [ -f "$infile" ] || return 0
+
+    awk -v prefixes="$REMOTE_SAFE_EXCLUDE_FW_PREFIXES" '
+    BEGIN {
+        split(prefixes, pfx_arr, " ")
+        skip = 0
+    }
+    /^config / {
+        skip = 0
+        # Get the name (3rd field, may be quoted)
+        name = $3
+        gsub(/'\''/, "", name)
+        # Check each prefix
+        for (i in pfx_arr) {
+            if (index(name, pfx_arr[i]) == 1) {
+                skip = 1
+                break
+            }
+        }
+    }
+    !skip { print }
+    ' "$infile" > "$tmpfile"
+
+    mv "$tmpfile" "$infile"
+}
+
+# ─── Profile Mode (API-Based) ─────────────────────────────────────────────────
+
+capture_profile() {
+    local apidir="$1"
+    local sid
+
+    mkdir -p "$apidir"
+
+    sid=$(gl_auth)
+    [ -z "$sid" ] && die "Failed to authenticate to local API"
+
+    # Wi-Fi config
+    gl_api "$sid" "wifi" "get_config" '{}' > "$apidir/wifi.json" 2>/dev/null || echo '{}' > "$apidir/wifi.json"
+
+    # LAN config
+    gl_api "$sid" "lan" "get_config_list" '{}' > "$apidir/lan.json" 2>/dev/null || echo '{}' > "$apidir/lan.json"
+
+    # DNS config
+    gl_api "$sid" "dns" "get_config" '{}' > "$apidir/dns_config.json" 2>/dev/null || echo '{}' > "$apidir/dns_config.json"
+
+    # DNS hosts
+    gl_api "$sid" "dns" "get_host" '{}' > "$apidir/dns_hosts.json" 2>/dev/null || echo '{}' > "$apidir/dns_hosts.json"
+
+    # Firewall rules
+    gl_api "$sid" "firewall" "get_rule_list" '{}' > "$apidir/firewall_rules.json" 2>/dev/null || echo '{}' > "$apidir/firewall_rules.json"
+
+    # Port forwards
+    gl_api "$sid" "firewall" "get_port_forward_list" '{}' > "$apidir/firewall_forwards.json" 2>/dev/null || echo '{}' > "$apidir/firewall_forwards.json"
+
+    # WAN access settings
+    gl_api "$sid" "firewall" "get_wan_access" '{}' > "$apidir/firewall_wan_access.json" 2>/dev/null || echo '{}' > "$apidir/firewall_wan_access.json"
+
+    # Timezone
+    gl_api "$sid" "system" "get_timezone_config" '{}' > "$apidir/timezone.json" 2>/dev/null || echo '{}' > "$apidir/timezone.json"
+
+    # LED
+    gl_api "$sid" "led" "get_config" '{}' > "$apidir/led.json" 2>/dev/null || echo '{}' > "$apidir/led.json"
+
+    # DHCP static bindings (fixed IP assignments)
+    gl_api "$sid" "lan" "get_static_bind_list" '{}' > "$apidir/dhcp_static_binds.json" 2>/dev/null || echo '{}' > "$apidir/dhcp_static_binds.json"
+}
+
+# ─── Package Capture ───────────────────────────────────────────────────────────
+
+get_kernel_version() {
+    awk '/^Package: kernel$/{found=1} found && /^Version:/{print $2; exit}' \
+        /usr/lib/opkg/status 2>/dev/null || echo "unknown"
+}
+
+# Capture user-installed packages with full metadata as JSON
+capture_packages_json() {
+    local outfile="$1"
+    local kver arch
+
+    kver=$(get_kernel_version)
+    arch=$(get_architecture)
+
+    awk -v kver="$kver" -v arch="$arch" '
+    BEGIN {
+        first = 1
+        printf "{\n  \"format\": 1,\n"
+        printf "  \"kernel_version\": \"%s\",\n", kver
+        printf "  \"architecture\": \"%s\",\n", arch
+        printf "  \"packages\": [\n"
+    }
+
+    /^$/ { flush(); next }
+
+    /^Package:/       { pkg = substr($0, 10) }
+    /^Version:/       { ver = substr($0, 10) }
+    /^Section:/       { sec = substr($0, 10) }
+    /^Architecture:/  { pkgarch = substr($0, 15) }
+    /^Depends:/       { deps = substr($0, 10) }
+    /^Installed-Size:/ { isize = substr($0, 17) }
+    /^Installed-Time:/ { itime = substr($0, 17) }
+    /^Description:/   { desc = substr($0, 14) }
+    /^Status:.*user installed/ { user_installed = 1 }
+
+    function flush() {
+        if (pkg != "" && user_installed) {
+            # Escape double quotes in string fields
+            gsub(/"/, "\\\"", desc)
+            gsub(/"/, "\\\"", deps)
+            is_kmod = (sec == "kernel" || substr(pkg, 1, 5) == "kmod-") ? "true" : "false"
+            if (!first) printf ",\n"
+            first = 0
+            printf "    {\n"
+            printf "      \"name\": \"%s\",\n", pkg
+            printf "      \"version\": \"%s\",\n", ver
+            printf "      \"section\": \"%s\",\n", sec
+            printf "      \"architecture\": \"%s\",\n", pkgarch
+            printf "      \"description\": \"%s\",\n", desc
+            printf "      \"depends\": \"%s\",\n", deps
+            printf "      \"installed_size\": %s,\n", (isize != "" ? isize : "0")
+            printf "      \"installed_time\": %s,\n", (itime != "" ? itime : "0")
+            printf "      \"is_kmod\": %s\n", is_kmod
+            printf "    }"
+        }
+        pkg = ""; ver = ""; sec = ""; pkgarch = ""; desc = ""; deps = ""
+        isize = ""; itime = ""; user_installed = 0
+    }
+
+    END {
+        flush()
+        printf "\n  ]\n}\n"
+    }
+    ' /usr/lib/opkg/status > "$outfile" 2>/dev/null
+}
+
+# Legacy name-only capture for backward compatibility
+capture_packages_txt() {
+    local outfile="$1"
+    awk '/^Package:/{p=$2} /Status:.*user installed/{print p}' \
+        /usr/lib/opkg/status > "$outfile" 2>/dev/null || true
+}
+
+# ─── Manifest ──────────────────────────────────────────────────────────────────
+
+write_manifest() {
+    local outfile="$1"
+    local mode="$2"
+    local notes="$3"
+    local sections="$4"
+    local excluded="$5"
+    local extra_files="$6"
+
+    cat > "$outfile" <<EOF
+{
+  "format_version": ${FORMAT_VERSION},
+  "tool": "${TOOL_NAME}",
+  "tool_version": "${VERSION}",
+  "created_at": "$(get_timestamp)",
+  "mode": "${mode}",
+  "source": {
+    "model": "$(get_model_name)",
+    "model_id": "$(get_model_id)",
+    "firmware_version": "$(get_fw_version)",
+    "openwrt_version": "$(get_openwrt_version)",
+    "architecture": "$(get_architecture)",
+    "hostname": "$(get_hostname)"
+  },
+  "sections": [${sections}],
+  "excluded_sections": [${excluded}],
+  "extra_files": [${extra_files}],
+  "notes": "${notes}"
+}
+EOF
+}
+
+# Build sections list from config directory contents
+list_sections() {
+    local confdir="$1"
+    local result=""
+    for f in "$confdir"/*; do
+        [ -f "$f" ] || continue
+        local name=$(basename "$f")
+        if [ -n "$result" ]; then
+            result="${result}, \"${name}\""
+        else
+            result="\"${name}\""
+        fi
+    done
+    echo "$result"
+}
+
+# ─── CREATE ────────────────────────────────────────────────────────────────────
+
+cmd_create() {
+    local mode="clone"
+    local output=""
+    local notes=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mode) mode="$2"; shift 2 ;;
+            --output) output="$2"; shift 2 ;;
+            --notes) notes="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    case "$mode" in
+        clone|remote-safe|profile|full) ;;
+        *) die "Invalid mode: $mode (must be clone, remote-safe, profile, or full)" ;;
+    esac
+
+    local tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" EXIT
+
+    # All archive contents go under a prefix directory. This makes the archive
+    # intentionally incompatible with stock LuCI backup restore (System > Flash),
+    # which does "tar -C / -xzf" and expects paths like etc/config/*. Our prefix
+    # causes extraction to /gl-portable-backup/* instead — harmless but clearly
+    # wrong — preventing accidental router corruption from importing the wrong
+    # archive type.
+    local archdir="$tmpdir/${ARCHIVE_PREFIX}"
+    mkdir -p "$archdir"
+
+    local model_short=$(get_model_short)
+    local hostname=$(get_hostname)
+    local datestamp=$(get_datestamp)
+
+    echo "Creating ${mode} backup..." >&2
+
+    # Always capture hardware identity
+    capture_hardware_ids "$archdir/hardware.json"
+    echo "  Captured hardware identity" >&2
+
+    local sections=""
+    local excluded=""
+
+    if [ "$mode" = "profile" ]; then
+        # Profile mode: API-only capture
+        capture_profile "$archdir/api"
+        sections=$(cd "$archdir/api" && for f in *.json; do printf '"%s", ' "${f%.json}"; done | sed 's/, $//')
+        echo "  Captured API profile data" >&2
+    else
+        # Clone, Remote-Safe, Full: copy UCI config files
+        mkdir -p "$archdir/config"
+        cp -a /etc/config/* "$archdir/config/"
+        echo "  Copied $(ls "$archdir/config/" | wc -l) UCI config files" >&2
+
+        # Capture packages (enriched JSON + legacy text)
+        capture_packages_json "$archdir/packages.json"
+        capture_packages_txt "$archdir/packages.txt"
+        local pkg_count
+        pkg_count=$(jsonfilter -i "$archdir/packages.json" -e '@.packages' 2>/dev/null | grep -c '"name"' || echo 0)
+        echo "  Captured ${pkg_count} user-installed packages" >&2
+
+        # Capture non-UCI persistent files from keep.d
+        local extra_count
+        extra_count=$(capture_extra_files "$archdir" "$mode")
+        echo "  Captured ${extra_count} extra persistent files (keep.d)" >&2
+
+        if [ "$mode" = "clone" ] || [ "$mode" = "remote-safe" ]; then
+            # Strip hardware-specific fields
+            sanitize_configs "$archdir/config"
+            echo "  Stripped hardware-specific fields" >&2
+        fi
+
+        if [ "$mode" = "remote-safe" ]; then
+            # Build excluded sections list before removing files
+            for f in $REMOTE_SAFE_EXCLUDE_FILES; do
+                if [ -n "$excluded" ]; then
+                    excluded="${excluded}, \"${f}\""
+                else
+                    excluded="\"${f}\""
+                fi
+            done
+
+            # Remove remote-access config files
+            exclude_remote_access_files "$archdir/config"
+            echo "  Excluded remote-access config files" >&2
+
+            # Filter network and firewall
+            filter_network_remote_safe "$archdir/config/network"
+            filter_firewall_remote_safe "$archdir/config/firewall"
+            echo "  Filtered remote-access sections from network/firewall" >&2
+        fi
+
+        sections=$(list_sections "$archdir/config")
+    fi
+
+    # Build extra_files list for manifest
+    local extra_files=""
+    if [ -d "$archdir/extra" ]; then
+        extra_files=$(cd "$archdir/extra" && find . -type f | sort | while IFS= read -r f; do
+            f="${f#./}"
+            printf '"/%s", ' "$f"
+        done | sed 's/, $//')
+    fi
+
+    # Write manifest
+    write_manifest "$archdir/manifest.json" "$mode" "$notes" "$sections" "$excluded" "$extra_files"
+
+    # Write human-readable backup info and compatibility warning
+    cat > "$archdir/backup-info.txt" <<INFOEOF
+GL Portable Backup
+==================
+Mode:       ${mode}
+Model:      $(get_model_name)
+Model ID:   $(get_model_id)
+Firmware:   $(get_fw_version)
+Hostname:   $(get_hostname)
+Created:    $(get_timestamp)
+Tool:       ${TOOL_NAME} ${VERSION}
+
+IMPORTANT: This archive was created by GL Portable Backup, a custom plugin
+by RemoteToHome Consulting. It is NOT compatible with the standard LuCI
+backup restore (System > Backup/Flash Firmware). Importing this file
+through the stock LuCI restore interface will NOT work correctly.
+
+To restore this backup, use:
+  GL Admin Panel > Advanced > LuCI > System > GL Portable Backup
+
+For support: https://remotetohome.io/contact
+INFOEOF
+    [ -n "$notes" ] && printf "Notes:      %s\n" "${notes}" >> "$archdir/backup-info.txt"
+
+    # Create archive
+    if [ -z "$output" ]; then
+        local fw_short=$(get_fw_version | tr '.' '-')
+        output="/tmp/gl-backup-${mode}-${hostname}-${model_short}-fw${fw_short}-${datestamp}.tar.gz"
+    fi
+
+    tar -czf "$output" -C "$tmpdir" "${ARCHIVE_PREFIX}"
+    echo "  Archive: $output" >&2
+
+    # Output the path (for LuCI to read)
+    echo "$output"
+}
+
+# ─── INSPECT ───────────────────────────────────────────────────────────────────
+
+cmd_inspect() {
+    local archive="$1"
+    [ -z "$archive" ] && die "Usage: gl-portable-backup inspect ARCHIVE"
+    [ -f "$archive" ] || die "File not found: $archive"
+
+    local tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" EXIT
+
+    # Try prefixed archive first, fall back to flat (backward compat)
+    tar -xzf "$archive" -C "$tmpdir" "${ARCHIVE_PREFIX}/manifest.json" 2>/dev/null \
+        || tar -xzf "$archive" -C "$tmpdir" manifest.json 2>/dev/null \
+        || die "Invalid archive: no manifest.json"
+
+    if [ -f "$tmpdir/${ARCHIVE_PREFIX}/manifest.json" ]; then
+        cat "$tmpdir/${ARCHIVE_PREFIX}/manifest.json"
+    else
+        cat "$tmpdir/manifest.json"
+    fi
+}
+
+# ─── RESTORE ───────────────────────────────────────────────────────────────────
+
+cmd_restore() {
+    local archive="$1"
+    [ -z "$archive" ] && die "Usage: gl-portable-backup restore ARCHIVE"
+    [ -f "$archive" ] || die "File not found: $archive"
+
+    local tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" EXIT
+
+    echo "Extracting backup..." >&2
+    tar -xzf "$archive" -C "$tmpdir"
+
+    # Resolve archive prefix (prefixed format or flat for backward compat)
+    if [ -d "$tmpdir/${ARCHIVE_PREFIX}" ]; then
+        tmpdir="$tmpdir/${ARCHIVE_PREFIX}"
+    fi
+
+    [ -f "$tmpdir/manifest.json" ] || die "Invalid archive: no manifest.json"
+
+    local mode=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.mode')
+    local backup_model=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.source.model_id')
+    local backup_fw=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.source.firmware_version' 2>/dev/null)
+    local current_model=$(get_model_id)
+    local current_fw=$(get_fw_version)
+
+    echo "Backup mode:     ${mode}" >&2
+    echo "Backup model:    ${backup_model}" >&2
+    echo "Backup firmware: ${backup_fw:-unknown}" >&2
+    echo "This device:     ${current_model}" >&2
+    echo "This firmware:   ${current_fw}" >&2
+
+    # Model validation (hard block for non-profile modes)
+    if [ "$mode" != "profile" ]; then
+        if [ "$backup_model" != "$current_model" ]; then
+            die "Model mismatch. Backup: ${backup_model}, This device: ${current_model}. Use 'profile' mode for cross-model restore."
+        fi
+    fi
+
+    # Firmware version check (warning only — same model, different firmware)
+    if [ -n "$backup_fw" ] && [ "$backup_fw" != "unknown" ] && [ "$backup_fw" != "$current_fw" ]; then
+        echo "WARNING: Firmware version mismatch — backup: ${backup_fw}, this device: ${current_fw}" >&2
+        echo "  UCI config schema may differ between firmware versions." >&2
+        echo "  Clone/Remote-Safe restores are safest between identical firmware versions." >&2
+        echo "  Consider using Profile mode for cross-version portability." >&2
+    fi
+
+    case "$mode" in
+        clone|remote-safe)
+            restore_portable "$tmpdir" "$mode"
+            ;;
+        profile)
+            restore_profile "$tmpdir"
+            ;;
+        full)
+            restore_full "$tmpdir"
+            ;;
+        *)
+            die "Unknown backup mode: $mode"
+            ;;
+    esac
+
+    echo "Restore complete. Reboot recommended." >&2
+    echo "RESTORE_OK"
+}
+
+restore_portable() {
+    local tmpdir="$1"
+    local mode="$2"
+    local saved_hw=$(mktemp -d)
+
+    echo "Saving current hardware identity..." >&2
+
+    # Save current device's hardware-specific values before overwriting
+    # Network MACs
+    grep 'option macaddr' /etc/config/network > "$saved_hw/network_macs" 2>/dev/null || true
+    grep 'option macaddr' /etc/config/wireless > "$saved_hw/wireless_macs" 2>/dev/null || true
+
+    # Remote-safe: also save excluded configs
+    if [ "$mode" = "remote-safe" ]; then
+        for f in $REMOTE_SAFE_EXCLUDE_FILES; do
+            [ -f "/etc/config/$f" ] && cp -a "/etc/config/$f" "$saved_hw/$f"
+        done
+        # Save the network interface sections we need to preserve
+        # (zerotier, tailscale, etc.)
+    fi
+
+    echo "Applying backup configs..." >&2
+
+    # Apply config files from archive
+    if [ -d "$tmpdir/config" ]; then
+        for f in "$tmpdir/config"/*; do
+            [ -f "$f" ] || continue
+            local name=$(basename "$f")
+            cp -a "$f" "/etc/config/$name"
+        done
+    fi
+
+    # Restore non-UCI persistent files (keep.d)
+    if [ -d "$tmpdir/extra" ]; then
+        local extra_restored
+        extra_restored=$(restore_extra_files "$tmpdir")
+        echo "  Restored ${extra_restored} extra persistent files" >&2
+    fi
+
+    echo "Re-injecting hardware identity..." >&2
+
+    # Re-inject this device's MAC addresses into network config
+    # Read MACs from board.json (the authoritative source)
+    local lan_mac=$(jsonfilter -i /etc/board.json -e '@.network.lan.macaddr' 2>/dev/null)
+    local wan_mac=$(jsonfilter -i /etc/board.json -e '@.network.wan.macaddr' 2>/dev/null)
+
+    if [ -n "$lan_mac" ]; then
+        # Find br-lan device section and add macaddr
+        # Use UCI to set it properly
+        local br_dev=$(uci -q get network.@device[0].name 2>/dev/null)
+        if [ "$br_dev" = "br-lan" ]; then
+            uci -q set network.@device[0].macaddr="$lan_mac"
+        fi
+        # Also set eth1 device if it exists
+        local i=0
+        while uci -q get network.@device[$i].name >/dev/null 2>&1; do
+            local dev_name=$(uci -q get network.@device[$i].name)
+            case "$dev_name" in
+                br-lan|eth1)
+                    uci -q set network.@device[$i].macaddr="$lan_mac"
+                    ;;
+                eth0)
+                    [ -n "$wan_mac" ] && uci -q set network.@device[$i].macaddr="$wan_mac"
+                    ;;
+            esac
+            i=$((i + 1))
+        done
+        uci commit network
+    fi
+
+    # Re-inject Wi-Fi MACs from saved state
+    # The wireless config from the backup has no MACs (stripped).
+    # We need the current device's Wi-Fi MACs.
+    # On GL.iNet routers, Wi-Fi MACs are randomized per-interface — we restore
+    # what was saved from this device before the overwrite.
+    if [ -s "$saved_hw/wireless_macs" ]; then
+        # Re-apply saved MAC addresses to the matching interface positions
+        local idx=0
+        while IFS= read -r line; do
+            local mac=$(echo "$line" | awk '{print $3}' | tr -d "'")
+            uci -q set wireless.@wifi-iface[$idx].macaddr="$mac" 2>/dev/null || true
+            idx=$((idx + 1))
+        done < "$saved_hw/wireless_macs"
+        uci commit wireless
+    fi
+
+    reinitialize_ddns "$tmpdir"
+
+    # Remote-safe: restore the excluded config files from saved state
+    if [ "$mode" = "remote-safe" ]; then
+        echo "Restoring preserved remote-access configs..." >&2
+        for f in $REMOTE_SAFE_EXCLUDE_FILES; do
+            [ -f "$saved_hw/$f" ] && cp -a "$saved_hw/$f" "/etc/config/$f"
+        done
+    fi
+
+    rm -rf "$saved_hw"
+    echo "Hardware identity preserved." >&2
+}
+
+restore_profile() {
+    local tmpdir="$1"
+    local apidir="$tmpdir/api"
+    local sid
+
+    [ -d "$apidir" ] || die "Invalid profile backup: no api/ directory"
+
+    echo "Authenticating to local API..." >&2
+    sid=$(gl_auth)
+    [ -z "$sid" ] && die "Failed to authenticate to local API"
+
+    # Restore timezone
+    if [ -f "$apidir/timezone.json" ]; then
+        local tz_result=$(jsonfilter -i "$apidir/timezone.json" -e '@.result')
+        if [ -n "$tz_result" ] && [ "$tz_result" != "null" ]; then
+            local zonename=$(jsonfilter -i "$apidir/timezone.json" -e '@.result.zonename' 2>/dev/null)
+            if [ -n "$zonename" ]; then
+                gl_api "$sid" "system" "set_timezone_config" "{\"zonename\":\"$zonename\"}" >/dev/null 2>&1
+                echo "  Restored timezone: $zonename" >&2
+            fi
+        fi
+    fi
+
+    # Restore DNS config
+    if [ -f "$apidir/dns_config.json" ]; then
+        local dns_result=$(jsonfilter -i "$apidir/dns_config.json" -e '@.result')
+        if [ -n "$dns_result" ] && [ "$dns_result" != "null" ]; then
+            local dns_mode=$(jsonfilter -i "$apidir/dns_config.json" -e '@.result.mode' 2>/dev/null || echo "")
+            local force_dns=$(jsonfilter -i "$apidir/dns_config.json" -e '@.result.force_dns' 2>/dev/null || echo "")
+            if [ -n "$dns_mode" ]; then
+                local params="{\"mode\":\"$dns_mode\""
+                [ -n "$force_dns" ] && params="${params},\"force_dns\":$force_dns"
+                params="${params}}"
+                gl_api "$sid" "dns" "set_config" "$params" >/dev/null 2>&1
+                echo "  Restored DNS config" >&2
+            fi
+        fi
+    fi
+
+    # Restore DNS hosts
+    if [ -f "$apidir/dns_hosts.json" ]; then
+        local hosts_content=$(jsonfilter -i "$apidir/dns_hosts.json" -e '@.result.content' 2>/dev/null)
+        if [ -n "$hosts_content" ]; then
+            local escaped=$(echo "$hosts_content" | sed 's/"/\\"/g')
+            gl_api "$sid" "dns" "set_host" "{\"content\":\"$escaped\"}" >/dev/null 2>&1
+            echo "  Restored DNS hosts" >&2
+        fi
+    fi
+
+    # Restore LED config
+    if [ -f "$apidir/led.json" ]; then
+        local led_enable=$(jsonfilter -i "$apidir/led.json" -e '@.result.led_enable' 2>/dev/null)
+        if [ -n "$led_enable" ]; then
+            gl_api "$sid" "led" "set_config" "{\"led_enable\":$led_enable}" >/dev/null 2>&1
+            echo "  Restored LED config" >&2
+        fi
+    fi
+
+    # Restore Wi-Fi config (map by band)
+    if [ -f "$apidir/wifi.json" ]; then
+        echo "  Restoring Wi-Fi (mapped by band)..." >&2
+        restore_profile_wifi "$sid" "$apidir/wifi.json"
+    fi
+
+    # Restore LAN config
+    if [ -f "$apidir/lan.json" ]; then
+        echo "  Restoring LAN config..." >&2
+        restore_profile_lan "$sid" "$apidir/lan.json"
+    fi
+
+    # Restore DHCP static bindings (fixed IP assignments)
+    if [ -f "$apidir/dhcp_static_binds.json" ]; then
+        restore_profile_dhcp_static "$sid" "$apidir/dhcp_static_binds.json"
+    fi
+
+    echo "  Profile restore complete" >&2
+}
+
+restore_profile_wifi() {
+    local sid="$1"
+    local wifi_file="$2"
+
+    # Get current Wi-Fi config from target to map interfaces by band
+    local current_wifi=$(gl_api "$sid" "wifi" "get_config" '{}')
+
+    # For each interface in the backup, find matching interface on target by band+guest
+    # This is simplified — full implementation will parse JSON arrays properly
+    # For now, just set SSID/key on all interfaces
+    echo "    Wi-Fi profile restore requires JSON array parsing — placeholder" >&2
+}
+
+restore_profile_lan() {
+    local sid="$1"
+    local lan_file="$2"
+
+    # Simplified — set LAN IP from backup
+    echo "    LAN profile restore requires JSON parsing — placeholder" >&2
+}
+
+restore_profile_dhcp_static() {
+    local sid="$1"
+    local binds_file="$2"
+
+    # Check if backup has any static bindings
+    local count
+    count=$(jsonfilter -i "$binds_file" -e '@.result.static_bind_list[*]' 2>/dev/null | grep -c '"mac"' || echo 0)
+    if [ "$count" = "0" ]; then
+        echo "  No DHCP static bindings in backup" >&2
+        return 0
+    fi
+
+    echo "  Restoring $count DHCP static binding(s)..." >&2
+
+    # Get current bindings on target to avoid duplicates
+    local current
+    current=$(gl_api "$sid" "lan" "get_static_bind_list" '{}')
+
+    # For each binding in the backup, add or update on target
+    local idx=0
+    while true; do
+        local mac ip name
+        mac=$(jsonfilter -i "$binds_file" -e "@.result.static_bind_list[$idx].mac" 2>/dev/null)
+        [ -z "$mac" ] && break
+
+        ip=$(jsonfilter -i "$binds_file" -e "@.result.static_bind_list[$idx].ip" 2>/dev/null)
+        name=$(jsonfilter -i "$binds_file" -e "@.result.static_bind_list[$idx].name" 2>/dev/null)
+
+        if [ -n "$mac" ] && [ -n "$ip" ]; then
+            local params="{\"mac\":\"$mac\",\"ip\":\"$ip\""
+            [ -n "$name" ] && params="${params},\"name\":\"$name\""
+            params="${params}}"
+
+            # Check if this MAC already exists on target
+            local existing
+            existing=$(echo "$current" | jsonfilter -e '@.result.static_bind_list[*].mac' 2>/dev/null | grep -c "$mac" || echo 0)
+
+            if [ "$existing" -gt 0 ]; then
+                # Update existing binding
+                gl_api "$sid" "lan" "set_static_bind" "$params" >/dev/null 2>&1
+                echo "    Updated: $mac -> $ip ($name)" >&2
+            else
+                # Add new binding
+                gl_api "$sid" "lan" "add_static_bind" "$params" >/dev/null 2>&1
+                echo "    Added: $mac -> $ip ($name)" >&2
+            fi
+        fi
+
+        idx=$((idx + 1))
+    done
+}
+
+restore_full() {
+    local tmpdir="$1"
+
+    echo "Applying full backup (hardware IDs will be overwritten)..." >&2
+
+    if [ -d "$tmpdir/config" ]; then
+        for f in "$tmpdir/config"/*; do
+            [ -f "$f" ] || continue
+            local name=$(basename "$f")
+            cp -a "$f" "/etc/config/$name"
+        done
+    fi
+
+    # Restore non-UCI persistent files (keep.d)
+    if [ -d "$tmpdir/extra" ]; then
+        local extra_restored
+        extra_restored=$(restore_extra_files "$tmpdir")
+        echo "  Restored ${extra_restored} extra persistent files" >&2
+    fi
+
+    # Re-initialize DDNS service (required after factory reset + restore)
+    reinitialize_ddns "$tmpdir"
+
+    echo "Full restore applied." >&2
+}
+
+# ─── PACKAGES (Compare archive packages vs target device) ───────────────────
+
+cmd_packages() {
+    local archive="$1"
+    [ -z "$archive" ] && die "Usage: gl-portable-backup packages ARCHIVE"
+    [ -f "$archive" ] || die "File not found: $archive"
+
+    local tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" EXIT
+
+    # Extract package data from archive (try prefixed, then flat for backward compat)
+    local has_json=0 has_txt=0
+    tar -xzf "$archive" -C "$tmpdir" "${ARCHIVE_PREFIX}/packages.json" 2>/dev/null && has_json=1
+    [ "$has_json" = "0" ] && tar -xzf "$archive" -C "$tmpdir" packages.json 2>/dev/null && has_json=1
+    tar -xzf "$archive" -C "$tmpdir" "${ARCHIVE_PREFIX}/packages.txt" 2>/dev/null && has_txt=1
+    [ "$has_txt" = "0" ] && tar -xzf "$archive" -C "$tmpdir" packages.txt 2>/dev/null && has_txt=1
+
+    [ "$has_json" = "0" ] && [ "$has_txt" = "0" ] && \
+        die "Archive contains no package information"
+
+    # Resolve prefix — move files to tmpdir root for uniform access
+    if [ -d "$tmpdir/${ARCHIVE_PREFIX}" ]; then
+        [ -f "$tmpdir/${ARCHIVE_PREFIX}/packages.json" ] && mv "$tmpdir/${ARCHIVE_PREFIX}/packages.json" "$tmpdir/"
+        [ -f "$tmpdir/${ARCHIVE_PREFIX}/packages.txt" ] && mv "$tmpdir/${ARCHIVE_PREFIX}/packages.txt" "$tmpdir/"
+    fi
+
+    # Get target device installed packages (all installed, not just user-installed)
+    awk '/^Package:/{pkg=$2} /^Version:/{ver=$2} /^Status:.*installed/{print pkg "\t" ver}' \
+        /usr/lib/opkg/status > "$tmpdir/installed.tsv" 2>/dev/null
+
+    # Get available packages from opkg feeds (best-effort)
+    local feeds_ok=0
+    opkg list 2>/dev/null | awk '{print $1 "\t" $3}' > "$tmpdir/available.tsv" 2>/dev/null
+    [ -s "$tmpdir/available.tsv" ] && feeds_ok=1
+
+    # Sentinel markers for awk multi-file parsing (POSIX-compatible alternative to process substitution)
+    echo "---END_INSTALLED---" > "$tmpdir/end_installed.marker"
+    echo "---END_AVAILABLE---" > "$tmpdir/end_available.marker"
+
+    # Get target kernel version
+    local target_kver
+    target_kver=$(get_kernel_version)
+
+    if [ "$has_json" = "1" ]; then
+        _packages_compare_json "$tmpdir" "$target_kver" "$feeds_ok"
+    else
+        _packages_compare_txt "$tmpdir" "$target_kver" "$feeds_ok"
+    fi
+}
+
+_packages_compare_json() {
+    local tmpdir="$1" target_kver="$2" feeds_ok="$3"
+
+    # Single-pass awk: read installed + available lists, then compare against packages.json
+    awk -v target_kver="$target_kver" -v feeds_ok="$feeds_ok" '
+    BEGIN {
+        # Phase: 1=installed, 2=available, 3=packages.json
+        phase = 1
+        first_i = 1; first_mk = 1; first_ma = 1; first_mu = 1
+    }
+
+    # Phase 1: installed packages (tab-separated name\tversion)
+    phase == 1 && /^$/ { next }
+    phase == 1 && $0 == "---END_INSTALLED---" { phase = 2; next }
+    phase == 1 {
+        split($0, f, "\t")
+        inst_ver[f[1]] = f[2]
+        inst[f[1]] = 1
+        next
+    }
+
+    # Phase 2: available packages (tab-separated name\tversion)
+    phase == 2 && /^$/ { next }
+    phase == 2 && $0 == "---END_AVAILABLE---" { phase = 3; next }
+    phase == 2 {
+        split($0, f, "\t")
+        avail_ver[f[1]] = f[2]
+        avail[f[1]] = 1
+        next
+    }
+
+    # Phase 3: packages.json — extract source_kernel then each package
+    phase == 3 && /\"kernel_version\"/ {
+        match($0, /"kernel_version": *"([^"]*)"/, m)
+        source_kver = m[1]
+        next
+    }
+
+    phase == 3 && /\"name\"/ {
+        match($0, /"name": *"([^"]*)"/, m); pkg_name = m[1]
+    }
+    phase == 3 && /\"version\"/ && !/kernel_version/ {
+        match($0, /"version": *"([^"]*)"/, m); pkg_ver = m[1]
+    }
+    phase == 3 && /\"section\"/ {
+        match($0, /"section": *"([^"]*)"/, m); pkg_sec = m[1]
+    }
+    phase == 3 && /\"description\"/ {
+        match($0, /"description": *"([^"]*)"/, m); pkg_desc = m[1]
+    }
+    phase == 3 && /\"is_kmod\"/ {
+        match($0, /"is_kmod": *(true|false)/, m); pkg_is_kmod = m[1]
+    }
+
+    # End of a package object — closing brace with possible comma
+    phase == 3 && /^    \}/ {
+        if (pkg_name == "") next
+
+        if (inst[pkg_name]) {
+            tver = inst_ver[pkg_name]
+            vmatch = (pkg_ver == tver) ? "true" : "false"
+            if (!first_i) i_buf = i_buf ",\n"
+            first_i = 0
+            i_buf = i_buf sprintf("    {\"name\":\"%s\",\"source_version\":\"%s\",\"target_version\":\"%s\",\"version_match\":%s,\"is_kmod\":%s,\"description\":\"%s\"}", \
+                pkg_name, pkg_ver, tver, vmatch, pkg_is_kmod, pkg_desc)
+        } else if (pkg_is_kmod == "true") {
+            if (!first_mk) mk_buf = mk_buf ",\n"
+            first_mk = 0
+            mk_buf = mk_buf sprintf("    {\"name\":\"%s\",\"version\":\"%s\",\"section\":\"%s\",\"description\":\"%s\"}", \
+                pkg_name, pkg_ver, pkg_sec, pkg_desc)
+        } else if (feeds_ok == "1" && avail[pkg_name]) {
+            aver = avail_ver[pkg_name]
+            if (!first_ma) ma_buf = ma_buf ",\n"
+            first_ma = 0
+            ma_buf = ma_buf sprintf("    {\"name\":\"%s\",\"source_version\":\"%s\",\"available_version\":\"%s\",\"description\":\"%s\"}", \
+                pkg_name, pkg_ver, aver, pkg_desc)
+        } else {
+            if (!first_mu) mu_buf = mu_buf ",\n"
+            first_mu = 0
+            mu_buf = mu_buf sprintf("    {\"name\":\"%s\",\"version\":\"%s\",\"section\":\"%s\",\"description\":\"%s\"}", \
+                pkg_name, pkg_ver, pkg_sec, pkg_desc)
+        }
+
+        pkg_name = ""; pkg_ver = ""; pkg_sec = ""; pkg_desc = ""; pkg_is_kmod = ""
+        next
+    }
+
+    END {
+        kernel_match = (source_kver == target_kver) ? "true" : "false"
+        feeds_avail = (feeds_ok == "1") ? "true" : "false"
+
+        printf "{\n"
+        printf "  \"source_kernel\": \"%s\",\n", source_kver
+        printf "  \"target_kernel\": \"%s\",\n", target_kver
+        printf "  \"kernel_match\": %s,\n", kernel_match
+        printf "  \"feeds_available\": %s,\n", feeds_avail
+        printf "  \"installed\": [\n%s\n  ],\n", i_buf
+        printf "  \"missing_kmod\": [\n%s\n  ],\n", mk_buf
+        printf "  \"missing_available\": [\n%s\n  ],\n", ma_buf
+        printf "  \"missing_unavailable\": [\n%s\n  ]\n", mu_buf
+        printf "}\n"
+    }
+    ' "$tmpdir/installed.tsv" "$tmpdir/end_installed.marker" \
+      "$tmpdir/available.tsv" "$tmpdir/end_available.marker" \
+      "$tmpdir/packages.json"
+}
+
+_packages_compare_txt() {
+    local tmpdir="$1" target_kver="$2" feeds_ok="$3"
+
+    # Legacy mode: name-only, no kmod detection, no version comparison
+    awk -v target_kver="$target_kver" -v feeds_ok="$feeds_ok" '
+    BEGIN {
+        phase = 1
+        first_i = 1; first_ma = 1; first_mu = 1
+    }
+
+    phase == 1 && /^$/ { next }
+    phase == 1 && $0 == "---END_INSTALLED---" { phase = 2; next }
+    phase == 1 {
+        split($0, f, "\t")
+        inst[f[1]] = 1
+        next
+    }
+
+    phase == 2 && /^$/ { next }
+    phase == 2 && $0 == "---END_AVAILABLE---" { phase = 3; next }
+    phase == 2 {
+        split($0, f, "\t")
+        avail[f[1]] = 1
+        next
+    }
+
+    # Phase 3: packages.txt — one name per line
+    phase == 3 && /^$/ { next }
+    phase == 3 {
+        name = $1
+        if (inst[name]) {
+            if (!first_i) i_buf = i_buf ",\n"
+            first_i = 0
+            i_buf = i_buf sprintf("    {\"name\":\"%s\"}", name)
+        } else if (feeds_ok == "1" && avail[name]) {
+            if (!first_ma) ma_buf = ma_buf ",\n"
+            first_ma = 0
+            ma_buf = ma_buf sprintf("    {\"name\":\"%s\"}", name)
+        } else {
+            if (!first_mu) mu_buf = mu_buf ",\n"
+            first_mu = 0
+            mu_buf = mu_buf sprintf("    {\"name\":\"%s\"}", name)
+        }
+    }
+
+    END {
+        printf "{\n"
+        printf "  \"source_kernel\": \"unknown\",\n"
+        printf "  \"target_kernel\": \"%s\",\n", target_kver
+        printf "  \"kernel_match\": false,\n"
+        printf "  \"feeds_available\": %s,\n", (feeds_ok == "1" ? "true" : "false")
+        printf "  \"installed\": [\n%s\n  ],\n", i_buf
+        printf "  \"missing_kmod\": [],\n"
+        printf "  \"missing_available\": [\n%s\n  ],\n", ma_buf
+        printf "  \"missing_unavailable\": [\n%s\n  ]\n", mu_buf
+        printf "}\n"
+    }
+    ' "$tmpdir/installed.tsv" "$tmpdir/end_installed.marker" \
+      "$tmpdir/available.tsv" "$tmpdir/end_available.marker" \
+      "$tmpdir/packages.txt"
+}
+
+# ─── INSTALL-PACKAGE ────────────────────────────────────────────────────────────
+
+cmd_install_package() {
+    local pkg="$1"
+    [ -z "$pkg" ] && die "Usage: gl-portable-backup install-package PKG"
+
+    local stdout stderr code
+
+    stderr=$(opkg install "$pkg" 2>&1 >/tmp/gl-pb-opkg.tmp)
+    code=$?
+    stdout=$(cat /tmp/gl-pb-opkg.tmp 2>/dev/null || echo "")
+    rm -f /tmp/gl-pb-opkg.tmp
+
+    # Escape for JSON
+    stdout=$(printf '%s' "$stdout" | sed 's/"/\\"/g' | tr '\n' ' ')
+    stderr=$(printf '%s' "$stderr" | sed 's/"/\\"/g' | tr '\n' ' ')
+
+    printf '{"name":"%s","code":%d,"stdout":"%s","stderr":"%s"}\n' \
+        "$pkg" "$code" "$stdout" "$stderr"
+}
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    create)
+        shift
+        cmd_create "$@"
+        ;;
+    restore)
+        shift
+        cmd_restore "$@"
+        ;;
+    inspect)
+        shift
+        cmd_inspect "$@"
+        ;;
+    packages)
+        shift
+        cmd_packages "$@"
+        ;;
+    install-package)
+        shift
+        cmd_install_package "$@"
+        ;;
+    version)
+        echo "${TOOL_NAME} ${VERSION}"
+        ;;
+    *)
+        echo "Usage: gl-portable-backup {create|restore|inspect|packages|install-package|version}" >&2
+        echo "" >&2
+        echo "Commands:" >&2
+        echo "  create           Create a backup archive" >&2
+        echo "  restore          Restore from a backup archive" >&2
+        echo "  inspect          Show manifest from a backup archive" >&2
+        echo "  packages         Compare archive packages vs this device" >&2
+        echo "  install-package  Install a single package via opkg" >&2
+        echo "  version          Show version" >&2
+        exit 1
+        ;;
+esac

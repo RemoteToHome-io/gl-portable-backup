@@ -1,0 +1,9 @@
+#!/bin/sh
+# Clear LuCI caches so the new menu/ACL register immediately.
+# Skipped during image builds (IPKG_INSTROOT set), matching the SDK default.
+[ -n "${IPKG_INSTROOT}" ] || {
+	rm -f /tmp/luci-indexcache
+	rm -rf /tmp/luci-modulecache/
+	killall -HUP rpcd 2>/dev/null
+}
+exit 0

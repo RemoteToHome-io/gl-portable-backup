@@ -1,0 +1,15 @@
+# Build artifacts
+*.ipk
+*.tar.gz
+/build/
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
