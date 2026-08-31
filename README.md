@@ -1,7 +1,8 @@
 # GL Portable Backup
 
-## THIS REPO IS AN EARLY WORK IN PROGRESS.  Significant addition are coming when time permits. ##
+** THIS REPO IS AN EARLY WORK IN PROGRESS.  Significant addition are coming when time permits. **
 Until then, I would recommend checking out: https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility
+
 
 Portable configuration backup and restore for GL.iNet routers. Creates backups with four modes tailored to different deployment scenarios — from fleet cloning to cross-model profile transfer.
 
