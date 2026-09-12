@@ -483,7 +483,7 @@ capture_profile() {
 
 get_kernel_version() {
     awk '/^Package: kernel$/{found=1} found && /^Version:/{print $2; exit}' \
-        /usr/lib/opkg/status 2>/dev/null || echo "unknown"
+        "$ROOT/usr/lib/opkg/status" 2>/dev/null || echo "unknown"
 }
 
 # Capture user-installed packages with full metadata as JSON
@@ -543,14 +543,14 @@ capture_packages_json() {
         flush()
         printf "\n  ]\n}\n"
     }
-    ' /usr/lib/opkg/status > "$outfile" 2>/dev/null
+    ' "$ROOT/usr/lib/opkg/status" > "$outfile" 2>/dev/null
 }
 
 # Legacy name-only capture for backward compatibility
 capture_packages_txt() {
     local outfile="$1"
     awk '/^Package:/{p=$2} /Status:.*user installed/{print p}' \
-        /usr/lib/opkg/status > "$outfile" 2>/dev/null || true
+        "$ROOT/usr/lib/opkg/status" > "$outfile" 2>/dev/null || true
 }
 
 # ─── Manifest ──────────────────────────────────────────────────────────────────
@@ -1142,7 +1142,7 @@ cmd_packages() {
 
     # Get target device installed packages (all installed, not just user-installed)
     awk '/^Package:/{pkg=$2} /^Version:/{ver=$2} /^Status:.*installed/{print pkg "\t" ver}' \
-        /usr/lib/opkg/status > "$tmpdir/installed.tsv" 2>/dev/null
+        "$ROOT/usr/lib/opkg/status" > "$tmpdir/installed.tsv" 2>/dev/null
 
     # Get available packages from opkg feeds (best-effort)
     local feeds_ok=0
