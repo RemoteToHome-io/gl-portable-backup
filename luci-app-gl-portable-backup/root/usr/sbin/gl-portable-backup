@@ -78,7 +78,7 @@ get_datestamp() {
 gl_auth() {
     local challenge nonce shadow_hash login_str login_hash result
 
-    challenge=$(curl -sf "http://localhost/rpc" \
+    challenge=$(curl -sf "http://127.0.0.1/rpc" \
         -d '{"jsonrpc":"2.0","id":1,"method":"challenge","params":{"username":"root"}}')
     [ -z "$challenge" ] && return 1
 
@@ -92,14 +92,16 @@ gl_auth() {
         login_hash=$(printf "%s" "$login_str" | md5sum | awk '{print $1}')
     fi
 
-    result=$(curl -sf "http://localhost/rpc" \
+    result=$(curl -sf "http://127.0.0.1/rpc" \
         -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"login\",\"params\":{\"username\":\"root\",\"hash\":\"$login_hash\"}}")
     echo "$result" | jsonfilter -e '@.result.sid'
 }
 
 gl_api() {
-    local sid="$1" module="$2" method="$3" params="${4:-{}}"
-    curl -sf "http://localhost/rpc" \
+    local sid="$1" module="$2" method="$3" params="${4-}"
+    [ -n "$params" ] || params='{}'
+    vlog "rpc $module.$method $params"
+    curl -sf "http://127.0.0.1/rpc" \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$sid\",\"$module\",\"$method\",$params]}"
 }
 
