@@ -15,6 +15,11 @@ FORMAT_VERSION=3
 TOOL_NAME="gl-portable-backup"
 ARCHIVE_PREFIX="gl-portable-backup"
 
+# Filesystem prefix for tests (empty on the router). Every capture/restore path below uses it.
+ROOT="${GPB_ROOT:-}"
+GPB_VERBOSE="${GPB_VERBOSE:-0}"
+vlog() { [ "$GPB_VERBOSE" = 1 ] && echo "  [v] $*" >&2; return 0; }
+
 # Remote-access config files excluded in remote-safe mode (entire files)
 REMOTE_SAFE_EXCLUDE_FILES="zerotier tailscale gl-cloud rtty dropbear wan-access"
 
@@ -32,19 +37,18 @@ die() {
 }
 
 get_model_id() {
-    jsonfilter -i /etc/board.json -e '@.model.id'
+    jsonfilter -i "$ROOT/etc/board.json" -e '@.model.id'
 }
 
 get_model_name() {
-    jsonfilter -i /etc/board.json -e '@.model.name'
+    jsonfilter -i "$ROOT/etc/board.json" -e '@.model.name'
 }
 
-get_model_short() {
-    get_model_id | sed 's/glinet,//' | tr 'a-z' 'A-Z' | sed 's/-SNAND//'
-}
+get_model_short_from_id() { printf '%s' "$1" | sed 's/glinet,//' | tr 'a-z' 'A-Z' | sed 's/-SNAND//'; }
+get_model_short() { get_model_short_from_id "$(get_model_id)"; }
 
 get_fw_version() {
-    cat /etc/glversion 2>/dev/null || echo "unknown"
+    cat "$ROOT/etc/glversion" 2>/dev/null || echo "unknown"
 }
 
 get_openwrt_version() {
@@ -156,14 +160,14 @@ capture_hardware_ids() {
     local mac_lan mac_wan label_mac mac_wifi ddns_user ddns_domain ddns_param
 
     # LAN/WAN MACs from board.json
-    mac_lan=$(jsonfilter -i /etc/board.json -e '@.network.lan.macaddr' 2>/dev/null || echo "")
-    mac_wan=$(jsonfilter -i /etc/board.json -e '@.network.wan.macaddr' 2>/dev/null || echo "")
-    label_mac=$(jsonfilter -i /etc/board.json -e '@.system.label_macaddr' 2>/dev/null || echo "")
+    mac_lan=$(jsonfilter -i "$ROOT/etc/board.json" -e '@.network.lan.macaddr' 2>/dev/null || echo "")
+    mac_wan=$(jsonfilter -i "$ROOT/etc/board.json" -e '@.network.wan.macaddr' 2>/dev/null || echo "")
+    label_mac=$(jsonfilter -i "$ROOT/etc/board.json" -e '@.system.label_macaddr' 2>/dev/null || echo "")
 
     # Wi-Fi MACs from wireless config
     mac_wifi=""
     local iface_macs
-    iface_macs=$(grep 'option macaddr' /etc/config/wireless 2>/dev/null | awk '{print $3}' | tr -d "'" | sort -u)
+    iface_macs=$(grep 'option macaddr' "$ROOT/etc/config/wireless" 2>/dev/null | awk '{print $3}' | tr -d "'" | sort -u)
     for m in $iface_macs; do
         if [ -n "$mac_wifi" ]; then
             mac_wifi="${mac_wifi}, \"${m}\""
@@ -186,7 +190,7 @@ capture_hardware_ids() {
   "ddns_username": "${ddns_user}",
   "ddns_domain": "${ddns_domain}",
   "ddns_param_enc": "${ddns_param}",
-  "board_json": $(cat /etc/board.json)
+  "board_json": $(cat "$ROOT/etc/board.json")
 }
 EOF
 }
@@ -196,7 +200,7 @@ EOF
 # Enumerate all persistent file paths declared in /lib/upgrade/keep.d/*
 # Output: one absolute file path per line, sorted and deduplicated
 enumerate_keepd_paths() {
-    for keepfile in /lib/upgrade/keep.d/*; do
+    for keepfile in "$ROOT"/lib/upgrade/keep.d/*; do
         [ -f "$keepfile" ] || continue
         while IFS= read -r path || [ -n "$path" ]; do
             # Strip comments and whitespace
@@ -258,7 +262,7 @@ capture_extra_files() {
         local relpath="${filepath#/}"
         local destdir="$extradir/$(dirname "$relpath")"
         mkdir -p "$destdir"
-        cp -a "$filepath" "$destdir/"
+        cp -a "$ROOT$filepath" "$destdir/"
     done < "$pathlist"
 
     rm -f "$pathlist"
@@ -275,9 +279,9 @@ restore_extra_files() {
     local count=0
     local relfile
     for relfile in $(cd "$tmpdir/extra" && find . -type f | sed 's|^\./||'); do
-        local destdir="/$(dirname "$relfile")"
+        local destdir="$ROOT/$(dirname "$relfile")"
         mkdir -p "$destdir"
-        cp -a "$tmpdir/extra/$relfile" "/$relfile"
+        cp -a "$tmpdir/extra/$relfile" "$ROOT/$relfile"
         count=$((count + 1))
     done
     echo "$count"
@@ -652,7 +656,7 @@ cmd_create() {
     else
         # Clone, Remote-Safe, Full: copy UCI config files
         mkdir -p "$archdir/config"
-        cp -a /etc/config/* "$archdir/config/"
+        cp -a "$ROOT"/etc/config/. "$archdir/config/"
         echo "  Copied $(ls "$archdir/config/" | wc -l) UCI config files" >&2
 
         # Capture packages (enriched JSON + legacy text)
@@ -861,7 +865,7 @@ restore_portable() {
         for f in "$tmpdir/config"/*; do
             [ -f "$f" ] || continue
             local name=$(basename "$f")
-            cp -a "$f" "/etc/config/$name"
+            cp -a "$f" "$ROOT/etc/config/$name"
         done
     fi
 
@@ -1093,7 +1097,7 @@ restore_full() {
         for f in "$tmpdir/config"/*; do
             [ -f "$f" ] || continue
             local name=$(basename "$f")
-            cp -a "$f" "/etc/config/$name"
+            cp -a "$f" "$ROOT/etc/config/$name"
         done
     fi
 
@@ -1351,6 +1355,13 @@ cmd_install_package() {
 }
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
+
+# Library mode for tests: source with GPB_LIB_ONLY=1 and call functions directly.
+if [ "${GPB_LIB_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
+case "${1:-}" in
+    -v|--verbose) GPB_VERBOSE=1; shift ;;
+esac
 
 case "${1:-}" in
     create)

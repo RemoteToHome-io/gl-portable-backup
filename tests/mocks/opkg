@@ -1,0 +1,2 @@
+#!/bin/sh
+case "$1" in list-changed-conffiles) cat "${MOCK_OPKG_CONFFILES:-/dev/null}";; list-installed) cat "${MOCK_OPKG_INSTALLED:-/dev/null}";; *) exit 0;; esac

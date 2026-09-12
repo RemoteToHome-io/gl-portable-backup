@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "Public key portion is:"; echo "ssh-ed25519 AAAAmock"; echo "Fingerprint: SHA256:MOCKFINGERPRINT0000000000000000000000000000"

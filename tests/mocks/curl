@@ -1,0 +1,10 @@
+#!/bin/sh
+# mock curl: records the -d payload, replies from $MOCK_CURL_DIR/<key>.json, exit code $MOCK_CURL_EXIT.
+data=""
+while [ $# -gt 0 ]; do case "$1" in -d) data="$2"; shift 2;; *) shift;; esac; done
+printf '%s\n' "$data" >> "${MOCK_CURL_LOG:-/dev/null}"
+[ "${MOCK_CURL_EXIT:-0}" != 0 ] && exit "$MOCK_CURL_EXIT"
+key=$(printf '%s' "$data" | sed -n 's/.*"method":"\([a-z]*\)".*/\1/p')
+if [ "$key" = call ]; then key=$(printf '%s' "$data" | sed -n 's/.*"params":\["[^"]*","\([^"]*\)","\([^"]*\)".*/\1.\2/p'); fi
+f="${MOCK_CURL_DIR:-.}/$key.json"
+if [ -f "$f" ]; then cat "$f"; else printf '{"id":1,"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"}}'; fi
