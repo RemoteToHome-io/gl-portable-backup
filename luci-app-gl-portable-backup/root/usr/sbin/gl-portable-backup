@@ -7,6 +7,7 @@
 #   gl-portable-backup create [--mode clone|remote-safe|profile|full] [--output PATH] [--notes TEXT]
 #   gl-portable-backup restore ARCHIVE
 #   gl-portable-backup inspect ARCHIVE
+#   gl-portable-backup -v|--verbose <command> ...   (verbose logging; flag must come first)
 
 set -e
 
@@ -76,25 +77,23 @@ get_datestamp() {
 # ─── GL.iNet Local API Helper ─────────────────────────────────────────────────
 
 gl_auth() {
-    local challenge nonce shadow_hash login_str login_hash result
-
-    challenge=$(curl -sf "http://127.0.0.1/rpc" \
-        -d '{"jsonrpc":"2.0","id":1,"method":"challenge","params":{"username":"root"}}')
-    [ -z "$challenge" ] && return 1
-
-    nonce=$(echo "$challenge" | jsonfilter -e '@.result.nonce')
-    shadow_hash=$(awk -F: '/^root/{print $2}' /etc/shadow)
-
+    local challenge nonce shadow_hash login_str login_hash result rc
+    # Status is captured with "|| rc=$?": under dash, errexit propagates into $(...) and would abort
+    # this function before a following "rc=$?" ran (verified 2026-09-12 on dash, busybox sh, router ash).
+    rc=0; challenge=$(curl -sf "http://127.0.0.1/rpc" \
+        -d '{"jsonrpc":"2.0","id":1,"method":"challenge","params":{"username":"root"}}') || rc=$?
+    if [ $rc -ne 0 ] || [ -z "$challenge" ]; then echo "auth: challenge failed (curl exit $rc) — is the GL web service (nginx /rpc) running?" >&2; return 1; fi
+    nonce=$(echo "$challenge" | jsonfilter -e '@.result.nonce' 2>/dev/null) || { echo "auth: challenge reply has no nonce: $(printf '%s' "$challenge" | head -c 200)" >&2; return 1; }
+    shadow_hash=$(awk -F: '/^root/{print $2}' "$ROOT/etc/shadow")
     login_str="root:${shadow_hash}:${nonce}"
-    if echo "$challenge" | grep -q '"hash-method":"sha256"'; then
-        login_hash=$(printf "%s" "$login_str" | sha256sum | awk '{print $1}')
-    else
-        login_hash=$(printf "%s" "$login_str" | md5sum | awk '{print $1}')
-    fi
-
-    result=$(curl -sf "http://127.0.0.1/rpc" \
-        -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"login\",\"params\":{\"username\":\"root\",\"hash\":\"$login_hash\"}}")
-    echo "$result" | jsonfilter -e '@.result.sid'
+    if echo "$challenge" | grep -q '"hash-method":"sha256"'; then login_hash=$(printf "%s" "$login_str" | sha256sum | awk '{print $1}')
+    else login_hash=$(printf "%s" "$login_str" | md5sum | awk '{print $1}'); fi
+    rc=0; result=$(curl -sf "http://127.0.0.1/rpc" \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"login\",\"params\":{\"username\":\"root\",\"hash\":\"$login_hash\"}}") || rc=$?
+    [ $rc -eq 0 ] || { echo "auth: login request failed (curl exit $rc)" >&2; return 1; }
+    echo "$result" | jsonfilter -e '@.result.sid' 2>/dev/null && return 0
+    echo "auth: login refused: $(printf '%s' "$result" | head -c 200)" >&2
+    return 1
 }
 
 gl_api() {
@@ -131,27 +130,29 @@ reinitialize_ddns() {
         done
     done
 
-    # Authenticate and enable DDNS via API (initializes/re-registers device identity)
+    # Authenticate and enable DDNS via API (initializes/re-registers device identity). The
+    # preference re-apply and service restart below always run — even when auth fails — so a
+    # restore leaves DDNS in a consistent state; only the API-driven identity registration is
+    # skipped on failure.
     local sid
-    sid=$(gl_auth)
-    if [ -n "$sid" ]; then
+    if sid=$(gl_auth); then
         gl_api "$sid" "ddns" "set_config" '{"enable_ddns":true}' >/dev/null 2>&1
         echo "  DDNS enabled with device identity" >&2
-
-        # Re-apply backed-up operational preferences (API enable resets these)
-        for section in glddns glddnsv6; do
-            for field in check_interval check_unit force_interval force_unit; do
-                local val=$(cat "$ddns_prefs/${section}_${field}" 2>/dev/null)
-                [ -n "$val" ] && uci -q set gl_ddns.${section}.${field}="$val"
-            done
-        done
-        uci commit gl_ddns 2>/dev/null || true
-        /etc/init.d/gl_ddns restart 2>/dev/null || true
-        echo "  DDNS operational preferences restored" >&2
     else
-        echo "  WARNING: Could not authenticate to DDNS API — DDNS not initialized" >&2
-        echo "  Enable DDNS manually via GL admin panel" >&2
+        echo "  WARNING: local API auth failed — DDNS not re-initialised via API (service restart still runs)" >&2
     fi
+
+    # Re-apply backed-up operational preferences (API enable resets these)
+    for section in glddns glddnsv6; do
+        for field in check_interval check_unit force_interval force_unit; do
+            local val=$(cat "$ddns_prefs/${section}_${field}" 2>/dev/null)
+            [ -n "$val" ] && uci -q set gl_ddns.${section}.${field}="$val"
+        done
+    done
+    uci commit gl_ddns 2>/dev/null || true
+    /etc/init.d/gl_ddns restart 2>/dev/null || true
+    echo "  DDNS operational preferences restored" >&2
+
     rm -rf "$ddns_prefs"
 }
 
@@ -447,8 +448,7 @@ capture_profile() {
 
     mkdir -p "$apidir"
 
-    sid=$(gl_auth)
-    [ -z "$sid" ] && die "Failed to authenticate to local API"
+    sid=$(gl_auth) || die "Failed to authenticate to local API — see the line above"
 
     # Wi-Fi config
     gl_api "$sid" "wifi" "get_config" '{}' > "$apidir/wifi.json" 2>/dev/null || echo '{}' > "$apidir/wifi.json"
@@ -947,8 +947,7 @@ restore_profile() {
     [ -d "$apidir" ] || die "Invalid profile backup: no api/ directory"
 
     echo "Authenticating to local API..." >&2
-    sid=$(gl_auth)
-    [ -z "$sid" ] && die "Failed to authenticate to local API"
+    sid=$(gl_auth) || die "Failed to authenticate to local API — see the line above"
 
     # Restore timezone
     if [ -f "$apidir/timezone.json" ]; then
@@ -1399,6 +1398,9 @@ case "${1:-}" in
         echo "  packages         Compare archive packages vs this device" >&2
         echo "  install-package  Install a single package via opkg" >&2
         echo "  version          Show version" >&2
+        echo "" >&2
+        echo "Options:" >&2
+        echo "  -v, --verbose    Print each API call and diagnostic detail (put before the command)" >&2
         exit 1
         ;;
 esac
