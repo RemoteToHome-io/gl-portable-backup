@@ -128,17 +128,17 @@ return view.extend({
 				var bodyItems = [
 					E('p', _('Backup details:')),
 					E('ul', {}, [
-						E('li', {}, _('Mode: %s').format(modeLabels[manifest.mode] || manifest.mode)),
-						E('li', {}, _('Model: %s').format(manifest.source.model || 'unknown')),
-						E('li', {}, _('Hostname: %s').format(manifest.source.hostname || 'unknown')),
+						E('li', {}, [ _('Mode: %s').format(modeLabels[manifest.mode] || manifest.mode) ]),
+						E('li', {}, [ _('Model: %s').format(manifest.source.model || 'unknown') ]),
+						E('li', {}, [ _('Hostname: %s').format(manifest.source.hostname || 'unknown') ]),
 						E('li', {}, [
 							_('Firmware: %s').format(backupFw),
 							(!fwMatch && deviceFw !== 'unknown')
 								? E('span', { 'style': 'color: #c44; font-weight: bold' },
-									_(' (this device: %s)').format(deviceFw))
+									[ _(' (this device: %s)').format(deviceFw) ])
 								: ''
 						]),
-						E('li', {}, _('Created: %s').format(manifest.created_at || 'unknown'))
+						E('li', {}, [ _('Created: %s').format(manifest.created_at || 'unknown') ])
 					])
 				];
 
@@ -146,13 +146,13 @@ return view.extend({
 				if (!fwMatch && deviceFw !== 'unknown' && backupFw !== 'unknown'
 						&& manifest.mode !== 'profile') {
 					bodyItems.push(E('p', { 'class': 'alert-message warning' },
-						_('Firmware version mismatch: backup was created on %s, this device runs %s. UCI config schema may differ between firmware versions. Clone and Remote-Safe restores are safest between identical versions. Consider Profile mode for cross-version portability.').format(backupFw, deviceFw)));
+						[ _('Firmware version mismatch: backup was created on %s, this device runs %s. UCI config schema may differ between firmware versions. Clone and Remote-Safe restores are safest between identical versions. Consider Profile mode for cross-version portability.').format(backupFw, deviceFw) ]));
 				}
 
 				if (manifest.excluded_sections && manifest.excluded_sections.length > 0) {
 					bodyItems.push(E('p', { 'class': 'alert-message' },
-						_('The following configs will NOT be overwritten (preserved from this device): %s')
-							.format(manifest.excluded_sections.join(', '))));
+						[ _('The following configs will NOT be overwritten (preserved from this device): %s')
+							.format(manifest.excluded_sections.join(', ')) ]));
 				}
 
 				if (manifest.mode === 'full') {
@@ -163,9 +163,9 @@ return view.extend({
 				/* Identity overwrites: the SSH host keys (opt-out below) and the root password */
 				if (manifest.restores_ssh_host_keys) {
 					bodyItems.push(E('p', { 'class': 'alert-message warning' },
-						hostKeyFp
+						[ hostKeyFp
 							? _('WARNING: this archive restores the SSH host keys of the source router — SSH clients will see a changed key. Expected fingerprint after restore: %s').format(hostKeyFp)
-							: _('WARNING: this archive restores the SSH host keys of the source router — SSH clients will see a changed key.')));
+							: _('WARNING: this archive restores the SSH host keys of the source router — SSH clients will see a changed key.') ]));
 					bodyItems.push(E('div', { 'style': 'padding: 0.25em 0 0.75em' }, [
 						E('label', {}, [
 							E('input', { 'type': 'checkbox', 'id': 'gl-pb-keep-host-keys' }), ' ',
@@ -361,9 +361,9 @@ return view.extend({
 			];
 			data.missing_kmod.forEach(function(pkg) {
 				kmodRows.push(E('tr', { 'class': 'tr' }, [
-					E('td', { 'class': 'td left' }, pkg.name),
-					E('td', { 'class': 'td left' }, pkg.version || '-'),
-					E('td', { 'class': 'td left' }, pkg.description || '-')
+					E('td', { 'class': 'td left' }, [ pkg.name || '-' ]),
+					E('td', { 'class': 'td left' }, [ pkg.version || '-' ]),
+					E('td', { 'class': 'td left' }, [ pkg.description || '-' ])
 				]));
 			});
 			body.push(E('table', { 'class': 'table' }, kmodRows));
@@ -385,9 +385,9 @@ return view.extend({
 			];
 			data.missing_unavailable.forEach(function(pkg) {
 				unavRows.push(E('tr', { 'class': 'tr' }, [
-					E('td', { 'class': 'td left' }, pkg.name),
-					E('td', { 'class': 'td left' }, pkg.version || '-'),
-					E('td', { 'class': 'td left' }, pkg.description || '-')
+					E('td', { 'class': 'td left' }, [ pkg.name || '-' ]),
+					E('td', { 'class': 'td left' }, [ pkg.version || '-' ]),
+					E('td', { 'class': 'td left' }, [ pkg.description || '-' ])
 				]));
 			});
 			body.push(E('table', { 'class': 'table' }, unavRows));
@@ -433,13 +433,13 @@ return view.extend({
 				availList.appendChild(E('div', { 'style': 'padding: 0.25em 0' }, [
 					E('label', {}, [
 						cb, ' ',
-						E('strong', {}, pkg.name),
+						E('strong', {}, [ pkg.name || '' ]),
 						' ',
 						E('span', { 'style': 'color: #888' },
-							pkg.available_version || pkg.source_version || ''),
+							[ pkg.available_version || pkg.source_version || '' ]),
 						pkg.description
 							? E('span', { 'style': 'color: #666; margin-left: 1em' },
-								'\u2014 ' + pkg.description)
+								[ '\u2014 ' + pkg.description ])
 							: ''
 					])
 				]));
@@ -496,9 +496,9 @@ return view.extend({
 						: E('span', { 'style': 'color: #888' }, '-');
 
 				instRows.push(E('tr', { 'class': 'tr' }, [
-					E('td', { 'class': 'td left' }, pkg.name),
-					E('td', { 'class': 'td left' }, pkg.source_version || '-'),
-					E('td', { 'class': 'td left' }, pkg.target_version || '-'),
+					E('td', { 'class': 'td left' }, [ pkg.name || '-' ]),
+					E('td', { 'class': 'td left' }, [ pkg.source_version || '-' ]),
+					E('td', { 'class': 'td left' }, [ pkg.target_version || '-' ]),
 					E('td', { 'class': 'td left' }, [ statusEl ])
 				]));
 			});

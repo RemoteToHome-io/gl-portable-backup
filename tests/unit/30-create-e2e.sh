@@ -31,9 +31,14 @@ echo same > "$R/rom/etc/gl_crontabs/crontabs.d/auto_timezone"
 echo mine > "$R/etc/gl_crontabs/crontabs.d/user_job"              # edited by the user -> captured
 echo stock > "$R/rom/etc/gl_crontabs/crontabs.d/user_job"
 
+# A quote or a backslash in free text ends the JSON string it sits in, leaving a manifest no
+# restore can parse — the failure surfaces later as a bogus "Model mismatch. Backup: ,".
+assert_eq "$(json_escape 'a"b\c')" 'a\"b\\c' "json_escape quotes and backslashes"
+
 # Sub-shell form so the backend's own set -e is live (load_backend turns it off — see tests/lib.sh).
 mkdir -p "$T/out"
-archive=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode full --output "$T/out" 2>"$T/err"); rc=$?
+NOTES='say "hi" \ there'
+archive=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode full --notes "$NOTES" --output "$T/out" 2>"$T/err"); rc=$?
 assert_eq "$rc" 0 "cmd_create exit code"
 case "$archive" in
     "$T/out"/gl-backup-full-TESTHOST-MT3000-fw4-11-0-*.tar.gz) ;;
@@ -58,6 +63,20 @@ assert_contains "$err" "Skipped 2 firmware-owned, 1 identical to /rom" "skipped 
 mkdir -p "$T/x"; tar -xzf "$archive" -C "$T/x" gl-portable-backup/backup-info.txt
 assert_contains "$(cat "$T/x/gl-portable-backup/backup-info.txt")" \
     "Skipped:    2 firmware-owned, 1 identical to /rom" "backup-info skipped line"
+
+# The manifest still parses, and the note round-trips through it unchanged.
+insp=$(sh -c '. "$0"; cmd_inspect "$@"' "$BACKEND" "$archive"); rc=$?
+assert_eq "$rc" 0 "cmd_inspect exit code (escaped notes)"
+printf '%s' "$insp" | python3 -m json.tool >/dev/null 2>&1 \
+    || { echo "  manifest is not valid JSON: $insp"; exit 1; }
+assert_eq "$(printf '%s' "$insp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["notes"])')" \
+    "$NOTES" "notes round-trip through the manifest"
+
+# A newline cannot be expressed in this manifest's string form at all, so it is refused up front.
+out=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode full --notes 'line one
+line two' --output "$T/out" 2>&1); rc=$?
+assert_eq "$rc" 1 "cmd_create rejects a multi-line --notes"
+assert_contains "$out" "single line" "reason given for the rejected --notes"
 
 # --include-plugins opts the out-of-/etc files back in.
 mkdir -p "$T/out2"

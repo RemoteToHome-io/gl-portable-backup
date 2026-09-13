@@ -78,6 +78,10 @@ get_datestamp() {
     date +%Y%m%d-%H%M
 }
 
+# Make a value safe to sit inside a JSON string literal. Backslash first, or the escape added for
+# a quote would itself be escaped. A newline cannot be expressed this way — callers reject one.
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
 resolve_output_path() {
     local out="$1" name="$2"
     if [ -z "$out" ]; then echo "/tmp/$name"
@@ -152,7 +156,7 @@ reinitialize_ddns() {
     # skipped on failure.
     local sid
     if sid=$(gl_auth); then
-        gl_api "$sid" "ddns" "set_config" '{"enable_ddns":true}' >/dev/null 2>&1
+        gl_api "$sid" "ddns" "set_config" '{"enable_ddns":true}' >/dev/null 2>&1 || echo "  WARNING: ddns.set_config failed" >&2
         echo "  DDNS enabled with device identity" >&2
     else
         echo "  WARNING: local API auth failed — DDNS not re-initialised via API (service restart still runs)" >&2
@@ -363,19 +367,29 @@ restore_extra_files() {
     local tmpdir="$1"
     [ -d "$tmpdir/extra" ] || return 0
 
+    # The relative paths go through a file and are read one line at a time. A `for f in $(find …)`
+    # form would word-split a name holding a space and pathname-expand one holding * or ?, so the
+    # copy aborted part-way through a restore and the count counted the fragments. Reading from a
+    # file rather than a pipe also keeps the loop in this shell, so the count survives it — the
+    # same pattern capture_extra_files uses.
+    local pathlist=$(mktemp)
+    (cd "$tmpdir/extra" && find . -type f | sed 's|^\./||') > "$pathlist"
+
     local count=0
-    local relfile
-    for relfile in $(cd "$tmpdir/extra" && find . -type f | sed 's|^\./||'); do
+    local relfile destdir
+    while IFS= read -r relfile; do
         # --keep-host-keys leaves this unit's SSH identity alone. authorized_keys is never
         # skipped: which keys may log in is user configuration, the host key is identity.
         case "$relfile" in
             etc/dropbear/dropbear_*_host_key) [ "${GPB_KEEP_HOST_KEYS:-0}" = 1 ] && continue ;;
         esac
-        local destdir="$ROOT/$(dirname "$relfile")"
+        destdir="$ROOT/$(dirname "$relfile")"
         mkdir -p "$destdir"
         cp -a "$tmpdir/extra/$relfile" "$ROOT/$relfile"
         count=$((count + 1))
-    done
+    done < "$pathlist"
+
+    rm -f "$pathlist"
     echo "$count"
 }
 
@@ -680,6 +694,13 @@ write_manifest() {
     local excluded="$5"
     local extra_files="$6"
 
+    # The two free-text fields are the only ones a user or a hostname can put a quote or a
+    # backslash into; unescaped, either ends the JSON string and leaves a manifest jsonfilter
+    # cannot read, which surfaces on restore as a bogus model mismatch against an empty value.
+    notes=$(json_escape "$notes")
+    local hostname
+    hostname=$(json_escape "$(get_hostname)")
+
     cat > "$outfile" <<EOF
 {
   "format_version": ${FORMAT_VERSION},
@@ -693,7 +714,7 @@ write_manifest() {
     "firmware_version": "$(get_fw_version)",
     "openwrt_version": "$(get_openwrt_version)",
     "architecture": "$(get_architecture)",
-    "hostname": "$(get_hostname)"
+    "hostname": "${hostname}"
   },
   "sections": [${sections}],
   "excluded_sections": [${excluded}],
@@ -740,6 +761,11 @@ cmd_create() {
         clone|remote-safe|profile|full) ;;
         *) die "Invalid mode: $mode (must be clone, remote-safe, profile, or full)" ;;
     esac
+
+    # A newline would break the manifest's "notes" string across lines, and no escaping in
+    # json_escape can express one, so it is refused here rather than written into an archive that
+    # cannot be restored. wc -l counts the newlines in the value itself (printf adds none).
+    [ "$(printf '%s' "$notes" | wc -l)" -eq 0 ] || die "--notes must be a single line (no newline)"
 
     local tmpdir=$(mktemp -d)
     trap "rm -rf '$tmpdir'" EXIT
@@ -1078,11 +1104,19 @@ restore_portable() {
         for f in $REMOTE_SAFE_EXCLUDE_FILES; do
             [ -f "$ROOT/etc/config/$f" ] && cp -a "$ROOT/etc/config/$f" "$saved_hw/$f"
         done
-        # Save the network interface sections we need to preserve
-        # (zerotier, tailscale, etc.)
+        # LIMITATION (1.1): only whole excluded FILES are preserved. The target's own
+        # zerotier*/tailscale* sections inside network and firewall — the interface, its zone and
+        # its forwardings — are not extracted here, so restore_config_tree below overwrites them
+        # with the archive's filtered copies, which have none. The tunnel's daemon keeps running
+        # and its own config file is preserved, but LAN forwarding and masquerade for it are gone
+        # until the service is re-enabled. The notice below says so; implementing the preservation
+        # is the fix.
     fi
 
     echo "Applying backup configs..." >&2
+    if [ "$mode" = "remote-safe" ]; then
+        echo "NOTE: this release restores the archive's network/firewall files as filtered; the target's ZeroTier/Tailscale interface, zone and forwarding sections are NOT re-added — re-enable those services after the restore" >&2
+    fi
 
     # Apply config files from archive
     echo "  Restored $(restore_config_tree "$tmpdir/config") config entries" >&2
@@ -1186,7 +1220,7 @@ restore_profile() {
         if [ -n "$tz_result" ] && [ "$tz_result" != "null" ]; then
             local zonename=$(jsonfilter -i "$tz_file" -e '@.result.zonename' 2>/dev/null)
             if [ -n "$zonename" ]; then
-                gl_api "$sid" "system" "set_timezone_config" "{\"zonename\":\"$zonename\"}" >/dev/null 2>&1
+                gl_api "$sid" "system" "set_timezone_config" "{\"zonename\":\"$zonename\"}" >/dev/null 2>&1 || echo "  WARNING: system.set_timezone_config failed" >&2
                 echo "  Restored timezone: $zonename" >&2
             fi
         fi
@@ -1204,7 +1238,7 @@ restore_profile() {
                 local params="{\"mode\":\"$dns_mode\""
                 [ -n "$force_dns" ] && params="${params},\"force_dns\":$force_dns"
                 params="${params}}"
-                gl_api "$sid" "dns" "set_config" "$params" >/dev/null 2>&1
+                gl_api "$sid" "dns" "set_config" "$params" >/dev/null 2>&1 || echo "  WARNING: dns.set_config failed" >&2
                 echo "  Restored DNS config" >&2
             fi
         fi
@@ -1217,7 +1251,7 @@ restore_profile() {
         local hosts_content=$(jsonfilter -i "$hosts_file" -e '@.result.content' 2>/dev/null)
         if [ -n "$hosts_content" ]; then
             local escaped=$(echo "$hosts_content" | sed 's/"/\\"/g')
-            gl_api "$sid" "dns" "set_host" "{\"content\":\"$escaped\"}" >/dev/null 2>&1
+            gl_api "$sid" "dns" "set_host" "{\"content\":\"$escaped\"}" >/dev/null 2>&1 || echo "  WARNING: dns.set_host failed" >&2
             echo "  Restored DNS hosts" >&2
         fi
     fi
@@ -1228,7 +1262,7 @@ restore_profile() {
     if [ -n "$led_file" ]; then
         local led_enable=$(jsonfilter -i "$led_file" -e '@.result.led_enable' 2>/dev/null)
         if [ -n "$led_enable" ]; then
-            gl_api "$sid" "led" "set_config" "{\"led_enable\":$led_enable}" >/dev/null 2>&1
+            gl_api "$sid" "led" "set_config" "{\"led_enable\":$led_enable}" >/dev/null 2>&1 || echo "  WARNING: led.set_config failed" >&2
             echo "  Restored LED config" >&2
         fi
     fi
@@ -1327,11 +1361,11 @@ restore_profile_dhcp_static() {
 
             if [ "$existing" -gt 0 ]; then
                 # Update existing binding
-                gl_api "$sid" "lan" "set_static_bind" "$params" >/dev/null 2>&1
+                gl_api "$sid" "lan" "set_static_bind" "$params" >/dev/null 2>&1 || echo "  WARNING: lan.set_static_bind failed" >&2
                 echo "    Updated: $mac -> $ip ($name)" >&2
             else
                 # Add new binding
-                gl_api "$sid" "lan" "add_static_bind" "$params" >/dev/null 2>&1
+                gl_api "$sid" "lan" "add_static_bind" "$params" >/dev/null 2>&1 || echo "  WARNING: lan.add_static_bind failed" >&2
                 echo "    Added: $mac -> $ip ($name)" >&2
             fi
         fi
