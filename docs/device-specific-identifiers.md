@@ -91,7 +91,9 @@ These are read-only API responses — the API does not set MACs.
 - It is stored in firmware/EEPROM, not in UCI config files.
 - It does NOT appear in `/etc/config/` — no UCI path to strip.
 - It is NOT captured in `sysupgrade -b` backups.
-- **No action needed** for portable backup — serial number is not in the backup.
+- **Clone/Remote-Safe:** nothing to strip from `/etc/config/` — the serial number was never
+  there. **Profile:** captured — the stored `system.get_info` reply includes `sn`, `sn_bak`, and
+  the base `mac`.
 
 ---
 
@@ -314,6 +316,8 @@ first start. These form a PKI identity unique to the device.
 - **Both `gl-cloud` and `rtty` are excluded entirely in Remote-Safe mode.**
 - In Clone mode, these configs ARE captured. The target device will lose its
   GoodCloud binding and need to be re-bound.
+- **Profile mode does not capture `cloud.get_config`** — the binding is this device's identity,
+  and a Profile archive is meant for a different device.
 
 ---
 
@@ -447,9 +451,12 @@ nothing else in this table is in our archives at all:
 
 | Item | Location | Regeneration |
 |------|----------|-------------|
-| Serial number | Firmware/EEPROM | N/A — hardware-burned |
 | `board.json` | `/etc/board.json` | N/A — factory-set |
 | ZeroTier node identity (files) | `/var/lib/zerotier-one/identity.*` | Auto-generated if missing |
+
+Serial number is not in `/etc/config/` either, but it is left out of this table because Profile
+mode does capture it, via the stored `system.get_info` reply (`sn`, `sn_bak`, plus the base
+`mac`) — see §2.
 
 ### Captured, But Only in Some Modes
 
