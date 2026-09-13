@@ -677,7 +677,7 @@ cmd_create() {
         # Clone, Remote-Safe, Full: copy UCI config files
         mkdir -p "$archdir/config"
         cp -a "$ROOT"/etc/config/. "$archdir/config/"
-        echo "  Copied $(ls "$archdir/config/" | wc -l) UCI config files" >&2
+        echo "  Copied $(ls -A "$archdir/config/" | wc -l) UCI config files" >&2
 
         # Capture packages (enriched JSON + legacy text)
         capture_packages_json "$archdir/packages.json"
@@ -855,6 +855,14 @@ cmd_restore() {
     echo "RESTORE_OK"
 }
 
+restore_config_tree() {
+    local src="$1"
+    [ -d "$src" ] || { echo 0; return 0; }
+    mkdir -p "$ROOT/etc/config"
+    cp -a "$src"/. "$ROOT/etc/config/"
+    find "$src" -type f | wc -l
+}
+
 restore_portable() {
     local tmpdir="$1"
     local mode="$2"
@@ -879,13 +887,7 @@ restore_portable() {
     echo "Applying backup configs..." >&2
 
     # Apply config files from archive
-    if [ -d "$tmpdir/config" ]; then
-        for f in "$tmpdir/config"/*; do
-            [ -f "$f" ] || continue
-            local name=$(basename "$f")
-            cp -a "$f" "$ROOT/etc/config/$name"
-        done
-    fi
+    echo "  Restored $(restore_config_tree "$tmpdir/config") config entries" >&2
 
     # Restore non-UCI persistent files (keep.d)
     if [ -d "$tmpdir/extra" ]; then
@@ -1110,13 +1112,7 @@ restore_full() {
 
     echo "Applying full backup (hardware IDs will be overwritten)..." >&2
 
-    if [ -d "$tmpdir/config" ]; then
-        for f in "$tmpdir/config"/*; do
-            [ -f "$f" ] || continue
-            local name=$(basename "$f")
-            cp -a "$f" "$ROOT/etc/config/$name"
-        done
-    fi
+    echo "  Restored $(restore_config_tree "$tmpdir/config") config entries" >&2
 
     # Restore non-UCI persistent files (keep.d)
     if [ -d "$tmpdir/extra" ]; then
