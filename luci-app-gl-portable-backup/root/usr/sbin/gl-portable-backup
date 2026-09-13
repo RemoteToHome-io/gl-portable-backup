@@ -696,10 +696,10 @@ cmd_create() {
         pkg_count=$(count_packages_json "$archdir/packages.json")
         echo "  Captured ${pkg_count} user-installed packages" >&2
 
-        # Capture non-UCI persistent files from keep.d
+        # Capture non-UCI persistent files: keep.d, /etc/sysupgrade.conf, changed conffiles
         local extra_count
         extra_count=$(capture_extra_files "$archdir" "$mode")
-        echo "  Captured ${extra_count} extra persistent files (keep.d)" >&2
+        echo "  Captured ${extra_count} extra persistent files" >&2
 
         if [ "$mode" = "clone" ] || [ "$mode" = "remote-safe" ]; then
             # Strip hardware-specific fields
