@@ -31,6 +31,8 @@ to a different device overwrites the target's MACs — breaking networking.
 - WAN MAC is typically LAN MAC minus 1 or 2 (vendor-specific offset).
 - On MT6000: 6 device sections use LAN MAC, 1 uses WAN MAC.
 - On MT3000: fewer device sections but same pattern.
+- The same `network.@device[N].macaddr` pattern also covers `br-guest` and `br-iot` device
+  sections where they exist — one strip rule (`option macaddr` in `network`) covers all of them.
 
 ### 1.2 Wi-Fi Interface MACs
 
@@ -40,6 +42,7 @@ to a different device overwrites the target's MACs — breaking networking.
 | `/etc/config/wireless` | `wireless.wifi5g.macaddr` | 5 GHz main interface | `8A:53:8C:A0:3C:92` |
 | `/etc/config/wireless` | `wireless.guest2g.macaddr` | 2.4 GHz guest interface | `16:8D:F3:BB:4E:B1` |
 | `/etc/config/wireless` | `wireless.guest5g.macaddr` | 5 GHz guest interface | `22:3E:88:27:53:9D` |
+| `/etc/config/wireless` | `wireless.<iface>.factory_macaddr` | Hardware radio MAC, firmware 4.9+ | (vendor-assigned) |
 
 **Notes:**
 - Wi-Fi MACs are **locally-administered** (LAA bit set) — generated per-device
@@ -47,8 +50,24 @@ to a different device overwrites the target's MACs — breaking networking.
 - These are NOT in `board.json`. They are only in `/etc/config/wireless`.
 - Number of interfaces varies by model (some have 6G, some have only 2G+5G).
 - On restore, the target device's existing Wi-Fi MACs must be preserved.
+- `factory_macaddr` (firmware 4.9+) is the radio's hardware-burned MAC, distinct from the
+  locally-administered `macaddr` above. It is stripped in Clone and Remote-Safe alongside
+  `macaddr`.
 
-### 1.3 MAC Address in API Responses
+### 1.3 Repeater and Per-Port Hardware MACs (firmware 4.9+/4.11)
+
+| Location | UCI Path | Description |
+|----------|----------|-------------|
+| `/etc/config/repeater` | `repeater.@main[0].macaddr` | Repeater main-section MAC |
+| `/etc/config/repeater` | `repeater.@network[N].macaddr` | Per-saved-network MAC (repeater's saved-AP list) |
+| `/etc/config/eth_ports_config_map` | `eth_ports_config_map.@port[N].default_mac` | Per-Ethernet-port hardware MAC, firmware 4.11 |
+
+**Notes:**
+- Both files are stripped in Clone and Remote-Safe mode, the same as the MAC fields in §1.1–1.2.
+- `eth_ports_config_map` is new in firmware 4.11 (per-port MAC-mode mapping); it does not exist
+  on 4.9 or earlier.
+
+### 1.4 MAC Address in API Responses
 
 | API Endpoint | Field | Description |
 |-------------|-------|-------------|
@@ -172,11 +191,16 @@ first start. These form a PKI identity unique to the device.
 **Notes:**
 - The `ovpnserver` UCI config file itself is mostly not device-specific (it
   contains protocol/port/cipher settings that are deployment choices).
-- The actual PKI material lives in `/etc/openvpn/` — these files are NOT in
-  `/etc/config/` and are NOT captured by our backup tool (which only copies
-  `/etc/config/*`).
-- If you restore a clone backup and then start the OpenVPN server, GL firmware
-  will regenerate the PKI material automatically.
+- The actual PKI material lives in `/etc/openvpn/`, outside `/etc/config/`, so it is not part of
+  `config/`. It IS captured under `extra/` via the `openvpn` keep.d declaration — in Full, Clone,
+  and Remote-Safe modes alike.
+- This PKI is device-specific: certs are issued by this device's own CA and are not portable to
+  a different physical unit. A **Full** restore puts it back onto the *same* device, which is
+  correct. Clone and Remote-Safe capture it too, but restoring onto a *different* device (Clone's
+  normal use case) carries the source device's OpenVPN PKI onto the target rather than generating
+  new, target-specific material — treat OpenVPN server certs as same-device-only, same as the SSH
+  host keys in §6, and regenerate them on the target after a cross-device Clone restore if you use
+  the OpenVPN server role.
 - OpenVPN user credentials (username/password) are stored in the `ovpnserver`
   config and ARE deployment-specific — they transfer with the backup.
 
@@ -193,14 +217,18 @@ first start. These form a PKI identity unique to the device.
 **Notes:**
 - SSH host keys are unique per device. They are what SSH clients use to verify
   they're connecting to the same device (host key fingerprint).
-- These files live in `/etc/dropbear/`, NOT in `/etc/config/`. They are NOT
-  captured by our backup tool.
+- These files live in `/etc/dropbear/`, NOT in `/etc/config/`. They ARE captured under `extra/`
+  via the `dropbear` keep.d declaration, but only in **Full** mode — Clone and Remote-Safe strip
+  them at capture time.
 - The `dropbear` UCI config (`/etc/config/dropbear`) contains SSH port and
   authentication settings — this IS in the backup but is not device-specific
   (it's a deployment choice). In Remote-Safe mode, this file is excluded to
   preserve the target's SSH configuration.
-- On restore, the target device keeps its own SSH host keys. Clients will see
-  the correct host key fingerprint.
+- On a **Full** restore, the target's SSH host keys are overwritten with the source's — SSH
+  clients will see a changed key on the next connection. `gl-portable-backup restore` and
+  `gl-portable-backup fingerprint ARCHIVE` both print the expected fingerprint beforehand;
+  `--keep-host-keys` keeps the target's own keys instead. Clone and Remote-Safe restores never
+  touch host keys (they were never captured), so the target keeps its own as before.
 
 ---
 
@@ -209,21 +237,27 @@ first start. These form a PKI identity unique to the device.
 | Location | UCI Path | Description | Example |
 |----------|----------|-------------|---------|
 | `/etc/config/zerotier` | `zerotier.gl.join` | ZT network join ID | `93afae59635b3dfe` |
+| `/etc/config/zerotier` | `zerotier.gl.secret` | ZT node private identity, mirrored into UCI on firmware 4.9+ | (256-bit key) |
 | `/var/lib/zerotier-one/identity.secret` | (file) | ZT node private identity | (256-bit key) |
 | `/var/lib/zerotier-one/identity.public` | (file) | ZT node public identity | (256-bit key) |
 
 **Notes:**
 - The UCI config contains the network join ID — which network this device
   belongs to. Overwriting it disconnects the device from its ZT network.
-- The actual node identity (cryptographic keypair) is in `/var/lib/zerotier-one/`.
-  This is NOT in `/etc/config/` and is not captured by our backup.
+- The node identity (cryptographic keypair) lives in `/var/lib/zerotier-one/` — NOT in
+  `/etc/config/`, and not captured by our backup. On firmware 4.9 and later, GL.iNet also mirrors
+  the node's private key into UCI as `zerotier.gl.secret`; this copy IS in `/etc/config/zerotier`
+  and IS captured whenever that file is (Full and Clone). It's why a **Full** restore brings the
+  source's ZT node ID back rather than leaving the target with a fresh identity — the UCI copy
+  reaches the daemon the same as the `/var/lib` files would.
 - The ZT node identity determines the device's ZT address (10-digit hex).
   Changing it means the device appears as a new node on the network.
-- **Excluded entirely in Remote-Safe mode** — both the UCI config file and
-  the associated network/firewall interface sections.
-- In Clone mode, the ZT config IS captured (but the node identity in /var/lib
-  is not). On restore, ZT will use the target's existing node identity but
-  attempt to join the source's network — which may or may not be desired.
+- **Excluded entirely in Remote-Safe mode** — both the UCI config file (so `zerotier.gl.secret`
+  too) and the associated network/firewall interface sections.
+- In Clone mode, the ZT config file IS captured, including `zerotier.gl.secret` on firmware 4.9+
+  — so a Clone restore carries the source's node identity onto the target rather than leaving it
+  with a fresh one. This is the same same-device-only caution as the SSH host keys (§6) and
+  OpenVPN PKI (§5) above: two devices sharing one ZT node identity will conflict on the network.
 
 ---
 
@@ -312,12 +346,17 @@ first start. These form a PKI identity unique to the device.
 | `/etc/config/rpcd` | RPCD authentication (references shadow) |
 
 **Notes:**
-- The root password hash in `/etc/shadow` is NOT in `/etc/config/` and is NOT
-  captured by our backup tool.
+- The root password hash in `/etc/shadow` is NOT in `/etc/config/`. It IS captured under
+  `extra/` (identity-file list, subject to the `/rom`-identical skip), but only in **Full**
+  mode — Clone and Remote-Safe never capture it.
 - This is a deployment choice (set by operator), not a hardware identifier.
 - On GL.iNet routers, the root password also controls the GL Admin Panel login.
 - The password hash is used by our shell backend for API authentication
   (challenge-response auth reads `/etc/shadow`).
+- A **Full** restore overwrites the target's `/etc/shadow` with the source's, so the target's
+  root/admin password becomes the source's password. `gl-portable-backup restore` warns about
+  this; `gl-portable-backup inspect ARCHIVE` reports it as `restores_root_password`. There is no
+  opt-out for this in the current release (unlike `--keep-host-keys` for SSH keys, §6).
 
 ---
 
@@ -344,14 +383,36 @@ network.wan.macaddr  = "94:83:c4:6b:0d:80"
 
 ---
 
+## 14. Cellular Modem State (firmware 4.9+)
+
+| Location | Description |
+|----------|-------------|
+| `/etc/config/cellular/slot_map.json` | Per-slot modem/SIM state; one file inside the 4.9+ cellular subsystem's config directory, shipped on all hardware, cellular or not |
+
+**Notes:**
+- On firmware 4.9 and later, `/etc/config/cellular` is a directory of JSON state files (not a
+  flat UCI file); `slot_map.json` is one of them, alongside `network_check.json` and
+  `sms_forward.json`.
+- This is device-specific modem/SIM state, not portable configuration — and no stripping rule
+  exists for it yet.
+- It has always been captured (the plain `cp -a` that copies `/etc/config/*` copies directories
+  along with files); as of this release it is also restored, since `/etc/config` directories are
+  no longer skipped on restore (they used to be). **Known gap**: Clone and Remote-Safe restore
+  this directory as-is onto the target, with no per-field filtering.
+
+---
+
 ## Summary: What Gets Stripped by GL Portable Backup
 
 ### Clone and Remote-Safe Modes
 
 | Category | Config File | Fields Stripped |
 |----------|-------------|----------------|
-| Wired MACs | `network` | All `option macaddr` lines |
+| Wired MACs | `network` | All `option macaddr` lines (incl. br-guest/br-iot device sections) |
 | Wi-Fi MACs | `wireless` | All `option macaddr` lines |
+| Wi-Fi hardware MACs | `wireless` | All `option factory_macaddr` lines (firmware 4.9+) |
+| Repeater MACs | `repeater` | All `option macaddr` lines (firmware 4.9+) |
+| Per-port hardware MACs | `eth_ports_config_map` | All `option default_mac` lines (firmware 4.11) |
 | DDNS identity | `gl_ddns` | username, password, domain, param_enc, lookup_host (v4+v6) |
 | WG server keys | `wireguard_server` | private_key, public_key, preshared_key |
 | WG/AWG client keys | `network` | private_key, public_key, preshared_key |
@@ -371,18 +432,34 @@ network.wan.macaddr  = "94:83:c4:6b:0d:80"
 
 ### NOT in `/etc/config/` (not captured by any mode)
 
-These device-specific items live outside the UCI config directory and are never
-part of our backup archives:
+These device-specific items live outside the UCI config directory. `board.json`'s values are
+captured for reference in `hardware.json` (see §13), but the file itself is never restored;
+nothing else in this table is in our archives at all:
 
 | Item | Location | Regeneration |
 |------|----------|-------------|
 | Serial number | Firmware/EEPROM | N/A — hardware-burned |
 | `board.json` | `/etc/board.json` | N/A — factory-set |
-| SSH host keys | `/etc/dropbear/dropbear_*_host_key` | Auto-generated if missing |
-| ZeroTier node identity | `/var/lib/zerotier-one/identity.*` | Auto-generated if missing |
-| Tailscale node state | `/etc/tailscale/` | Requires re-authentication |
-| OpenVPN PKI (CA, certs, keys) | `/etc/openvpn/` | Auto-generated by GL firmware on server start |
-| Root password hash | `/etc/shadow` | Set by operator |
+| ZeroTier node identity (files) | `/var/lib/zerotier-one/identity.*` | Auto-generated if missing |
+
+### Captured, But Only in Some Modes
+
+These items also live outside `/etc/config/`, but — unlike the table above — they ARE captured,
+via the `extra/` keep.d mechanism, in the modes marked below:
+
+| Item | Location | Full | Clone | Remote-Safe |
+|------|----------|:----:|:-----:|:-----------:|
+| SSH host keys | `/etc/dropbear/dropbear_*_host_key` | yes | no (stripped) | no (stripped) |
+| Root password hash | `/etc/shadow` | yes | no | no |
+| OpenVPN PKI (CA, certs, keys) | `/etc/openvpn/` | yes | yes | yes |
+| Tailscale node state | `/etc/tailscale/` | yes | yes | no (excluded) |
+
+A "yes" here is a caution, not just a feature: SSH host keys, the root password, and OpenVPN PKI
+are same-device identity (see §§5, 6, and 12 above). Restoring a Full archive onto anything but the exact
+source device, or a Clone/Remote-Safe archive's OpenVPN PKI onto a different physical unit, hands
+that unit the source's identity rather than fresh material of its own. The ZeroTier node secret
+mirrored into UCI on firmware 4.9+ (`zerotier.gl.secret`, §7) is the same caution again, but it
+travels with `/etc/config/zerotier` rather than through `extra/`.
 
 ---
 
@@ -393,6 +470,8 @@ How to discover all device-specific identifiers on a live router:
 ```bash
 # MAC addresses in UCI configs
 grep -r 'option macaddr' /etc/config/
+grep -r 'option factory_macaddr' /etc/config/wireless    # firmware 4.9+
+grep -r 'option default_mac' /etc/config/eth_ports_config_map    # firmware 4.11
 
 # MAC addresses from board.json (authoritative)
 jsonfilter -i /etc/board.json -e '@.network.lan.macaddr'
@@ -413,8 +492,11 @@ uci show network | grep '_key'
 # GoodCloud binding
 uci show gl-cloud
 
-# ZeroTier network
+# ZeroTier network + node secret (secret mirrored into UCI on firmware 4.9+)
 uci show zerotier
+
+# Cellular modem state (firmware 4.9+, a directory rather than a flat file)
+cat /etc/config/cellular/slot_map.json 2>/dev/null
 
 # SSH host key fingerprints
 dropbearkey -y -f /etc/dropbear/dropbear_rsa_host_key 2>/dev/null | grep Fingerprint

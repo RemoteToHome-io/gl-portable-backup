@@ -1,8 +1,6 @@
 # GL Portable Backup
 
-** THIS REPO IS AN EARLY WORK IN PROGRESS.  Significant addition are coming when time permits. **
-Until then, I would recommend checking out: https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility
-
+**v1.1:** Full, Clone, and Remote-Safe modes are production-ready. Profile capture works across firmware 4.8 through 4.11. Profile *restore* is currently limited to timezone, DNS mode, DNS hosts, LED on/off, and DHCP static bindings (the last only on firmware that still has the `lan` API) — Wi-Fi and LAN restore are not yet implemented. If you need full cross-model transfer today, see [zippyy/GL.iNet-CrossModel-BackupRestoreUtility](https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility) until Profile restore v2 lands.
 
 Portable configuration backup and restore for GL.iNet routers. Creates backups with four modes tailored to different deployment scenarios — from fleet cloning to cross-model profile transfer.
 
@@ -40,7 +38,9 @@ Same as Clone, but additionally excludes remote access configurations so you don
 
 ### Profile
 
-Uses the GL.iNet JSON-RPC API instead of raw UCI files. Captures structured, model-agnostic settings: Wi-Fi (mapped by band, not interface name), LAN, DHCP static bindings (fixed IP assignments), DNS, firewall rules, timezone, LED config. Restores via API calls. No model restriction — works across any GL.iNet 4.x router.
+Uses the GL.iNet JSON-RPC API instead of raw UCI files. One JSON file is written per API call (`api/<module>.<method>.json`); a module the firmware doesn't ship is skipped, and a JSON-RPC error reply is logged as a warning rather than stored. On firmware 4.11+, where the `lan` RPC module was replaced by `vlan_subnet`, LAN subnets and DHCP static bindings are captured via `vlan_subnet.get_subnets` / `vlan_subnet.get_static_bind_list`; on earlier firmware, via `lan.get_config_list` / `lan.get_static_bind_list`. Also captured when the firmware ships the module: Wi-Fi, DNS (config + hosts), firewall (rules, port forwards, WAN access), timezone, system info, LED, IPv6, per-port MAC mode, GoodCloud, Tailscale, ZeroTier, VPN client tunnels, timers, switch-button config, saved repeater APs, and network mode. No model restriction on capture — works across any GL.iNet 4.x router.
+
+**Restore is currently limited** to timezone, DNS mode/force_dns, DNS hosts, LED on/off, and DHCP static bindings — and the static-binding restore only runs on firmware that still exposes the `lan` API (on 4.11+ it prints a skip notice, since the equivalent `vlan_subnet` write hasn't been implemented yet). Wi-Fi and LAN restore are placeholders that print a message and make no changes. Full cross-model restore (Profile restore v2) is planned, not yet shipped.
 
 ## Install
 
@@ -73,24 +73,24 @@ All contents are nested under a `gl-portable-backup/` prefix directory:
 
 ```
 gl-portable-backup/
-├── manifest.json       Metadata: mode, model, firmware, hostname, sections
-├── backup-info.txt     Human-readable summary and compatibility warning
+├── manifest.json       Metadata: format_version (currently 4), mode, model, firmware, hostname, sections
+├── backup-info.txt     Human-readable summary, compatibility warning, and the Skipped line
 ├── hardware.json       Source device hardware IDs (reference only)
 ├── config/             UCI config files (clone, remote-safe, full modes)
-├── extra/              Non-UCI persistent files from keep.d discovery
+├── extra/              Non-UCI persistent files (see below)
 │   └── etc/
 │       ├── openvpn/    OpenVPN PKI certs, client profiles, scripts
-│       ├── dropbear/   SSH host keys and authorized_keys
+│       ├── dropbear/   SSH host keys (full mode only) and authorized_keys
 │       ├── wireguard/  WireGuard client/server profile files
-│       └── ...         Other keep.d-declared paths
-├── api/                API-captured JSON data (profile mode only)
+│       └── ...         Other discovered paths
+├── api/                One JSON file per API call: <module>.<method>.json (profile mode only)
 ├── packages.json       Enriched package list with versions, sections, kmod flags
 └── packages.txt        Legacy name-only package list (backward compat)
 ```
 
 ### Non-UCI Persistent Files
 
-Beyond UCI configs in `/etc/config/`, routers have persistent files that survive firmware upgrades — OpenVPN certificates, SSH keys, WireGuard profiles, Tailscale state, etc. GL Portable Backup discovers these via OpenWrt's `keep.d` mechanism (`/lib/upgrade/keep.d/*`) and captures them in the `extra/` directory. Mode-specific filtering applies (Clone strips SSH host keys, Remote-Safe excludes Tailscale state, etc.).
+Beyond UCI configs in `/etc/config/`, routers have persistent files that survive firmware upgrades — OpenVPN certificates, SSH keys, WireGuard profiles, Tailscale state, etc. GL Portable Backup discovers these the same way OpenWrt's own `sysupgrade` does, from three sources: `/lib/upgrade/keep.d/*` (files, directories, and glob lines), `/etc/sysupgrade.conf`, and `opkg list-changed-conffiles`. Discovered files are captured into the `extra/` directory, then filtered — see "What Is Excluded, and Why" below for what's left out and why, and "SSH Host Keys and the Root Password on Restore" for what a Full archive carries beyond configuration.
 
 ### Intentionally Incompatible with Stock LuCI Restore
 
@@ -99,6 +99,16 @@ Beyond UCI configs in `/etc/config/`, routers have persistent files that survive
 The stock LuCI restore extracts directly to the root filesystem with `tar -C / -xzf`. GL Portable Backup archives use a `gl-portable-backup/` prefix, so stock LuCI would extract to `/gl-portable-backup/` — harmless but non-functional. This prevents accidental router corruption from restoring through the wrong interface.
 
 **Always restore through:** GL Admin Panel → Advanced → LuCI → System → GL Portable Backup
+
+## What Is Excluded, and Why
+
+GL Portable Backup backs up **user configuration**, not router functionality. Two automatic skips apply before any mode-specific filtering, and both are counted in the create output (`Skipped N firmware-owned, M identical to /rom`) and in `backup-info.txt`:
+
+- **Firmware-owned paths** — engine state, vendor scripts, package-manager bookkeeping, and generated caches that the target's own firmware recreates on its own, so carrying the source's copy across only pushes it over the target's. Excluded: `/etc/netifyd/`, `/etc/udhcpc.user.d/`, `/etc/openvpn/scripts/`, `/etc/gl_crontabs/crontabs.d/modem_*`, `/etc/backup/installed_packages.txt`, `/etc/xattr.conf`, `/etc/fw_env.config`, `/etc/luci-uploads/`, `/etc/domain_mac_list/`, `/etc/opkg/keys/`, `/etc/ssmtp/`, `/etc/oui/oui.db`. opkg's own `*-opkg` conffile backups are dropped from `config/` the same way.
+- **Everything outside `/etc`** — installed packages' binaries, libraries, and plugin files are functionality, not settings, so they're skipped by default. This also excludes Tor's identity under `/var/lib/tor/`. Pass `--include-plugins` to capture them anyway.
+- **Files identical to the firmware's own copy under `/rom`** — a file nobody ever edited. This keeps the archive to what was actually changed, and leaves the target free to keep whatever its own firmware shipped, which matters most when restoring onto newer firmware.
+
+Separately, the system identity files `/etc/shadow`, `/etc/passwd`, `/etc/group`, `/etc/hosts`, `/etc/shells`, `/etc/profile`, `/etc/inittab`, `/etc/shinit`, `/etc/sysctl.conf`, and `/etc/rc.local` are kept only in **Full** mode (still subject to the `/rom`-identical skip) — Clone and Remote-Safe omit them, same as before.
 
 ## Package Review
 
@@ -117,8 +127,10 @@ In Clone and Remote-Safe modes, these device-specific fields are removed:
 
 | Config File | Fields Stripped |
 |-------------|---------------|
-| `network` | `option macaddr` (device MACs), `private_key`, `public_key`, `preshared_key` (AWG/WG) |
-| `wireless` | `option macaddr` (Wi-Fi interface MACs) |
+| `network` | `option macaddr` (device MACs, incl. br-guest/br-iot), `private_key`, `public_key`, `preshared_key` (AWG/WG) |
+| `wireless` | `option macaddr` (Wi-Fi interface MACs), `option factory_macaddr` (hardware radio MAC, firmware 4.9+) |
+| `repeater` | `option macaddr` (firmware 4.9+) |
+| `eth_ports_config_map` | `option default_mac` (per-port hardware MAC, firmware 4.11) |
 | `gl_ddns` | `enabled`, `username`, `domain`, `param_enc`, `lookup_host`, `password` |
 | `wireguard_server` | `private_key`, `public_key`, `preshared_key` (server + all peers) |
 | `wireguard` | `private_key`, `public_key`, `preshared_key` (WG client peers) |
@@ -142,18 +154,38 @@ All restore modes automatically re-initialize the DDNS service after applying co
 
 Custom DDNS operational preferences (check interval, force interval) are preserved through the re-initialization process.
 
+## SSH Host Keys and the Root Password on Restore
+
+A **Full** archive carries the source router's dropbear SSH host keys and its `/etc/shadow` (root/admin password hash) — Clone and Remote-Safe never capture either. Restoring a Full archive therefore replaces the target's SSH host keys and its root password with the source's:
+
+- SSH clients will see a changed host key on the next connection. `gl-portable-backup restore` and `gl-portable-backup fingerprint ARCHIVE` both print the fingerprint the archive would install, so you can recognize it when your SSH client warns you. The LuCI restore dialog shows the same fingerprint.
+- `gl-portable-backup inspect ARCHIVE` reports two booleans, `restores_ssh_host_keys` and `restores_root_password`, alongside the manifest.
+- Pass `--keep-host-keys` on the CLI, or check "Keep this device's SSH host keys" in the LuCI restore dialog, to keep the target's own SSH identity instead. `authorized_keys` is always restored regardless of this flag. There is no equivalent opt-out for `/etc/shadow` in this release — a Full restore always brings back the source's root password.
+
+## Restoring Across Firmware Versions
+
+One tested data point so far: a Full archive created on a GL-MT3000 running firmware 4.9.0 (beta4) was restored onto the same unit after a clean flash to 4.11.0 (beta1), with GL's "Keep Settings" off. Every item checked came back: LAN/guest/IoT subnets, Wi-Fi SSIDs and passwords, WireGuard and OpenVPN client profiles, ZeroTier and Tailscale node identities, GoodCloud binding, hostname, DNS settings, WAN MAC mode, IPv6 mode, deleted default DHCP domains, and DDNS re-registration.
+
+At first boot, 4.11 rewrote some of the restored config on its own: `network.iot` gained `vlan_id`, `display_name`, and `delegate` and lost `ip6assign`; the old-style `guest` section was left unconverted (but still worked); `dhcp.iot.ndp` was added; `gl-dns-v2` gained `manual_enable`/`manual_type`/`manual_local_dns`; and the wireless BSSIDs were regenerated. On 4.11 the `lan` RPC module no longer exists — Profile mode uses `vlan_subnet` instead (see Profile above).
+
+The firmware-mismatch warning on restore is unchanged by any of this — it warns, but does not block. This is one tested result on one model; treat it as a data point, not a guarantee for other models or other firmware jumps.
+
 ## Shell Backend
 
 The on-router backend (`/usr/sbin/gl-portable-backup`) supports:
 
 ```
-gl-portable-backup create [--mode clone|remote-safe|profile|full] [--output PATH] [--notes TEXT]
-gl-portable-backup restore ARCHIVE
+gl-portable-backup create [--mode clone|remote-safe|profile|full] [--output PATH]
+                          [--notes TEXT] [--include-plugins]
+gl-portable-backup restore [--keep-host-keys] ARCHIVE
 gl-portable-backup inspect ARCHIVE
+gl-portable-backup fingerprint ARCHIVE
 gl-portable-backup packages ARCHIVE
 gl-portable-backup install-package PKG
 gl-portable-backup version
 ```
+
+`-v`/`--verbose`, placed before the subcommand, prints each local API call including its request payload — a verbose log may contain keys and secrets, so don't share one. `--output` accepts a directory (the default filename is written inside it) or a full file path. `--include-plugins` also backs up files outside `/etc` — installed packages' binaries, libraries, and plugin files, including Tor's identity under `/var/lib/tor/` — which are excluded by default (see "What Is Excluded, and Why"). `--keep-host-keys` keeps this device's own SSH host keys during a restore instead of installing the archive's; it only matters for Full archives, since Clone, Remote-Safe, and Profile archives never carry host keys.
 
 ## Build
 
@@ -172,13 +204,32 @@ TERM=xterm make package/luci-app-gl-portable-backup/compile V=s
 
 Output: `bin/packages/*/glbuilder/luci-app-gl-portable-backup_*.ipk`
 
+### No-SDK Build (CI / Quick Build)
+
+The package is architecture-independent (pure shell + LuCI JS/JSON), so a valid `.ipk` can also be assembled directly with standard tools — no SDK toolchain required:
+
+```bash
+./pkg/build.sh [version]
+```
+
+Output: `build/out/luci-app-gl-portable-backup_<version>_all.ipk`. This is also what `.github/workflows/build-ipk.yml` runs on every push and pull request (uploading the ipk as a build artifact), and, on `v*` tags, to publish a prerelease GitHub Release with the ipk attached.
+
+## Tests
+
+`tests/run.sh` runs the unit test suite under `dash` with mock BusyBox applets on `PATH` (requires `dash` and `python3`):
+
+```bash
+./tests/run.sh
+```
+
+`tests/on-router-smoke.sh <router-ip>` re-runs the target-sensitive checks against a real GL router from `/tmp`, without installing anything.
+
 ## Compatibility
 
-- **Firmware**: GL.iNet 4.x (tested on 4.8.2)
-- **Models**: Any GL.iNet router — architecture-independent package
-- **Dependencies**: None beyond stock GL.iNet firmware (`jsonfilter`, `uci`, `curl`, `awk`, `tar`)
+- **Firmware**: GL.iNet 4.x. Full backup/restore, including factory reset, tested on GL-MT3000 at firmware 4.8.2, 4.9.0-beta4, and 4.11.0-beta1. Profile capture (API inventory) also checked on GL-MT5000 4.8.4 and GL-AXT1800 4.8.2. Not tested on other models or firmware versions.
+- **Models**: Architecture-independent package — installs on any GL.iNet router. Actual behavior is verified only on the models above; Clone, Remote-Safe, and Full restores are hard-blocked to the same model regardless.
+- **Dependencies**: None beyond stock GL.iNet firmware (`jsonfilter`, `uci`, `curl`, `awk`, `tar`, `dropbearkey` for host-key fingerprints)
 - **Package install**: Uses `/usr/libexec/opkg-call` from `luci-app-opkg` (present on all GL.iNet firmware)
-- **Tested**: Full backup/restore cycle including factory reset verified on GL-MT3000
 
 ## Project Structure
 
@@ -189,6 +240,10 @@ gl-portable-backup/
 ├── backups/                              # Test backup archives (not committed)
 ├── docs/
 │   └── device-specific-identifiers.md    # Reference: HW ID sources
+├── pkg/                                  # No-SDK ipk build: build.sh, control, postinst, prerm
+├── tests/                                # dash-based unit tests + on-router smoke test
+├── .github/workflows/
+│   └── build-ipk.yml                     # CI build; prerelease GitHub Release on v* tags
 └── luci-app-gl-portable-backup/          # OpenWrt/LuCI package source
     ├── Makefile
     ├── htdocs/luci-static/resources/
@@ -196,7 +251,7 @@ gl-portable-backup/
     │       └── backup.js                 # LuCI JavaScript UI
     └── root/
         ├── usr/sbin/
-        │   └── gl-portable-backup        # Shell backend (~1300 lines)
+        │   └── gl-portable-backup        # Shell backend
         └── usr/share/
             ├── luci/menu.d/
             │   └── luci-app-gl-portable-backup.json
