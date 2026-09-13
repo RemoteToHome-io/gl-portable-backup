@@ -100,9 +100,9 @@ gl_auth() {
         -d '{"jsonrpc":"2.0","id":1,"method":"challenge","params":{"username":"root"}}') || rc=$?
     if [ $rc -ne 0 ] || [ -z "$challenge" ]; then echo "auth: challenge failed (curl exit $rc) — is the GL web service (nginx /rpc) running?" >&2; return 1; fi
     nonce=$(echo "$challenge" | jsonfilter -e '@.result.nonce' 2>/dev/null) || { echo "auth: challenge reply has no nonce: $(printf '%s' "$challenge" | head -c 200)" >&2; return 1; }
-    # Guarded the same way: an unreadable/missing shadow file must not abort silently, and an
-    # empty hash (BusyBox awk on a missing file continues rather than erroring) must not be sent
-    # to the login step, where it would surface later as a misleading "login refused".
+    # Guarded the same way: an unreadable or missing shadow file must not abort silently, and an
+    # empty hash must not reach the login step, where it would surface later as a misleading
+    # "login refused".
     shadow_hash=$(awk -F: '/^root/{print $2}' "$ROOT/etc/shadow" 2>/dev/null) || shadow_hash=""
     [ -n "$shadow_hash" ] || { echo "auth: no password hash for root in $ROOT/etc/shadow (is the admin password set?)" >&2; return 1; }
     login_str="root:${shadow_hash}:${nonce}"
@@ -355,11 +355,17 @@ archive_has_host_keys() {
 
 # The fingerprint an SSH client sees once the archive's host keys are in place. Prints nothing
 # when the archive carries none.
+# The key types are tried in the order an SSH client prefers them, and the list matches the one
+# archive_has_host_keys tests, so an archive carrying only an ecdsa key still reports a fingerprint.
 archive_hostkey_fingerprint() {
-    local k="$1/extra/etc/dropbear/dropbear_ed25519_host_key"
-    [ -f "$k" ] || k="$1/extra/etc/dropbear/dropbear_rsa_host_key"
-    [ -f "$k" ] || return 0
-    dropbearkey -y -f "$k" 2>/dev/null | grep -i fingerprint
+    local d="$1/extra/etc/dropbear" k
+    for k in dropbear_ed25519_host_key dropbear_rsa_host_key dropbear_ecdsa_host_key; do
+        if [ -f "$d/$k" ]; then
+            dropbearkey -y -f "$d/$k" 2>/dev/null | grep -i fingerprint
+            return 0
+        fi
+    done
+    return 0
 }
 
 # Restore extra/ files from archive to filesystem
@@ -678,12 +684,12 @@ capture_packages_txt() {
         "$ROOT/usr/lib/opkg/status" > "$outfile" 2>/dev/null || true
 }
 
-
 count_packages_json() {
     local n
     n=$(grep -c '"name":' "$1" 2>/dev/null) || true
     echo "${n:-0}"
 }
+
 # ─── Manifest ──────────────────────────────────────────────────────────────────
 
 write_manifest() {
@@ -951,9 +957,10 @@ cmd_inspect() {
     # The two flags are appended to the OUTPUT only — the archive's own manifest.json is never
     # rewritten. Built line-wise rather than with a sed replacement carrying a newline, which is
     # not portable: every line but the closing brace, a comma on the new last line, then the
-    # flags and the brace. A manifest that is not a multi-line object ending in a bare brace is
-    # passed through untouched, so no input shape can turn into invalid JSON.
-    if [ "$(tail -n 1 "$manifest" | tr -d ' \t\r')" != "}" ] || [ "$(wc -l < "$manifest")" -lt 2 ]; then
+    # flags and the brace. That needs three lines at minimum — an opening line, something to carry
+    # the comma, and the closing brace — so a shorter manifest, or one whose last line is not a
+    # bare brace, is passed through untouched rather than rewritten into something invalid.
+    if [ "$(tail -n 1 "$manifest" | tr -d ' \t\r')" != "}" ] || [ "$(wc -l < "$manifest")" -lt 3 ]; then
         cat "$manifest"
         return 0
     fi
@@ -1327,8 +1334,12 @@ restore_profile_dhcp_static() {
     fi
 
     # Check if backup has any static bindings
+    # grep -c prints 0 and exits 1 when nothing matches, so the count is taken from its output and
+    # its status is tolerated separately. Folding both into `$(… || echo 0)` makes the no-match case
+    # print two lines, which every later test on $count then has to survive by accident.
     local count
-    count=$(jsonfilter -i "$binds_file" -e '@.result.static_bind_list[*]' 2>/dev/null | grep -c '"mac"' || echo 0)
+    count=$(jsonfilter -i "$binds_file" -e '@.result.static_bind_list[*]' 2>/dev/null | grep -c '"mac"') || true
+    count="${count:-0}"
     if [ "$count" = "0" ]; then
         echo "  No DHCP static bindings in backup" >&2
         return 0
@@ -1357,7 +1368,8 @@ restore_profile_dhcp_static() {
 
             # Check if this MAC already exists on target
             local existing
-            existing=$(echo "$current" | jsonfilter -e '@.result.static_bind_list[*].mac' 2>/dev/null | grep -c "$mac" || echo 0)
+            existing=$(echo "$current" | jsonfilter -e '@.result.static_bind_list[*].mac' 2>/dev/null | grep -c "$mac") || true
+            existing="${existing:-0}"
 
             if [ "$existing" -gt 0 ]; then
                 # Update existing binding

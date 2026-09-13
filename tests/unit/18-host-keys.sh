@@ -16,4 +16,9 @@ count=$(GPB_KEEP_HOST_KEYS=1 restore_extra_files "$T/x")
 assert_file "$T/root/etc/awkward/my file.conf"
 assert_file "$T/root/etc/awkward/star*.conf"
 assert_eq "$count" 3 "restored count (authorized_keys + two awkward names; host key skipped)"
+
+# archive_has_host_keys accepts an ecdsa-only archive, so the fingerprint must too — otherwise the
+# restore warning says a key is being installed and cannot say which.
+mkdir -p "$T/z/extra/etc/dropbear"; echo key > "$T/z/extra/etc/dropbear/dropbear_ecdsa_host_key"
+assert_contains "$(archive_hostkey_fingerprint "$T/z")" "SHA256:MOCKFINGERPRINT" "ecdsa-only fingerprint"
 echo "ok 18-host-keys"

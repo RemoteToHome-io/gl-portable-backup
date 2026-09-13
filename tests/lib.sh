@@ -4,7 +4,10 @@ set -u
 # root is two levels up from it.
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 BACKEND="$HERE/luci-app-gl-portable-backup/root/usr/sbin/gl-portable-backup"
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+# A failed mktemp would leave T empty and every path below would land at the filesystem root.
+T=$(mktemp -d) || exit 2
+[ -n "$T" ] || exit 2
+trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/root/etc/config" "$T/root/rom/etc" "$T/root/lib/upgrade/keep.d" "$T/root/usr/lib/oui-httpd/rpc"
 export MOCK_CURL_LOG="$T/curl.log" MOCK_CURL_DIR="$T/curl" MOCK_UCI_FILE="$T/uci.txt" MOCK_UCI_LOG="$T/uci.log" MOCK_OPKG_CONFFILES="$T/conffiles.txt" MOCK_OPKG_AVAILABLE="$T/available.txt"
 mkdir -p "$MOCK_CURL_DIR"; : > "$MOCK_UCI_FILE"; : > "$MOCK_OPKG_CONFFILES"; : > "$MOCK_OPKG_AVAILABLE"

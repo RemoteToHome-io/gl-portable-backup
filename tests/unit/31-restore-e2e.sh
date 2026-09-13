@@ -76,6 +76,18 @@ fp=$(sh -c '. "$0"; cmd_fingerprint "$@"' "$BACKEND" "$archive"); rc=$?
 assert_eq "$rc" 0 "cmd_fingerprint exit code"
 assert_contains "$fp" "SHA256:MOCKFINGERPRINT" "fingerprint subcommand"
 
+# The flag-appending rewrite needs an opening line, a line to carry the comma, and the closing
+# brace. A two-line manifest has nothing to carry the comma, so it must pass through untouched
+# rather than come out as "{," followed by the flags.
+mkdir -p "$T/tiny/gl-portable-backup"
+printf '{\n}\n' > "$T/tiny/gl-portable-backup/manifest.json"
+tar -czf "$T/tiny.tar.gz" -C "$T/tiny" gl-portable-backup
+tinyinsp=$(sh -c '. "$0"; cmd_inspect "$@"' "$BACKEND" "$T/tiny.tar.gz"); rc=$?
+assert_eq "$rc" 0 "cmd_inspect exit code (two-line manifest)"
+assert_eq "$tinyinsp" "$(printf '{\n}')" "two-line manifest passed through untouched"
+printf '%s' "$tinyinsp" | python3 -m json.tool >/dev/null 2>&1 \
+    || { echo "  inspect output is not valid JSON: $tinyinsp"; exit 1; }
+
 # A Clone archive carries neither: host keys and /etc/shadow are stripped at capture time.
 mkdir -p "$T/outc"
 clone=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode clone --output "$T/outc" 2>/dev/null); rc=$?
