@@ -1,8 +1,11 @@
 #!/bin/sh
 # mock uci: 'get a.b.c' reads key=value lines from $MOCK_UCI_FILE; set/commit/show are logged.
+# 'get' matches the key literally — uci keys contain [ ] and . which a regex would reinterpret.
 q=0; [ "$1" = -q ] && { q=1; shift; }
 case "$1" in
-  get) v=$(grep "^$2=" "$MOCK_UCI_FILE" | head -1 | cut -d= -f2-); [ -n "$v" ] && { printf '%s\n' "$v"; exit 0; }; [ $q = 1 ] || echo "uci: Entry not found" >&2; exit 1;;
+  get) v=""
+       while IFS= read -r l; do case "$l" in "$2="*) v="${l#*=}"; break;; esac; done < "$MOCK_UCI_FILE"
+       [ -n "$v" ] && { printf '%s\n' "$v"; exit 0; }; [ $q = 1 ] || echo "uci: Entry not found" >&2; exit 1;;
   set|commit|show|delete) printf '%s\n' "$*" >> "${MOCK_UCI_LOG:-/dev/null}"; exit 0;;
 esac
 exit 1

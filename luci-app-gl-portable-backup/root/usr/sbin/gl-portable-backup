@@ -53,18 +53,20 @@ get_fw_version() {
     cat "$ROOT/etc/glversion" 2>/dev/null || echo "unknown"
 }
 
+# A missing file given to `.` is fatal in a non-interactive POSIX shell — 2>/dev/null hides the
+# message, not the exit — so the read is guarded rather than tolerated.
 get_openwrt_version() {
-    . /etc/openwrt_release 2>/dev/null
+    [ -f "$ROOT/etc/openwrt_release" ] && . "$ROOT/etc/openwrt_release"
     echo "${DISTRIB_RELEASE:-unknown}"
 }
 
 get_architecture() {
-    . /etc/openwrt_release 2>/dev/null
+    [ -f "$ROOT/etc/openwrt_release" ] && . "$ROOT/etc/openwrt_release"
     echo "${DISTRIB_ARCH:-unknown}"
 }
 
 get_hostname() {
-    uci -q get system.@system[0].hostname 2>/dev/null || cat /proc/sys/kernel/hostname
+    uci -q get system.@system[0].hostname 2>/dev/null || cat "$ROOT/proc/sys/kernel/hostname"
 }
 
 get_timestamp() {
@@ -245,14 +247,16 @@ enumerate_persistent_paths() {
 # the target's. Everything outside /etc gets the same treatment: those are the binaries and
 # libraries of installed packages, not settings. --include-plugins opts them back in.
 is_firmware_owned() {
+    # Outside /etc: binaries, libraries and plugin files — functionality, not config.
     case "$1" in
         /etc/*) ;;
-        *) [ "${GPB_INCLUDE_PLUGINS:-0}" = 1 ] && return 1; return 0 ;;   # binaries/libs/plugins: functionality, not config
+        *) [ "${GPB_INCLUDE_PLUGINS:-0}" = 1 ] && return 1; return 0 ;;
     esac
+    # opkg's *-opkg conffile backups are dropped in cmd_create; /etc/config never reaches here.
     case "$1" in
         /etc/netifyd/*|/etc/udhcpc.user.d/*|/etc/openvpn/scripts/*|/etc/gl_crontabs/crontabs.d/modem_*|\
         /etc/backup/installed_packages.txt|/etc/xattr.conf|/etc/fw_env.config|/etc/luci-uploads/*|\
-        /etc/domain_mac_list/*|/etc/opkg/keys/*|/etc/ssmtp/*|/etc/oui/oui.db|/etc/config/*-opkg) return 0 ;;
+        /etc/domain_mac_list/*|/etc/opkg/keys/*|/etc/ssmtp/*|/etc/oui/oui.db) return 0 ;;
     esac
     return 1
 }
@@ -722,6 +726,9 @@ cmd_create() {
         # Clone, Remote-Safe, Full: copy UCI config files
         mkdir -p "$archdir/config"
         cp -a "$ROOT"/etc/config/. "$archdir/config/"
+        # opkg leaves *-opkg copies of conffiles it replaced: package-manager bookkeeping, not
+        # user config. rm -f is a no-op when the glob matches nothing, so set -e is unaffected.
+        rm -f "$archdir"/config/*-opkg
         echo "  Copied $(ls -A "$archdir/config/" | wc -l) UCI config files" >&2
 
         # Capture packages (enriched JSON + legacy text)
@@ -732,10 +739,10 @@ cmd_create() {
         echo "  Captured ${pkg_count} user-installed packages" >&2
 
         # Capture non-UCI persistent files: keep.d, /etc/sysupgrade.conf, changed conffiles.
-        # capture_extra_files prints three integers on one line; the positional parameters are
-        # free to split them into because the option loop above already consumed them. Keep the
-        # command substitution in its own assignment so a failure inside it still aborts (set -e
-        # ignores the status of a special builtin like set).
+        # capture_extra_files prints three integers on one line. Splitting them with `set --` is
+        # safe here: the option loop above consumed the arguments, so no positional parameter is
+        # still needed. The command substitution keeps its own assignment line, because `set` is
+        # a special builtin that returns 0 and would discard a failure inside the capture.
         local extra_counts extra_count skip_owned skip_rom
         extra_counts=$(capture_extra_files "$archdir" "$mode")
         set -- $extra_counts
