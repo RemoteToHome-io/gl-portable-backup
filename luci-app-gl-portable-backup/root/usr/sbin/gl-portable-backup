@@ -7,7 +7,7 @@
 #   gl-portable-backup create [--mode clone|remote-safe|profile|full] [--output PATH] [--notes TEXT]
 #   gl-portable-backup restore ARCHIVE
 #   gl-portable-backup inspect ARCHIVE
-#   gl-portable-backup -v|--verbose <command> ...   (verbose logging; flag must come first)
+#   gl-portable-backup -v|--verbose <command> ...   (prints each local API call; must come first)
 
 set -e
 
@@ -78,13 +78,18 @@ get_datestamp() {
 
 gl_auth() {
     local challenge nonce shadow_hash login_str login_hash result rc
-    # Status is captured with "|| rc=$?": under dash, errexit propagates into $(...) and would abort
-    # this function before a following "rc=$?" ran (verified 2026-09-12 on dash, busybox sh, router ash).
+    # Status is captured with "|| rc=$?": under dash, errexit propagates into $(...) and would
+    # abort this function before a following "rc=$?" ran (verified 2026-09-12 on dash, busybox
+    # sh, router ash).
     rc=0; challenge=$(curl -sf "http://127.0.0.1/rpc" \
         -d '{"jsonrpc":"2.0","id":1,"method":"challenge","params":{"username":"root"}}') || rc=$?
     if [ $rc -ne 0 ] || [ -z "$challenge" ]; then echo "auth: challenge failed (curl exit $rc) — is the GL web service (nginx /rpc) running?" >&2; return 1; fi
     nonce=$(echo "$challenge" | jsonfilter -e '@.result.nonce' 2>/dev/null) || { echo "auth: challenge reply has no nonce: $(printf '%s' "$challenge" | head -c 200)" >&2; return 1; }
-    shadow_hash=$(awk -F: '/^root/{print $2}' "$ROOT/etc/shadow")
+    # Guarded the same way: an unreadable/missing shadow file must not abort silently, and an
+    # empty hash (BusyBox awk on a missing file continues rather than erroring) must not be sent
+    # to the login step, where it would surface later as a misleading "login refused".
+    shadow_hash=$(awk -F: '/^root/{print $2}' "$ROOT/etc/shadow" 2>/dev/null) || shadow_hash=""
+    [ -n "$shadow_hash" ] || { echo "auth: no password hash for root in $ROOT/etc/shadow (is the admin password set?)" >&2; return 1; }
     login_str="root:${shadow_hash}:${nonce}"
     if echo "$challenge" | grep -q '"hash-method":"sha256"'; then login_hash=$(printf "%s" "$login_str" | sha256sum | awk '{print $1}')
     else login_hash=$(printf "%s" "$login_str" | md5sum | awk '{print $1}'); fi
@@ -1400,7 +1405,7 @@ case "${1:-}" in
         echo "  version          Show version" >&2
         echo "" >&2
         echo "Options:" >&2
-        echo "  -v, --verbose    Print each API call and diagnostic detail (put before the command)" >&2
+        echo "  -v, --verbose    Print each local API call (put before the command)" >&2
         exit 1
         ;;
 esac
