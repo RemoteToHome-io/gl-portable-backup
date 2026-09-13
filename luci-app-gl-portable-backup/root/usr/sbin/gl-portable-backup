@@ -4,7 +4,8 @@
 # Licensed under the GNU General Public License v3.0 or later
 #
 # Usage:
-#   gl-portable-backup create [--mode clone|remote-safe|profile|full] [--output PATH] [--notes TEXT]
+#   gl-portable-backup create [--mode clone|remote-safe|profile|full] [--output PATH]
+#                             [--notes TEXT] [--include-plugins]
 #   gl-portable-backup restore ARCHIVE
 #   gl-portable-backup inspect ARCHIVE
 #   gl-portable-backup -v|--verbose <command> ...   (prints each local API call; must come first)
@@ -238,13 +239,38 @@ enumerate_persistent_paths() {
     } | sed "s|^$ROOT||" | sort -u
 }
 
+# Back up user configuration, not router functionality. Firmware-owned paths — engine state,
+# vendor scripts, package-manager bookkeeping, generated caches — are recreated by the target's
+# own firmware, so carrying them across only pushes the source's copy of a router component over
+# the target's. Everything outside /etc gets the same treatment: those are the binaries and
+# libraries of installed packages, not settings. --include-plugins opts them back in.
+is_firmware_owned() {
+    case "$1" in
+        /etc/*) ;;
+        *) [ "${GPB_INCLUDE_PLUGINS:-0}" = 1 ] && return 1; return 0 ;;   # binaries/libs/plugins: functionality, not config
+    esac
+    case "$1" in
+        /etc/netifyd/*|/etc/udhcpc.user.d/*|/etc/openvpn/scripts/*|/etc/gl_crontabs/crontabs.d/modem_*|\
+        /etc/backup/installed_packages.txt|/etc/xattr.conf|/etc/fw_env.config|/etc/luci-uploads/*|\
+        /etc/domain_mac_list/*|/etc/opkg/keys/*|/etc/ssmtp/*|/etc/oui/oui.db|/etc/config/*-opkg) return 0 ;;
+    esac
+    return 1
+}
+
+# A file byte-identical to the firmware's own copy under /rom is one nobody ever edited. Skipping
+# it keeps the archive to what the user actually changed, and leaves the target free to keep the
+# version its own firmware shipped — which matters most when restoring onto newer firmware.
+is_rom_identical() { [ -f "$ROOT/rom$1" ] && cmp -s "$ROOT$1" "$ROOT/rom$1"; }
+
 # Capture the non-UCI persistent files discovered by enumerate_persistent_paths
 # Applies mode-specific filtering, copies to extra/ in archive
-# Outputs the count of captured files
+# Outputs one line: "<captured> <firmware-owned skipped> <rom-identical skipped>"
 capture_extra_files() {
     local archdir="$1"
     local mode="$2"
     local extradir="$archdir/extra"
+    local skipped_owned=0
+    local skipped_rom=0
 
     mkdir -p "$extradir"
 
@@ -255,6 +281,11 @@ capture_extra_files() {
     while IFS= read -r filepath; do
         # Skip /etc/config/ — already captured in config/
         case "$filepath" in /etc/config/*) continue ;; esac
+
+        # Router functionality rather than user configuration, and files nobody ever edited:
+        # neither belongs in a configuration archive. Both counts reach backup-info.txt.
+        is_firmware_owned "$filepath" && { skipped_owned=$((skipped_owned + 1)); vlog "skip firmware-owned $filepath"; continue; }
+        is_rom_identical "$filepath" && { skipped_rom=$((skipped_rom + 1)); vlog "skip rom-identical $filepath"; continue; }
 
         # System identity files belong to the device rather than to a portable configuration,
         # so only Full mode — disaster recovery of this same unit — keeps them.
@@ -292,8 +323,11 @@ capture_extra_files() {
 
     rm -f "$pathlist"
 
-    # Count captured files (avoids subshell variable loss)
-    find "$extradir" -type f 2>/dev/null | wc -l
+    # One line, three integers: captured, firmware-owned skipped, rom-identical skipped. The
+    # captured count comes from the archive itself (avoids subshell variable loss).
+    local captured
+    captured=$(find "$extradir" -type f 2>/dev/null | wc -l)
+    printf '%s %s %s\n' "$((captured))" "$skipped_owned" "$skipped_rom"
 }
 
 # Restore extra/ files from archive to filesystem
@@ -644,6 +678,7 @@ cmd_create() {
             --mode) mode="$2"; shift 2 ;;
             --output) output="$2"; shift 2 ;;
             --notes) notes="$2"; shift 2 ;;
+            --include-plugins) GPB_INCLUDE_PLUGINS=1; shift ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -696,10 +731,17 @@ cmd_create() {
         pkg_count=$(count_packages_json "$archdir/packages.json")
         echo "  Captured ${pkg_count} user-installed packages" >&2
 
-        # Capture non-UCI persistent files: keep.d, /etc/sysupgrade.conf, changed conffiles
-        local extra_count
-        extra_count=$(capture_extra_files "$archdir" "$mode")
+        # Capture non-UCI persistent files: keep.d, /etc/sysupgrade.conf, changed conffiles.
+        # capture_extra_files prints three integers on one line; the positional parameters are
+        # free to split them into because the option loop above already consumed them. Keep the
+        # command substitution in its own assignment so a failure inside it still aborts (set -e
+        # ignores the status of a special builtin like set).
+        local extra_counts extra_count skip_owned skip_rom
+        extra_counts=$(capture_extra_files "$archdir" "$mode")
+        set -- $extra_counts
+        extra_count=$1; skip_owned=$2; skip_rom=$3
         echo "  Captured ${extra_count} extra persistent files" >&2
+        echo "  Skipped ${skip_owned} firmware-owned, ${skip_rom} identical to /rom" >&2
 
         if [ "$mode" = "clone" ] || [ "$mode" = "remote-safe" ]; then
             # Strip hardware-specific fields
@@ -764,6 +806,7 @@ To restore this backup, use:
 
 For support: https://remotetohome.io/contact
 INFOEOF
+    [ "$mode" != "profile" ] && printf "Skipped:    %s firmware-owned, %s identical to /rom\n" "${skip_owned}" "${skip_rom}" >> "$archdir/backup-info.txt"
     [ -n "$notes" ] && printf "Notes:      %s\n" "${notes}" >> "$archdir/backup-info.txt"
 
     # Create archive
