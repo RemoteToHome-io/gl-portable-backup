@@ -567,6 +567,12 @@ capture_packages_txt() {
         "$ROOT/usr/lib/opkg/status" > "$outfile" 2>/dev/null || true
 }
 
+
+count_packages_json() {
+    local n
+    n=$(grep -c '"name":' "$1" 2>/dev/null) || true
+    echo "${n:-0}"
+}
 # ─── Manifest ──────────────────────────────────────────────────────────────────
 
 write_manifest() {
@@ -677,7 +683,7 @@ cmd_create() {
         capture_packages_json "$archdir/packages.json"
         capture_packages_txt "$archdir/packages.txt"
         local pkg_count
-        pkg_count=$(jsonfilter -i "$archdir/packages.json" -e '@.packages' 2>/dev/null | grep -c '"name"' || echo 0)
+        pkg_count=$(count_packages_json "$archdir/packages.json")
         echo "  Captured ${pkg_count} user-installed packages" >&2
 
         # Capture non-UCI persistent files from keep.d
