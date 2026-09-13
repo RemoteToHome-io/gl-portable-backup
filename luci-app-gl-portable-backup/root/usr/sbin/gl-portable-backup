@@ -74,6 +74,13 @@ get_datestamp() {
     date +%Y%m%d-%H%M
 }
 
+resolve_output_path() {
+    local out="$1" name="$2"
+    if [ -z "$out" ]; then echo "/tmp/$name"
+    elif [ -d "$out" ]; then echo "${out%/}/$name"
+    else echo "$out"; fi
+}
+
 # ─── GL.iNet Local API Helper ─────────────────────────────────────────────────
 
 gl_auth() {
@@ -744,10 +751,8 @@ INFOEOF
     [ -n "$notes" ] && printf "Notes:      %s\n" "${notes}" >> "$archdir/backup-info.txt"
 
     # Create archive
-    if [ -z "$output" ]; then
-        local fw_short=$(get_fw_version | tr '.' '-')
-        output="/tmp/gl-backup-${mode}-${hostname}-${model_short}-fw${fw_short}-${datestamp}.tar.gz"
-    fi
+    local fw_short=$(get_fw_version | tr '.' '-')
+    output=$(resolve_output_path "$output" "gl-backup-${mode}-${hostname}-${model_short}-fw${fw_short}-${datestamp}.tar.gz")
 
     tar -czf "$output" -C "$tmpdir" "${ARCHIVE_PREFIX}"
     echo "  Archive: $output" >&2
