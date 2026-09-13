@@ -84,17 +84,23 @@ return view.extend({
 			.then(L.bind(function(btn, res) {
 				btn.firstChild.data = _('Inspecting archive…');
 
-				/* Read device firmware version alongside the inspect call */
+				/* Read device firmware version and the archive's SSH host-key fingerprint
+				 * alongside the inspect call */
 				return Promise.all([
 					fs.exec(BACKEND, ['inspect', '/tmp/gl-portable-restore.tar.gz']),
 					fs.read('/etc/glversion').then(function(v) {
 						return (v || '').trim();
-					}).catch(function() { return 'unknown'; })
+					}).catch(function() { return 'unknown'; }),
+					fs.exec(BACKEND, ['fingerprint', '/tmp/gl-portable-restore.tar.gz'])
+						.then(function(r) {
+							return ((r.stdout || '').trim()).replace(/^Fingerprint:\s*/i, '');
+						}).catch(function() { return ''; })
 				]);
 			}, this, btn))
 			.then(L.bind(function(btn, results) {
 				var res = results[0];
 				var deviceFw = results[1];
+				var hostKeyFp = results[2];
 
 				if (res.code !== 0) {
 					ui.addNotification(null, E('p', _('Invalid backup archive.')));
@@ -154,6 +160,25 @@ return view.extend({
 						_('WARNING: This is a full backup. Hardware identifiers (MAC addresses, DDNS IDs) will be overwritten. Only restore to the same physical device.')));
 				}
 
+				/* Identity overwrites: the SSH host keys (opt-out below) and the root password */
+				if (manifest.restores_ssh_host_keys) {
+					bodyItems.push(E('p', { 'class': 'alert-message warning' },
+						hostKeyFp
+							? _('WARNING: this archive restores the SSH host keys of the source router — SSH clients will see a changed key. Expected fingerprint after restore: %s').format(hostKeyFp)
+							: _('WARNING: this archive restores the SSH host keys of the source router — SSH clients will see a changed key.')));
+					bodyItems.push(E('div', { 'style': 'padding: 0.25em 0 0.75em' }, [
+						E('label', {}, [
+							E('input', { 'type': 'checkbox', 'id': 'gl-pb-keep-host-keys' }), ' ',
+							_('Keep this device\'s SSH host keys')
+						])
+					]));
+				}
+
+				if (manifest.restores_root_password) {
+					bodyItems.push(E('p', { 'class': 'alert-message warning' },
+						_('WARNING: this archive restores /etc/shadow — the root (admin) password becomes the password of the source unit.')));
+				}
+
 				if (manifest.mode === 'clone' || manifest.mode === 'remote-safe') {
 					bodyItems.push(E('p', { 'class': 'alert-message' },
 						_('Hardware identifiers will be preserved. WireGuard keys will need to be regenerated after restore.')));
@@ -184,11 +209,18 @@ return view.extend({
 	},
 
 	handleRestoreConfirm: function(btn, ev) {
+		/* Read the opt-out before showModal replaces the confirm dialog's DOM */
+		var keepHostKeys = document.getElementById('gl-pb-keep-host-keys');
+		var args = [ 'restore' ];
+		if (keepHostKeys && keepHostKeys.checked)
+			args.push('--keep-host-keys');
+		args.push('/tmp/gl-portable-restore.tar.gz');
+
 		ui.showModal(_('Restoring…'), [
 			E('p', { 'class': 'spinning' }, _('Applying backup configuration. Please wait…'))
 		]);
 
-		return fs.exec(BACKEND, ['restore', '/tmp/gl-portable-restore.tar.gz'])
+		return fs.exec(BACKEND, args)
 			.then(L.bind(function(res) {
 				if (res.code !== 0 || (res.stdout || '').indexOf('RESTORE_OK') === -1) {
 					ui.hideModal();

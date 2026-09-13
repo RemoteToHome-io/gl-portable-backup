@@ -6,8 +6,9 @@
 # Usage:
 #   gl-portable-backup create [--mode clone|remote-safe|profile|full] [--output PATH]
 #                             [--notes TEXT] [--include-plugins]
-#   gl-portable-backup restore ARCHIVE
+#   gl-portable-backup restore [--keep-host-keys] ARCHIVE
 #   gl-portable-backup inspect ARCHIVE
+#   gl-portable-backup fingerprint ARCHIVE
 #   gl-portable-backup -v|--verbose <command> ...   (prints each local API call; must come first)
 
 set -e
@@ -334,6 +335,26 @@ capture_extra_files() {
     printf '%s %s %s\n' "$((captured))" "$skipped_owned" "$skipped_rom"
 }
 
+# ─── SSH Host Keys ────────────────────────────────────────────────────────────
+
+# True when the archive carries the source unit's dropbear host keys — the files that decide
+# which SSH identity this unit presents. Only Full mode captures them; Clone and Remote-Safe
+# strip them at capture time.
+archive_has_host_keys() {
+    [ -f "$1/extra/etc/dropbear/dropbear_ed25519_host_key" ] \
+        || [ -f "$1/extra/etc/dropbear/dropbear_rsa_host_key" ] \
+        || [ -f "$1/extra/etc/dropbear/dropbear_ecdsa_host_key" ]
+}
+
+# The fingerprint an SSH client sees once the archive's host keys are in place. Prints nothing
+# when the archive carries none.
+archive_hostkey_fingerprint() {
+    local k="$1/extra/etc/dropbear/dropbear_ed25519_host_key"
+    [ -f "$k" ] || k="$1/extra/etc/dropbear/dropbear_rsa_host_key"
+    [ -f "$k" ] || return 0
+    dropbearkey -y -f "$k" 2>/dev/null | grep -i fingerprint
+}
+
 # Restore extra/ files from archive to filesystem
 restore_extra_files() {
     local tmpdir="$1"
@@ -342,6 +363,11 @@ restore_extra_files() {
     local count=0
     local relfile
     for relfile in $(cd "$tmpdir/extra" && find . -type f | sed 's|^\./||'); do
+        # --keep-host-keys leaves this unit's SSH identity alone. authorized_keys is never
+        # skipped: which keys may log in is user configuration, the host key is identity.
+        case "$relfile" in
+            etc/dropbear/dropbear_*_host_key) [ "${GPB_KEEP_HOST_KEYS:-0}" = 1 ] && continue ;;
+        esac
         local destdir="$ROOT/$(dirname "$relfile")"
         mkdir -p "$destdir"
         cp -a "$tmpdir/extra/$relfile" "$ROOT/$relfile"
@@ -834,6 +860,17 @@ INFOEOF
 
 # ─── INSPECT ───────────────────────────────────────────────────────────────────
 
+# True when any of the literal substrings $2… occurs in the text $1. Used on a tar listing,
+# where the same member appears with or without the archive's prefix directory.
+listing_has() {
+    local text="$1" pat
+    shift
+    for pat in "$@"; do
+        if printf '%s\n' "$text" | grep -q -F "$pat"; then return 0; fi
+    done
+    return 1
+}
+
 cmd_inspect() {
     local archive="$1"
     [ -z "$archive" ] && die "Usage: gl-portable-backup inspect ARCHIVE"
@@ -847,18 +884,77 @@ cmd_inspect() {
         || tar -xzf "$archive" -C "$tmpdir" manifest.json 2>/dev/null \
         || die "Invalid archive: no manifest.json"
 
-    if [ -f "$tmpdir/${ARCHIVE_PREFIX}/manifest.json" ]; then
-        cat "$tmpdir/${ARCHIVE_PREFIX}/manifest.json"
-    else
-        cat "$tmpdir/manifest.json"
+    local manifest="$tmpdir/${ARCHIVE_PREFIX}/manifest.json"
+    [ -f "$manifest" ] || manifest="$tmpdir/manifest.json"
+
+    # What restoring this archive overwrites beyond configuration. Both are read from the
+    # archive listing, which covers the prefixed and the flat layout alike.
+    local listing has_keys=false has_shadow=false
+    listing=$(tar -tzf "$archive")
+    if listing_has "$listing" "extra/etc/dropbear/dropbear_ed25519_host_key" \
+            "extra/etc/dropbear/dropbear_rsa_host_key" \
+            "extra/etc/dropbear/dropbear_ecdsa_host_key"; then
+        has_keys=true
     fi
+    if listing_has "$listing" "extra/etc/shadow"; then
+        has_shadow=true
+    fi
+
+    # The two flags are appended to the OUTPUT only — the archive's own manifest.json is never
+    # rewritten. Built line-wise rather than with a sed replacement carrying a newline, which is
+    # not portable: every line but the closing brace, a comma on the new last line, then the
+    # flags and the brace. A manifest that is not a multi-line object ending in a bare brace is
+    # passed through untouched, so no input shape can turn into invalid JSON.
+    if [ "$(tail -n 1 "$manifest" | tr -d ' \t\r')" != "}" ] || [ "$(wc -l < "$manifest")" -lt 2 ]; then
+        cat "$manifest"
+        return 0
+    fi
+    sed '$d' "$manifest" | sed '$ s/$/,/'
+    printf '  "restores_ssh_host_keys": %s,\n  "restores_root_password": %s\n}\n' "$has_keys" "$has_shadow"
+}
+
+# ─── FINGERPRINT ───────────────────────────────────────────────────────────────
+
+# Print the SSH host-key fingerprint this archive would install, so the operator can recognise
+# the key their SSH client warns about after a Full restore. No output, exit 0, when the archive
+# carries no host keys.
+cmd_fingerprint() {
+    local archive="$1"
+    [ -z "$archive" ] && die "Usage: gl-portable-backup fingerprint ARCHIVE"
+    [ -f "$archive" ] || die "File not found: $archive"
+
+    local tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" EXIT
+
+    # Only the host keys are extracted, addressed by their exact names from the listing: no tar
+    # wildcard support is required, and the prefixed and flat layouts both work.
+    tar -tzf "$archive" > "$tmpdir/listing"
+    local member
+    while IFS= read -r member; do
+        case "$member" in
+            *extra/etc/dropbear/dropbear_*_host_key)
+                tar -xzf "$archive" -C "$tmpdir" "$member" 2>/dev/null || true ;;
+        esac
+    done < "$tmpdir/listing"
+
+    local base="$tmpdir"
+    [ -d "$tmpdir/${ARCHIVE_PREFIX}" ] && base="$tmpdir/${ARCHIVE_PREFIX}"
+    archive_hostkey_fingerprint "$base"
 }
 
 # ─── RESTORE ───────────────────────────────────────────────────────────────────
 
 cmd_restore() {
-    local archive="$1"
-    [ -z "$archive" ] && die "Usage: gl-portable-backup restore ARCHIVE"
+    local archive=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --keep-host-keys) GPB_KEEP_HOST_KEYS=1 ;;
+            -*) die "Unknown option: $1" ;;
+            *) archive="$1" ;;
+        esac
+        shift
+    done
+    [ -z "$archive" ] && die "Usage: gl-portable-backup restore [--keep-host-keys] ARCHIVE"
     [ -f "$archive" ] || die "File not found: $archive"
 
     local tmpdir=$(mktemp -d)
@@ -901,6 +997,21 @@ cmd_restore() {
         echo "  Consider using Profile mode for cross-version portability." >&2
     fi
 
+    # A Full archive carries the source unit's own identity as well as its configuration. Both
+    # overwrites are announced before anything is written; only the host keys can be opted out
+    # of, because a restored /etc/shadow is how the admin password comes back after a reset.
+    if archive_has_host_keys "$tmpdir"; then
+        if [ "${GPB_KEEP_HOST_KEYS:-0}" = 1 ]; then
+            echo "Keeping this device's SSH host keys (--keep-host-keys)" >&2
+        else
+            echo "WARNING: this archive restores the source's SSH host keys — SSH clients will see a changed key; expected: $(archive_hostkey_fingerprint "$tmpdir")" >&2
+            echo "  Re-run with --keep-host-keys to keep this device's own SSH identity." >&2
+        fi
+    fi
+    if [ -f "$tmpdir/extra/etc/shadow" ]; then
+        echo "WARNING: this archive restores /etc/shadow — the root (admin) password becomes the source unit's password" >&2
+    fi
+
     case "$mode" in
         clone|remote-safe)
             restore_portable "$tmpdir" "$mode"
@@ -937,13 +1048,13 @@ restore_portable() {
 
     # Save current device's hardware-specific values before overwriting
     # Network MACs
-    grep 'option macaddr' /etc/config/network > "$saved_hw/network_macs" 2>/dev/null || true
-    grep 'option macaddr' /etc/config/wireless > "$saved_hw/wireless_macs" 2>/dev/null || true
+    grep 'option macaddr' "$ROOT/etc/config/network" > "$saved_hw/network_macs" 2>/dev/null || true
+    grep 'option macaddr' "$ROOT/etc/config/wireless" > "$saved_hw/wireless_macs" 2>/dev/null || true
 
     # Remote-safe: also save excluded configs
     if [ "$mode" = "remote-safe" ]; then
         for f in $REMOTE_SAFE_EXCLUDE_FILES; do
-            [ -f "/etc/config/$f" ] && cp -a "/etc/config/$f" "$saved_hw/$f"
+            [ -f "$ROOT/etc/config/$f" ] && cp -a "$ROOT/etc/config/$f" "$saved_hw/$f"
         done
         # Save the network interface sections we need to preserve
         # (zerotier, tailscale, etc.)
@@ -965,8 +1076,8 @@ restore_portable() {
 
     # Re-inject this device's MAC addresses into network config
     # Read MACs from board.json (the authoritative source)
-    local lan_mac=$(jsonfilter -i /etc/board.json -e '@.network.lan.macaddr' 2>/dev/null)
-    local wan_mac=$(jsonfilter -i /etc/board.json -e '@.network.wan.macaddr' 2>/dev/null)
+    local lan_mac=$(jsonfilter -i "$ROOT/etc/board.json" -e '@.network.lan.macaddr' 2>/dev/null)
+    local wan_mac=$(jsonfilter -i "$ROOT/etc/board.json" -e '@.network.wan.macaddr' 2>/dev/null)
 
     if [ -n "$lan_mac" ]; then
         # Find br-lan device section and add macaddr
@@ -1014,7 +1125,7 @@ restore_portable() {
     if [ "$mode" = "remote-safe" ]; then
         echo "Restoring preserved remote-access configs..." >&2
         for f in $REMOTE_SAFE_EXCLUDE_FILES; do
-            [ -f "$saved_hw/$f" ] && cp -a "$saved_hw/$f" "/etc/config/$f"
+            [ -f "$saved_hw/$f" ] && cp -a "$saved_hw/$f" "$ROOT/etc/config/$f"
         done
     fi
 
@@ -1454,6 +1565,10 @@ case "${1:-}" in
         shift
         cmd_inspect "$@"
         ;;
+    fingerprint)
+        shift
+        cmd_fingerprint "$@"
+        ;;
     packages)
         shift
         cmd_packages "$@"
@@ -1466,18 +1581,20 @@ case "${1:-}" in
         echo "${TOOL_NAME} ${VERSION}"
         ;;
     *)
-        echo "Usage: gl-portable-backup {create|restore|inspect|packages|install-package|version}" >&2
+        echo "Usage: gl-portable-backup {create|restore|inspect|fingerprint|packages|install-package|version}" >&2
         echo "" >&2
         echo "Commands:" >&2
         echo "  create           Create a backup archive" >&2
-        echo "  restore          Restore from a backup archive" >&2
+        echo "  restore          Restore from a backup archive [--keep-host-keys]" >&2
         echo "  inspect          Show manifest from a backup archive" >&2
+        echo "  fingerprint      Show the SSH host-key fingerprint an archive would install" >&2
         echo "  packages         Compare archive packages vs this device" >&2
         echo "  install-package  Install a single package via opkg" >&2
         echo "  version          Show version" >&2
         echo "" >&2
         echo "Options:" >&2
         echo "  -v, --verbose    Print each local API call (put before the command)" >&2
+        echo "  --keep-host-keys Keep this device's SSH host keys during a restore" >&2
         exit 1
         ;;
 esac
