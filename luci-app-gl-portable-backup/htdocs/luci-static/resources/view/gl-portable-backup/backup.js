@@ -650,7 +650,7 @@ return view.extend({
 						E('label', {}, [
 							E('input', { type: 'radio', name: 'backup_mode', value: 'profile' }),
 							' ', E('strong', {}, _('Profile')),
-							' — ', _('Basic settings only (Wi-Fi, LAN, DNS, firewall). Portable across different GL.iNet models.')
+							' — ', _('Basic settings only (Wi-Fi, LAN, DNS, firewall). Portable across different GL.iNet models. Contains every Wi-Fi password in cleartext and the GoodCloud account identity; contains no VPN keys, saved repeater passwords, SSH keys or root password.')
 						])
 					]),
 

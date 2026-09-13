@@ -567,11 +567,16 @@ capture_profile() {
         capture_api "$sid" lan get_config_list "$apidir/lan.get_config_list.json"
         capture_api "$sid" lan get_static_bind_list "$apidir/lan.get_static_bind_list.json"
     fi
+    # Deliberately absent from this list: vpn-client.get_all_config_list, whose reply carries the
+    # private and pre-shared keys of every VPN tunnel plus OpenVPN credentials, and
+    # repeater.get_saved_ap_list, whose reply carries the passwords of third-party access points
+    # this router has joined. A Profile archive is the cross-model one — the one handed to a
+    # helper or another device — and nothing in restore_profile reads either reply. Wi-Fi
+    # passwords are still in here (wifi.get_config): they are the settings being transferred.
     for mm in wifi.get_config dns.get_config dns.get_host firewall.get_rule_list firewall.get_port_forward_list \
               firewall.get_wan_access system.get_timezone_config system.get_info led.get_config ipv6.get_ipv6 \
               cable.get_ports_config cloud.get_config tailscale.get_config zerotier.get_config vpn-client.get_tunnel \
-              vpn-client.get_all_config_list timer.get_wifi timer.get_led timer.get_reboot switch-button.get_config \
-              repeater.get_saved_ap_list netmode.get_mode; do
+              timer.get_wifi timer.get_led timer.get_reboot switch-button.get_config netmode.get_mode; do
         capture_api "$sid" "${mm%%.*}" "${mm#*.}" "$apidir/$mm.json"
     done
 }
