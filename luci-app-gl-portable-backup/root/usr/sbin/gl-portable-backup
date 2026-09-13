@@ -210,28 +210,35 @@ capture_hardware_ids() {
 EOF
 }
 
-# ─── Non-UCI Persistent Files (keep.d) ────────────────────────────────────────
+# ─── Persistent Files (keep.d + sysupgrade.conf + changed conffiles) ──────────
 
-# Enumerate all persistent file paths declared in /lib/upgrade/keep.d/*
-# Output: one absolute file path per line, sorted and deduplicated
-enumerate_keepd_paths() {
-    for keepfile in "$ROOT"/lib/upgrade/keep.d/*; do
-        [ -f "$keepfile" ] || continue
-        while IFS= read -r path || [ -n "$path" ]; do
-            # Strip comments and whitespace
-            path=$(echo "$path" | sed 's/#.*//' | tr -d ' \t\n\r')
-            [ -z "$path" ] && continue
-            # Expand directories to individual files
-            if [ -d "$path" ]; then
-                find "$path" -type f 2>/dev/null
-            elif [ -f "$path" ]; then
-                echo "$path"
-            fi
-        done < "$keepfile"
-    done | sort -u
+# Enumerate every path OpenWrt's own sysupgrade preserves: the /lib/upgrade/keep.d/*
+# declarations (files, directories and glob patterns), /etc/sysupgrade.conf, and the conffiles
+# opkg reports as locally changed. Reading only keep.d misses the other two sources.
+# Output: one absolute path per line, existing regular files only, sorted and deduplicated.
+enumerate_persistent_paths() {
+    {
+        for keepfile in "$ROOT"/lib/upgrade/keep.d/* "$ROOT/etc/sysupgrade.conf"; do
+            [ -f "$keepfile" ] || continue
+            while IFS= read -r line || [ -n "$line" ]; do
+                line=$(printf '%s' "$line" | sed 's/#.*//; s/^[ \t]*//; s/[ \t]*$//')
+                [ -n "$line" ] || continue
+                for p in "$ROOT"$line; do   # unquoted: expands keep.d globs
+                    if [ -d "$p" ]; then find "$p" -type f 2>/dev/null || true
+                    elif [ -f "$p" ]; then printf '%s\n' "$p"
+                    fi
+                done
+            done < "$keepfile"
+        done
+        # A read failure here must never truncate the list silently, so the whole pipeline is
+        # tolerated: opkg may be absent, and a conffile may be unreadable.
+        opkg list-changed-conffiles 2>/dev/null | while IFS= read -r c; do
+            [ -f "$ROOT$c" ] && printf '%s\n' "$ROOT$c"
+        done || true
+    } | sed "s|^$ROOT||" | sort -u
 }
 
-# Capture non-UCI persistent files discovered via keep.d
+# Capture the non-UCI persistent files discovered by enumerate_persistent_paths
 # Applies mode-specific filtering, copies to extra/ in archive
 # Outputs the count of captured files
 capture_extra_files() {
@@ -243,18 +250,21 @@ capture_extra_files() {
 
     # Write filtered paths to a temp file to avoid subshell count loss
     local pathlist=$(mktemp)
-    enumerate_keepd_paths > "$pathlist"
+    enumerate_persistent_paths > "$pathlist"
 
     while IFS= read -r filepath; do
         # Skip /etc/config/ — already captured in config/
         case "$filepath" in /etc/config/*) continue ;; esac
 
-        # Skip system identity files (not config — belong to the device)
-        case "$filepath" in
-            /etc/shadow|/etc/passwd|/etc/group|/etc/hosts|\
-            /etc/shells|/etc/shinit|/etc/profile|/etc/inittab|\
-            /etc/sysctl.conf|/etc/rc.local) continue ;;
-        esac
+        # System identity files belong to the device rather than to a portable configuration,
+        # so only Full mode — disaster recovery of this same unit — keeps them.
+        if [ "$mode" != "full" ]; then
+            case "$filepath" in
+                /etc/shadow|/etc/passwd|/etc/group|/etc/hosts|\
+                /etc/shells|/etc/shinit|/etc/profile|/etc/inittab|\
+                /etc/sysctl.conf|/etc/rc.local) continue ;;
+            esac
+        fi
 
         # Clone + Remote-Safe: exclude device-generated TLS/SSH keys
         if [ "$mode" = "clone" ] || [ "$mode" = "remote-safe" ]; then
