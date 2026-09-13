@@ -98,4 +98,21 @@ assert_contains "$cinsp" '"restores_root_password": false' "clone: no root passw
 cfp=$(sh -c '. "$0"; cmd_fingerprint "$@"' "$BACKEND" "$clone"); rc=$?
 assert_eq "$rc" 0 "cmd_fingerprint exit code (no host keys)"
 assert_eq "$cfp" "" "fingerprint prints nothing when the archive has no host keys"
+
+# Remote-Safe end to end. This release does not re-add the target's ZeroTier/Tailscale sections
+# inside network and firewall, and the operator has to hear that before anything is written —
+# it is the mode whose promise is "don't cut off the tunnel you are connected through".
+mkdir -p "$T/outrs"
+rsarch=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode remote-safe --output "$T/outrs" 2>/dev/null); rc=$?
+assert_eq "$rc" 0 "cmd_create exit code (remote-safe)"
+B3="$T/b3"; mkdir -p "$B3/etc/config"
+cp "$A/etc/board.json" "$B3/etc/board.json"; echo "4.11.0" > "$B3/etc/glversion"
+out3=$(GPB_ROOT="$B3" sh -c '. "$0"; cmd_restore "$@"' "$BACKEND" "$rsarch" 2>"$T/err3"); rc=$?
+assert_eq "$rc" 0 "cmd_restore exit code (remote-safe)"
+assert_eq "$(printf '%s\n' "$out3" | tail -n 1)" "RESTORE_OK" "RESTORE_OK (remote-safe)"
+assert_contains "$(cat "$T/err3")" \
+    "ZeroTier/Tailscale interface, zone and forwarding sections are NOT re-added" \
+    "remote-safe limitation announced"
+# The notice belongs to Remote-Safe alone — a Full restore must not print it.
+not_contains "$err" "sections are NOT re-added" "no remote-safe notice on a full restore"
 echo "ok 31-restore-e2e"

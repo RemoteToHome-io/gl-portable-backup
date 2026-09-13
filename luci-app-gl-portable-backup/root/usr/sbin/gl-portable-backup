@@ -353,10 +353,10 @@ archive_has_host_keys() {
         || [ -f "$1/extra/etc/dropbear/dropbear_ecdsa_host_key" ]
 }
 
-# The fingerprint an SSH client sees once the archive's host keys are in place. Prints nothing
-# when the archive carries none.
-# The key types are tried in the order an SSH client prefers them, and the list matches the one
-# archive_has_host_keys tests, so an archive carrying only an ecdsa key still reports a fingerprint.
+# The fingerprint an SSH client sees once the archive's host keys are in place. Prints nothing when
+# the archive carries none. The key types are tried in the order a client prefers them, and the
+# list matches the one archive_has_host_keys tests, so an archive carrying only an ecdsa key still
+# reports a fingerprint rather than warning about a key it cannot name.
 archive_hostkey_fingerprint() {
     local d="$1/extra/etc/dropbear" k
     for k in dropbear_ed25519_host_key dropbear_rsa_host_key dropbear_ecdsa_host_key; do
