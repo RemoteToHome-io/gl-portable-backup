@@ -40,6 +40,13 @@ jobs:
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
+      # dash and python3 are both present on ubuntu-latest, so the suite needs no extra install.
+      - name: Run unit tests
+        shell: bash
+        run: |
+          chmod +x tests/run.sh
+          ./tests/run.sh
+
       - name: Build package
         shell: bash
         run: |

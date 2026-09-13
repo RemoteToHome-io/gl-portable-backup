@@ -110,6 +110,15 @@ n=$(printf 'abc \t\n' | sed 's/[ \t]*$//' | wc -c)
 [ "$n" = "4" ]; r=$?
 judge 'applet: sed [ \t] strips a trailing space and tab (keep.d line parser)' "$r" "wc -c = $n (expected 4)"
 
+# The same instrument in the other direction. The check above proves [ \t] matches a TAB; it
+# cannot tell whether it ALSO matches a literal t, which it would if this sed read the two
+# characters as a backslash and a t rather than as an escape. Were that so, every keep.d path
+# ending in t -- installed_packages.txt, url.txt -- would be silently truncated by the parser.
+lt=$(printf 'abct \t\n' | sed 's/[ \t]*$//')
+[ "$lt" = "abct" ]; r=$?
+judge 'applet: sed [ \t] leaves a trailing literal t alone (keep.d paths ending in t)' "$r" \
+    "got [$lt] (expected [abct])"
+
 n=$(printf 'a\nb\n' | wc -l)
 [ "$n" = "2" ]; r=$?
 judge 'applet: wc -l prints an unpadded count (capture/restore counters)' "$r" "wc -l = [$n] (expected [2])"
@@ -146,20 +155,29 @@ fp=$(dropbearkey -y -f "$D/k" 2>/dev/null | grep -i '^Fingerprint:')
 case "$fp" in "Fingerprint: SHA256:"*) r=0 ;; *) r=1 ;; esac
 judge 'applet: dropbearkey -y -f prints a SHA256 fingerprint (host-key warning)' "$r" "$fp"
 
-# The guard that makes the "must not contain" checks non-vacuous is itself checked in both
-# directions: an empty listing must fail the predicate, a populated clean one must pass it.
+# Archive members under extra/ that are NOT under extra/etc/. The rule being checked is "user
+# configuration lives in /etc", so the predicate has to cover the whole subtree rather than the
+# three directory names usr/lib/var. The `.` after extra/ drops tar's own member for the extra/
+# directory itself, which ends in a slash.
+outside_etc() { grep -E '^gl-portable-backup/extra/.' "$1" | grep -v -E '^gl-portable-backup/extra/etc/'; }
+
+# The guard that makes the "must not contain" checks non-vacuous is itself checked in all three
+# directions: an empty listing must fail the predicate, a populated clean one must pass it, and one
+# carrying a member outside /etc must fail it.
 : > "$D/empty.list"
-printf 'gl-portable-backup/manifest.json\ngl-portable-backup/config/network\n' > "$D/clean.list"
+printf 'gl-portable-backup/manifest.json\ngl-portable-backup/extra/\ngl-portable-backup/extra/etc/\ngl-portable-backup/extra/etc/userconf\n' > "$D/clean.list"
+printf 'gl-portable-backup/manifest.json\ngl-portable-backup/extra/usr/bin/plugin-bin\n' > "$D/dirty.list"
 vacuity_guard() {   # 0 only when the listing is usable AND carries no offending member
     vn=$(wc -l < "$1" 2>/dev/null); [ -n "$vn" ] || vn=0
-    vm=$(grep -E '^gl-portable-backup/extra/(usr|lib|var)/' "$1")
+    vm=$(outside_etc "$1")
     [ "$vn" -gt 0 ] && [ -z "$vm" ]
 }
 vacuity_guard "$D/empty.list"; ve=$?
 vacuity_guard "$D/clean.list"; vc=$?
-[ "$ve" != 0 ] && [ "$vc" = 0 ]; r=$?
-judge 'vacuity guard: an empty listing fails the exclusion predicate, a populated clean one passes' "$r" \
-    "empty listing rc=$ve (expected non-zero)   populated clean listing rc=$vc (expected 0)"
+vacuity_guard "$D/dirty.list"; vd=$?
+[ "$ve" != 0 ] && [ "$vc" = 0 ] && [ "$vd" != 0 ]; r=$?
+judge 'vacuity guard: empty listing fails, populated clean one passes, one with a member outside /etc fails' "$r" \
+    "empty rc=$ve (expected non-zero)   clean rc=$vc (expected 0)   outside-/etc rc=$vd (expected non-zero)"
 
 echo "== c. create --mode full on the live configuration =="
 arch=$(sh "$GPB" create --mode full --output "$D/out" 2>"$D/full.err"); r=$?
@@ -181,9 +199,9 @@ grep -q -F -x 'gl-portable-backup/manifest.json' "$D/full.list" && grep -q -F -x
 judge 'create full: archive holds manifest.json and config/network' "$r" \
     "$(grep -F -x -e 'gl-portable-backup/manifest.json' -e 'gl-portable-backup/config/network' "$D/full.list" | tr '\n' ' ')$(cat "$D/full.list.err")"
 
-outside=$(grep -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/full.list" | head -n 5 | tr '\n' ' ')
+outside=$(outside_etc "$D/full.list" | head -n 5 | tr '\n' ' ')
 [ "$full_n" -gt 0 ] && [ -z "$outside" ]; r=$?
-judge 'create full: nothing outside /etc (no extra/usr, extra/lib, extra/var)' "$r" \
+judge 'create full: nothing outside /etc (no member under extra/ other than extra/etc/)' "$r" \
     "listing lines=$full_n   members: ${outside:-<none>}"
 
 sh "$GPB" inspect "$arch" > "$D/insp.json" 2>"$D/insp.err"; r=$?
@@ -211,10 +229,10 @@ sh "$GPB" create --mode full --include-plugins --output "$arch2" >"$D/plug.out" 
 [ "$r" = 0 ] && [ -f "$arch2" ]; r2=$?
 judge 'create --mode full --include-plugins' "$r2" "rc=$r $(grep -F -e 'Captured' -e 'Skipped' "$D/plug.err" | tr '\n' ';')"
 listing "$arch2" "$D/plug.list"; plug_n=$LIST_N
-inc=$(grep -c -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/plug.list")
-noinc=$(grep -c -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/full.list")
+inc=$(outside_etc "$D/plug.list" | wc -l)
+noinc=$(outside_etc "$D/full.list" | wc -l)
 judge 'observation: members outside /etc, with and without --include-plugins' 0 \
-    "--include-plugins: $inc of $plug_n members (tar rc=$LIST_RC)    default: $noinc of $full_n    sample: $(grep -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/plug.list" | head -n 3 | tr '\n' ' ')"
+    "--include-plugins: $inc of $plug_n members (tar rc=$LIST_RC)    default: $noinc of $full_n    sample: $(outside_etc "$D/plug.list" | head -n 3 | tr '\n' ' ')"
 
 echo "== e. create --mode clone and --mode remote-safe =="
 cl=$(sh "$GPB" create --mode clone --output "$D/out" 2>"$D/clone.err"); r=$?
