@@ -361,6 +361,11 @@ sanitize_configs() {
     # Strip Wi-Fi interface MACs
     [ -f "$confdir/wireless" ] && sed -i "/option macaddr/d" "$confdir/wireless"
 
+    # Strip per-device MAC fields added by firmware 4.9/4.11 (factory_macaddr, repeater, port map)
+    [ -f "$confdir/wireless" ] && sed -i "/option factory_macaddr/d" "$confdir/wireless"
+    [ -f "$confdir/repeater" ] && sed -i "/option macaddr/d" "$confdir/repeater"
+    [ -f "$confdir/eth_ports_config_map" ] && sed -i "/option default_mac/d" "$confdir/eth_ports_config_map"
+
     # Strip DDNS device-specific fields (both v4 and v6)
     # enabled is stripped because DDNS activation requires user consent via GUI
     # and the hostname is tied to the device ID (<gl-device-id>.glddns.com)
