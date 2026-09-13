@@ -14,7 +14,7 @@
 set -e
 
 VERSION="1.0.0"
-FORMAT_VERSION=3
+FORMAT_VERSION=4
 TOOL_NAME="gl-portable-backup"
 ARCHIVE_PREFIX="gl-portable-backup"
 
@@ -533,43 +533,44 @@ filter_firewall_remote_safe() {
 
 # ─── Profile Mode (API-Based) ─────────────────────────────────────────────────
 
+# The local API surface differs by firmware and by model: 4.11 dropped the `lan` module in
+# favour of `vlan_subnet`, and no model ships every module. The RPC handler directory is the
+# authoritative list — a bare file for a Lua module, NAME.so for a compiled one.
+api_module_present() { [ -e "$ROOT/usr/lib/oui-httpd/rpc/$1" ] || [ -e "$ROOT/usr/lib/oui-httpd/rpc/$1.so" ]; }
+
+# Capture one getter. A module this firmware does not ship is skipped, and a JSON-RPC error
+# reply is reported instead of being stored: the previous version wrote every reply to its file,
+# so an archive could carry "method not found" errors that looked like captured settings.
+capture_api() {   # sid module method outfile
+    local reply
+    api_module_present "$2" || { vlog "module $2 absent — skipping $2.$3"; return 0; }
+    reply=$(gl_api "$1" "$2" "$3") || { echo "  WARNING: $2.$3: transport failure" >&2; return 0; }
+    if printf '%s' "$reply" | grep -q '"error"'; then echo "  WARNING: $2.$3: $(printf '%s' "$reply" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')" >&2; return 0; fi
+    printf '%s' "$reply" > "$4"
+}
+
+# One file per call, named module.method.json (format 4). Format 3 named files after the setting
+# (wifi.json, dhcp_static_binds.json); restore reads either set — see api_file().
 capture_profile() {
-    local apidir="$1"
-    local sid
-
+    local apidir="$1" sid
     mkdir -p "$apidir"
-
     sid=$(gl_auth) || die "Failed to authenticate to local API — see the line above"
-
-    # Wi-Fi config
-    gl_api "$sid" "wifi" "get_config" '{}' > "$apidir/wifi.json" 2>/dev/null || echo '{}' > "$apidir/wifi.json"
-
-    # LAN config
-    gl_api "$sid" "lan" "get_config_list" '{}' > "$apidir/lan.json" 2>/dev/null || echo '{}' > "$apidir/lan.json"
-
-    # DNS config
-    gl_api "$sid" "dns" "get_config" '{}' > "$apidir/dns_config.json" 2>/dev/null || echo '{}' > "$apidir/dns_config.json"
-
-    # DNS hosts
-    gl_api "$sid" "dns" "get_host" '{}' > "$apidir/dns_hosts.json" 2>/dev/null || echo '{}' > "$apidir/dns_hosts.json"
-
-    # Firewall rules
-    gl_api "$sid" "firewall" "get_rule_list" '{}' > "$apidir/firewall_rules.json" 2>/dev/null || echo '{}' > "$apidir/firewall_rules.json"
-
-    # Port forwards
-    gl_api "$sid" "firewall" "get_port_forward_list" '{}' > "$apidir/firewall_forwards.json" 2>/dev/null || echo '{}' > "$apidir/firewall_forwards.json"
-
-    # WAN access settings
-    gl_api "$sid" "firewall" "get_wan_access" '{}' > "$apidir/firewall_wan_access.json" 2>/dev/null || echo '{}' > "$apidir/firewall_wan_access.json"
-
-    # Timezone
-    gl_api "$sid" "system" "get_timezone_config" '{}' > "$apidir/timezone.json" 2>/dev/null || echo '{}' > "$apidir/timezone.json"
-
-    # LED
-    gl_api "$sid" "led" "get_config" '{}' > "$apidir/led.json" 2>/dev/null || echo '{}' > "$apidir/led.json"
-
-    # DHCP static bindings (fixed IP assignments)
-    gl_api "$sid" "lan" "get_static_bind_list" '{}' > "$apidir/dhcp_static_binds.json" 2>/dev/null || echo '{}' > "$apidir/dhcp_static_binds.json"
+    # LAN subnets and DHCP reservations live under `vlan_subnet` from 4.11 on, where a subnet
+    # also carries its VLAN id, and under `lan` before that.
+    if api_module_present vlan_subnet; then
+        capture_api "$sid" vlan_subnet get_subnets "$apidir/vlan_subnet.get_subnets.json"
+        capture_api "$sid" vlan_subnet get_static_bind_list "$apidir/vlan_subnet.get_static_bind_list.json"
+    else
+        capture_api "$sid" lan get_config_list "$apidir/lan.get_config_list.json"
+        capture_api "$sid" lan get_static_bind_list "$apidir/lan.get_static_bind_list.json"
+    fi
+    for mm in wifi.get_config dns.get_config dns.get_host firewall.get_rule_list firewall.get_port_forward_list \
+              firewall.get_wan_access system.get_timezone_config system.get_info led.get_config ipv6.get_ipv6 \
+              cable.get_ports_config cloud.get_config tailscale.get_config zerotier.get_config vpn-client.get_tunnel \
+              vpn-client.get_all_config_list timer.get_wifi timer.get_led timer.get_reboot switch-button.get_config \
+              repeater.get_saved_ap_list netmode.get_mode; do
+        capture_api "$sid" "${mm%%.*}" "${mm#*.}" "$apidir/$mm.json"
+    done
 }
 
 # ─── Package Capture ───────────────────────────────────────────────────────────
@@ -1133,6 +1134,19 @@ restore_portable() {
     echo "Hardware identity preserved." >&2
 }
 
+# Profile archives before format 4 named each file after the setting (led.json); format 4 names
+# it after the API call that produced it (led.get_config.json), and 4.11 archives carry
+# vlan_subnet.* where older ones carry lan.*. Restore accepts every generation: print the first
+# candidate name that exists, and nothing when none of them do.
+api_file() {   # apidir name...
+    local dir="$1" name
+    shift
+    for name in "$@"; do
+        if [ -f "$dir/$name" ]; then echo "$dir/$name"; return 0; fi
+    done
+    return 0
+}
+
 restore_profile() {
     local tmpdir="$1"
     local apidir="$tmpdir/api"
@@ -1144,10 +1158,12 @@ restore_profile() {
     sid=$(gl_auth) || die "Failed to authenticate to local API — see the line above"
 
     # Restore timezone
-    if [ -f "$apidir/timezone.json" ]; then
-        local tz_result=$(jsonfilter -i "$apidir/timezone.json" -e '@.result')
+    local tz_file
+    tz_file=$(api_file "$apidir" system.get_timezone_config.json timezone.json)
+    if [ -n "$tz_file" ]; then
+        local tz_result=$(jsonfilter -i "$tz_file" -e '@.result')
         if [ -n "$tz_result" ] && [ "$tz_result" != "null" ]; then
-            local zonename=$(jsonfilter -i "$apidir/timezone.json" -e '@.result.zonename' 2>/dev/null)
+            local zonename=$(jsonfilter -i "$tz_file" -e '@.result.zonename' 2>/dev/null)
             if [ -n "$zonename" ]; then
                 gl_api "$sid" "system" "set_timezone_config" "{\"zonename\":\"$zonename\"}" >/dev/null 2>&1
                 echo "  Restored timezone: $zonename" >&2
@@ -1156,11 +1172,13 @@ restore_profile() {
     fi
 
     # Restore DNS config
-    if [ -f "$apidir/dns_config.json" ]; then
-        local dns_result=$(jsonfilter -i "$apidir/dns_config.json" -e '@.result')
+    local dns_file
+    dns_file=$(api_file "$apidir" dns.get_config.json dns_config.json)
+    if [ -n "$dns_file" ]; then
+        local dns_result=$(jsonfilter -i "$dns_file" -e '@.result')
         if [ -n "$dns_result" ] && [ "$dns_result" != "null" ]; then
-            local dns_mode=$(jsonfilter -i "$apidir/dns_config.json" -e '@.result.mode' 2>/dev/null || echo "")
-            local force_dns=$(jsonfilter -i "$apidir/dns_config.json" -e '@.result.force_dns' 2>/dev/null || echo "")
+            local dns_mode=$(jsonfilter -i "$dns_file" -e '@.result.mode' 2>/dev/null || echo "")
+            local force_dns=$(jsonfilter -i "$dns_file" -e '@.result.force_dns' 2>/dev/null || echo "")
             if [ -n "$dns_mode" ]; then
                 local params="{\"mode\":\"$dns_mode\""
                 [ -n "$force_dns" ] && params="${params},\"force_dns\":$force_dns"
@@ -1172,8 +1190,10 @@ restore_profile() {
     fi
 
     # Restore DNS hosts
-    if [ -f "$apidir/dns_hosts.json" ]; then
-        local hosts_content=$(jsonfilter -i "$apidir/dns_hosts.json" -e '@.result.content' 2>/dev/null)
+    local hosts_file
+    hosts_file=$(api_file "$apidir" dns.get_host.json dns_hosts.json)
+    if [ -n "$hosts_file" ]; then
+        local hosts_content=$(jsonfilter -i "$hosts_file" -e '@.result.content' 2>/dev/null)
         if [ -n "$hosts_content" ]; then
             local escaped=$(echo "$hosts_content" | sed 's/"/\\"/g')
             gl_api "$sid" "dns" "set_host" "{\"content\":\"$escaped\"}" >/dev/null 2>&1
@@ -1182,8 +1202,10 @@ restore_profile() {
     fi
 
     # Restore LED config
-    if [ -f "$apidir/led.json" ]; then
-        local led_enable=$(jsonfilter -i "$apidir/led.json" -e '@.result.led_enable' 2>/dev/null)
+    local led_file
+    led_file=$(api_file "$apidir" led.get_config.json led.json)
+    if [ -n "$led_file" ]; then
+        local led_enable=$(jsonfilter -i "$led_file" -e '@.result.led_enable' 2>/dev/null)
         if [ -n "$led_enable" ]; then
             gl_api "$sid" "led" "set_config" "{\"led_enable\":$led_enable}" >/dev/null 2>&1
             echo "  Restored LED config" >&2
@@ -1191,20 +1213,26 @@ restore_profile() {
     fi
 
     # Restore Wi-Fi config (map by band)
-    if [ -f "$apidir/wifi.json" ]; then
+    local wifi_file
+    wifi_file=$(api_file "$apidir" wifi.get_config.json wifi.json)
+    if [ -n "$wifi_file" ]; then
         echo "  Restoring Wi-Fi (mapped by band)..." >&2
-        restore_profile_wifi "$sid" "$apidir/wifi.json"
+        restore_profile_wifi "$sid" "$wifi_file"
     fi
 
-    # Restore LAN config
-    if [ -f "$apidir/lan.json" ]; then
+    # Restore LAN config (vlan_subnet on 4.11+, lan before it)
+    local lan_file
+    lan_file=$(api_file "$apidir" vlan_subnet.get_subnets.json lan.get_config_list.json lan.json)
+    if [ -n "$lan_file" ]; then
         echo "  Restoring LAN config..." >&2
-        restore_profile_lan "$sid" "$apidir/lan.json"
+        restore_profile_lan "$sid" "$lan_file"
     fi
 
     # Restore DHCP static bindings (fixed IP assignments)
-    if [ -f "$apidir/dhcp_static_binds.json" ]; then
-        restore_profile_dhcp_static "$sid" "$apidir/dhcp_static_binds.json"
+    local binds_file
+    binds_file=$(api_file "$apidir" vlan_subnet.get_static_bind_list.json lan.get_static_bind_list.json dhcp_static_binds.json)
+    if [ -n "$binds_file" ]; then
+        restore_profile_dhcp_static "$sid" "$binds_file"
     fi
 
     echo "  Profile restore complete" >&2
@@ -1234,6 +1262,14 @@ restore_profile_lan() {
 restore_profile_dhcp_static() {
     local sid="$1"
     local binds_file="$2"
+
+    # Every call below goes through the `lan` module, which 4.11 replaced with `vlan_subnet`.
+    # Its binding methods are not spoken yet, so report what was skipped rather than fire calls
+    # the router answers with "method not found" while nothing here notices.
+    if ! api_module_present lan; then
+        echo "  Static bindings: skipped — this firmware has no lan API (use a Clone archive or wait for Profile restore v2)" >&2
+        return 0
+    fi
 
     # Check if backup has any static bindings
     local count
