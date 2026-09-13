@@ -1,0 +1,369 @@
+#!/bin/sh
+# gl-portable-backup — on-router smoke test.
+#
+# Runs the release candidate's backend on a real GL.iNet router, where BusyBox applets, the live
+# firmware's API surface and the real /rom tree replace the laptop harness's mocks. This is the
+# lint-the-instrument gate for a release: every applet the backend depends on is checked against a
+# known answer here, in both directions where a direction exists.
+#
+# Usage: tests/on-router-smoke.sh <router-ip> [user]     (key-based SSH; scp -O, no sftp on GL)
+#
+# What it touches on the router: nothing outside /tmp/gpb-smoke*, removed by the remote driver's
+# EXIT trap. Nothing is installed. `create` reads the live configuration — that is the point — but
+# every archive it writes lands in /tmp/gpb-smoke/. `restore` runs only against a synthetic source
+# tree under /tmp/gpb-smoke/src with GPB_ROOT pointed at a scratch target, never against the live
+# root and never in a mode that calls uci. The md5 of the live SSH/network/DDNS files is recorded
+# before and after and compared as the last check.
+set -u
+
+usage() { echo "usage: tests/on-router-smoke.sh <router-ip> [user]" >&2; exit 2; }
+[ $# -ge 1 ] || usage
+IP="$1"
+USER_="${2:-root}"
+case "$IP" in -*|"") usage ;; esac
+
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+BACKEND="$HERE/luci-app-gl-portable-backup/root/usr/sbin/gl-portable-backup"
+[ -f "$BACKEND" ] || { echo "missing backend: $BACKEND" >&2; exit 2; }
+
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+REMOTE="$USER_@$IP"
+D=/tmp/gpb-smoke
+
+LOGDIR="$HERE/build"
+mkdir -p "$LOGDIR" || exit 2
+LOG="$LOGDIR/smoke-$(date +%Y%m%d-%H%M).log"
+
+TMP=$(mktemp -d) || exit 2
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+# The driver is copied to the router and run from a file rather than fed to `sh -s`: a script read
+# from stdin is corrupted by anything inside it that also reads stdin.
+cat > "$TMP/driver.sh" <<'REMOTE_DRIVER'
+#!/bin/sh
+# Runs ON the router. Writes only under /tmp/gpb-smoke*; no opkg install, no uci write, no
+# /etc/init.d, nothing under /etc, /overlay, /www or /usr.
+set -u
+D=/tmp/gpb-smoke
+GPB="$D/gl-portable-backup"
+TMPDIR="$D/tmp"; export TMPDIR
+trap 'rm -rf /tmp/gpb-smoke*' EXIT INT TERM HUP
+
+pass=0; fail=0
+# judge <name> <rc> [observation]: the raw observation is printed next to every verdict so a
+# surprising result is triageable without another run.
+judge() {
+    if [ "$2" = 0 ]; then pass=$((pass + 1)); echo "OK: $1"; else fail=$((fail + 1)); echo "FAIL: $1"; fi
+    if [ -n "${3:-}" ]; then printf '%s\n' "$3" | sed 's/^/    | /'; fi
+    return 0
+}
+
+mkdir -p "$D/tmp" "$D/out" "$D/x" "$D/fakebin" || exit 2
+[ -f "$GPB" ] || { echo "FAIL: backend not copied to $GPB"; echo "passed=0 failed=1"; exit 1; }
+
+# Live files that must be byte-identical before and after the whole run.
+snapshot() { md5sum /etc/dropbear/* /etc/config/network /etc/config/gl_ddns 2>&1 | sort; }
+snapshot > "$D/md5.before"
+
+echo "== environment =="
+echo "    | $(sh "$GPB" version 2>&1) | firmware $(cat /etc/glversion 2>/dev/null) | $(jsonfilter -i /etc/board.json -e '@.model.id' 2>/dev/null)"
+
+echo "== a. parameter-expansion lint =="
+cat > "$D/exp.sh" <<'EOS'
+f(){ p="${1-}"; [ -n "$p" ] || p='{}'; echo "[$p]"; }
+f
+f '{}'
+EOS
+got=$(sh "$D/exp.sh" 2>&1 | tr '\n' ' ')
+[ "$got" = "[{}] [{}] " ]; r=$?
+judge 'expansion: ${1-} plus default yields {} for both argument shapes' "$r" "got: $got(expected '[{}] [{}] ')"
+# The instrument has to discriminate, so the two pre-1.1 idioms are checked here too: each is
+# still wrong in exactly the argument shape it was wrong in (verified on this router's ash).
+cat > "$D/exp_old.sh" <<'EOS'
+g(){ p="${1:-{}}"; echo "[$p]"; }
+g
+g '{"a":1}'
+EOS
+cat > "$D/exp_olde.sh" <<'EOS'
+g(){ p="${1:-\{\}}"; echo "[$p]"; }
+g
+g '{"a":1}'
+EOS
+o1=$(sh "$D/exp_old.sh" 2>&1 | tr '\n' ' ')
+o2=$(sh "$D/exp_olde.sh" 2>&1 | tr '\n' ' ')
+[ "$o1" = '[{}] [{"a":1}}] ' ] && [ "$o2" = '[\{}] [{"a":1}] ' ]; r=$?
+judge 'expansion: both pre-1.1 idioms still fail where they failed (issue #1 B1 fence)' "$r" \
+    "\${4:-{}} -> $o1   \${4:-\\{\\}} -> $o2"
+
+echo "== b. applet known-answer lints =="
+n=$(printf 'abc \t\n' | sed 's/[ \t]*$//' | wc -c)
+[ "$n" = "4" ]; r=$?
+judge 'applet: sed [ \t] strips a trailing space and tab (keep.d line parser)' "$r" "wc -c = $n (expected 4)"
+
+n=$(printf 'a\nb\n' | wc -l)
+[ "$n" = "2" ]; r=$?
+judge 'applet: wc -l prints an unpadded count (capture/restore counters)' "$r" "wc -l = [$n] (expected [2])"
+
+printf '1\n2\n3\n' > "$D/3lines"
+d1=$(sed '$d' "$D/3lines" | tr '\n' '|')
+d2=$(sed '$ s/$/,/' "$D/3lines" | tr '\n' '|')
+[ "$d1" = "1|2|" ] && [ "$d2" = "1|2|3,|" ]; r=$?
+judge 'applet: sed $d and $ s/$/,/ (inspect rewrites the manifest tail)' "$r" "\$d -> $d1   \$ s/\$/,/ -> $d2"
+
+h=$(printf 'abcdefgh' | head -c 5)
+[ "$h" = "abcde" ]; r=$?
+judge 'applet: head -c truncates (API error messages)' "$r" "head -c 5 -> $h (expected abcde)"
+
+echo x > "$D/cmp_a"; echo x > "$D/cmp_b"; echo y > "$D/cmp_c"
+cmp -s "$D/cmp_a" "$D/cmp_b"; r1=$?
+cmp -s "$D/cmp_a" "$D/cmp_c"; r2=$?
+[ "$r1" = 0 ] && [ "$r2" != 0 ]; r=$?
+judge 'applet: cmp -s answers both directions (is_rom_identical)' "$r" "identical rc=$r1 (expected 0), differing rc=$r2 (expected non-zero)"
+
+mkdir -p "$D/cpsrc/sub" "$D/cpdst"; echo hi > "$D/cpsrc/.dot"; echo deep > "$D/cpsrc/sub/f"
+cp -a "$D/cpsrc/." "$D/cpdst/" 2>"$D/cp.err"
+[ -f "$D/cpdst/.dot" ] && [ -f "$D/cpdst/sub/f" ]; r=$?
+judge 'applet: cp -a SRC/. DST/ carries dotfiles and subdirectories (config tree copy)' "$r" \
+    "$(find "$D/cpdst" | sed "s|$D/cpdst|DST|" | sort | tr '\n' ' ')$(cat "$D/cp.err")"
+
+( cd "$D" && tar -czf "$D/t.tgz" cpsrc ) 2>/dev/null
+lst=$(tar -tzf "$D/t.tgz" 2>/dev/null | tr '\n' ' ')
+printf '%s' "$lst" | grep -q 'cpsrc/sub/f'; r=$?
+judge 'applet: tar -tzf lists nested members' "$r" "$lst"
+
+dropbearkey -t ed25519 -f "$D/k" >"$D/k.gen" 2>&1
+fp=$(dropbearkey -y -f "$D/k" 2>/dev/null | grep -i '^Fingerprint:')
+case "$fp" in "Fingerprint: SHA256:"*) r=0 ;; *) r=1 ;; esac
+judge 'applet: dropbearkey -y -f prints a SHA256 fingerprint (host-key warning)' "$r" "$fp"
+
+echo "== c. create --mode full on the live configuration =="
+arch=$(sh "$GPB" create --mode full --output "$D/out" 2>"$D/full.err"); r=$?
+arch=${arch:-$D/no-archive}
+[ "$r" = 0 ] && [ -f "$arch" ]; r2=$?
+judge 'create --mode full --output <directory> (B9: directory output)' "$r2" "rc=$r archive=$arch"
+
+cap=$(sed -n 's/.*Captured \([0-9][0-9]*\) extra persistent files.*/\1/p' "$D/full.err")
+skp=$(sed -n 's/.*Skipped \([0-9][0-9]*\) firmware-owned, \([0-9][0-9]*\) identical to \/rom.*/\1 \2/p' "$D/full.err")
+[ -n "$cap" ] && [ -n "$skp" ]; r=$?
+judge 'create full: reports the captured and skipped counts' "$r" \
+    "$(grep -F -e 'Captured' -e 'Skipped' "$D/full.err" | tr '\n' ';')"
+
+tar -tzf "$arch" > "$D/full.list" 2>"$D/full.list.err"
+grep -q -F -x 'gl-portable-backup/manifest.json' "$D/full.list" && grep -q -F -x 'gl-portable-backup/config/network' "$D/full.list"; r=$?
+judge 'create full: archive holds manifest.json and config/network' "$r" \
+    "$(grep -F -x -e 'gl-portable-backup/manifest.json' -e 'gl-portable-backup/config/network' "$D/full.list" | tr '\n' ' ')$(cat "$D/full.list.err")"
+
+outside=$(grep -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/full.list" | head -n 5 | tr '\n' ' ')
+[ -z "$outside" ]; r=$?
+judge 'create full: nothing outside /etc (no extra/usr, extra/lib, extra/var)' "$r" "members: ${outside:-<none>}"
+
+sh "$GPB" inspect "$arch" > "$D/insp.json" 2>"$D/insp.err"; r=$?
+fv=$(jsonfilter -e '@.format_version' < "$D/insp.json" 2>/dev/null)
+[ "$r" = 0 ] && [ "$fv" = 4 ]; r2=$?
+judge 'inspect full: output parses as JSON, format_version=4' "$r2" "rc=$r format_version=[$fv] $(cat "$D/insp.err")"
+
+grep -q -F '"restores_ssh_host_keys": true' "$D/insp.json" && grep -q -F '"restores_root_password": true' "$D/insp.json"; r=$?
+judge 'inspect full: reports the SSH host-key and root-password overwrite' "$r" \
+    "$(grep -F -e 'restores_ssh_host_keys' -e 'restores_root_password' "$D/insp.json" | tr '\n' ' ')"
+
+rm -rf "$D/x"; mkdir -p "$D/x"
+tar -xzf "$arch" -C "$D/x" gl-portable-backup/backup-info.txt 2>"$D/x.err"
+sk=$(sed -n 's/^Skipped: *//p' "$D/x/gl-portable-backup/backup-info.txt" 2>/dev/null)
+[ -n "$sk" ]; r=$?
+judge 'backup-info.txt carries the Skipped line' "$r" "Skipped: ${sk:-<absent>} $(cat "$D/x.err")"
+
+fpa=$(sh "$GPB" fingerprint "$arch" 2>"$D/fp.err")
+case "$fpa" in *"Fingerprint: SHA256:"*) r=0 ;; *) r=1 ;; esac
+judge 'fingerprint full: prints the host-key fingerprint the archive would install' "$r" "$fpa $(cat "$D/fp.err")"
+
+echo "== d. create --mode full --include-plugins =="
+arch2="$D/out/full-include-plugins.tar.gz"
+sh "$GPB" create --mode full --include-plugins --output "$arch2" >"$D/plug.out" 2>"$D/plug.err"; r=$?
+[ "$r" = 0 ] && [ -f "$arch2" ]; r2=$?
+judge 'create --mode full --include-plugins' "$r2" "rc=$r $(grep -F -e 'Captured' -e 'Skipped' "$D/plug.err" | tr '\n' ';')"
+inc=$(tar -tzf "$arch2" 2>/dev/null | grep -c -E '^gl-portable-backup/extra/(usr|lib|var)/')
+noinc=$(grep -c -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/full.list")
+judge 'observation: members outside /etc, with and without --include-plugins' 0 \
+    "--include-plugins: $inc    default: $noinc    sample: $(tar -tzf "$arch2" 2>/dev/null | grep -E '^gl-portable-backup/extra/(usr|lib|var)/' | head -n 3 | tr '\n' ' ')"
+
+echo "== e. create --mode clone and --mode remote-safe =="
+cl=$(sh "$GPB" create --mode clone --output "$D/out" 2>"$D/clone.err"); r=$?
+cl=${cl:-$D/no-clone}
+[ "$r" = 0 ] && [ -f "$cl" ]; r2=$?
+judge 'create --mode clone' "$r2" "rc=$r archive=$cl"
+tar -tzf "$cl" > "$D/clone.list" 2>/dev/null
+sh "$GPB" inspect "$cl" > "$D/clone.insp" 2>/dev/null
+grep -q -F '"restores_ssh_host_keys": false' "$D/clone.insp" && grep -q -F '"restores_root_password": false' "$D/clone.insp"; r=$?
+judge 'inspect clone: both overwrite flags false' "$r" \
+    "$(grep -F -e 'restores_ssh_host_keys' -e 'restores_root_password' "$D/clone.insp" | tr '\n' ' ')"
+leak=$(grep -E 'extra/etc/dropbear/dropbear_|extra/etc/shadow$' "$D/clone.list" | tr '\n' ' ')
+[ -z "$leak" ]; r=$?
+judge 'create clone: no SSH host keys and no /etc/shadow in the archive' "$r" "members: ${leak:-<none>}"
+
+rs=$(sh "$GPB" create --mode remote-safe --output "$D/out" 2>"$D/rs.err"); r=$?
+rs=${rs:-$D/no-rs}
+[ "$r" = 0 ] && [ -f "$rs" ]; r2=$?
+judge 'create --mode remote-safe' "$r2" "rc=$r archive=$rs"
+tar -tzf "$rs" > "$D/rs.list" 2>/dev/null
+sh "$GPB" inspect "$rs" > "$D/rs.insp" 2>/dev/null
+grep -q -F '"restores_ssh_host_keys": false' "$D/rs.insp" && grep -q -F '"restores_root_password": false' "$D/rs.insp"; r=$?
+judge 'inspect remote-safe: both overwrite flags false' "$r" \
+    "$(grep -F -e 'restores_ssh_host_keys' -e 'restores_root_password' "$D/rs.insp" | tr '\n' ' ')"
+leak=$(grep -E 'extra/etc/dropbear/dropbear_|extra/etc/shadow$' "$D/rs.list" | tr '\n' ' ')
+[ -z "$leak" ]; r=$?
+judge 'create remote-safe: no SSH host keys and no /etc/shadow in the archive' "$r" "members: ${leak:-<none>}"
+leak=$(grep -E 'config/(zerotier|tailscale|gl-cloud)$' "$D/rs.list" | tr '\n' ' ')
+[ -z "$leak" ]; r=$?
+judge 'create remote-safe: zerotier, tailscale and gl-cloud configs excluded' "$r" \
+    "members: ${leak:-<none>}   (clone for contrast: $(grep -E 'config/(zerotier|tailscale|gl-cloud)$' "$D/clone.list" | tr '\n' ' '))"
+
+echo "== f. create --mode profile (real local-API authentication) =="
+pr=$(sh "$GPB" create --mode profile --output "$D/out" 2>"$D/profile.err"); r=$?
+pr=${pr:-$D/no-profile}
+[ "$r" = 0 ] && [ -f "$pr" ]; r2=$?
+judge 'create --mode profile' "$r2" "rc=$r archive=$pr"
+tar -tzf "$pr" > "$D/profile.list" 2>/dev/null
+sh "$GPB" inspect "$pr" > "$D/profile.insp" 2>/dev/null
+fv=$(jsonfilter -e '@.format_version' < "$D/profile.insp" 2>/dev/null)
+[ "$fv" = 4 ]; r=$?
+judge 'inspect profile: format_version=4' "$r" "format_version=[$fv]"
+apis=$(sed -n 's|^gl-portable-backup/api/||p' "$D/profile.list" | sort | tr '\n' ' ')
+missing=""
+for want in vlan_subnet.get_subnets.json wifi.get_config.json dns.get_config.json system.get_info.json; do
+    case " $apis " in *" $want "*) ;; *) missing="$missing $want" ;; esac
+done
+[ -z "$missing" ]; r=$?
+judge 'create profile: the four required API captures are present' "$r" \
+    "missing:${missing:- <none>}   captured: $apis"
+lanmem=$(grep -E '^gl-portable-backup/api/lan\.' "$D/profile.list" | tr '\n' ' ')
+[ -z "$lanmem" ]; r=$?
+judge 'create profile: no lan.* capture on this firmware (4.11 replaced lan with vlan_subnet)' "$r" "members: ${lanmem:-<none>}"
+warns=$(grep -F 'WARNING:' "$D/profile.err" | sed 's/^ *//' | tr '\n' ';')
+judge 'observation: API calls this firmware refused' 0 "${warns:-<none>}"
+
+echo "== g. forced authentication failure =="
+printf '#!/bin/sh\nexit 7\n' > "$D/fakebin/curl"; chmod 0755 "$D/fakebin/curl"
+PATH="$D/fakebin:$PATH" sh "$GPB" create --mode profile --output "$D/out2" >"$D/g.out" 2>"$D/g.err"; r=$?
+[ "$r" = 1 ]; r2=$?
+judge 'auth failure: exit status 1' "$r2" "rc=$r"
+grep -q -F 'auth: challenge failed (curl exit 7)' "$D/g.err" && grep -q -F 'ERROR: Failed to authenticate' "$D/g.err"; r=$?
+judge 'auth failure: both diagnostic lines reach stderr (issue #1 B8)' "$r" "$(tr '\n' ';' < "$D/g.err")"
+[ ! -e "$D/out2" ]; r=$?
+judge 'auth failure: no archive created' "$r" "$(ls -d "$D/out2" 2>&1)"
+
+echo "== h. synthetic-root create and restore =="
+S="$D/src"
+mkdir -p "$S/etc/config/cellular" "$S/etc/dropbear" "$S/usr/lib/opkg" "$S/lib/upgrade/keep.d"
+cp /etc/board.json "$S/etc/board.json"
+cp /etc/glversion "$S/etc/glversion"
+cp /etc/openwrt_release "$S/etc/openwrt_release"
+printf 'Package: gpb-smoke-pkg\nStatus: install user installed\n' > "$S/usr/lib/opkg/status"
+echo "config interface 'smoke'" > "$S/etc/config/network"
+echo '{"smoke":true}' > "$S/etc/config/cellular/x.json"
+printf '/etc/dropbear/\n' > "$S/lib/upgrade/keep.d/dropbear"
+printf '/etc/shadow\n' > "$S/lib/upgrade/keep.d/base-files-essential"
+dropbearkey -t ed25519 -f "$S/etc/dropbear/dropbear_ed25519_host_key" >/dev/null 2>&1
+echo 'ssh-ed25519 AAAAsmokeauthorizedkey smoke' > "$S/etc/dropbear/authorized_keys"
+echo 'root:x:1::::::' > "$S/etc/shadow"
+[ ! -e "$S/etc/config/gl_ddns" ]; r=$?
+judge 'synthetic source has no gl_ddns (restore must not touch the live DDNS service)' "$r" \
+    "$(find "$S/etc/config" | sed "s|$S|SRC|" | sort | tr '\n' ' ')"
+
+sarch="$D/out3"
+GPB_ROOT="$S" sh "$GPB" create --mode full --output "$sarch" >"$D/syn.out" 2>"$D/syn.err"; r=$?
+[ "$r" = 0 ] && [ -f "$sarch" ]; r2=$?
+judge 'synthetic: create --mode full with GPB_ROOT' "$r2" "rc=$r $(grep -F -e 'Captured' -e 'Skipped' "$D/syn.err" | tr '\n' ';')"
+tar -tzf "$sarch" > "$D/syn.list" 2>/dev/null
+grep -q -F 'gl-portable-backup/config/cellular/x.json' "$D/syn.list" && grep -q -F 'gl-portable-backup/extra/etc/dropbear/authorized_keys' "$D/syn.list"; r=$?
+judge 'synthetic: the config directory and the keep.d files are in the archive' "$r" \
+    "$(grep -E 'cellular|dropbear|shadow' "$D/syn.list" | tr '\n' ' ')"
+
+srcfp=$(dropbearkey -y -f "$S/etc/dropbear/dropbear_ed25519_host_key" 2>/dev/null | grep -i '^Fingerprint:')
+arcfp=$(sh "$GPB" fingerprint "$sarch" 2>"$D/sfp.err")
+[ -n "$srcfp" ] && [ "$srcfp" = "$arcfp" ]; r=$?
+judge 'synthetic: fingerprint matches the source key dropbearkey reports' "$r" "source: $srcfp   archive: $arcfp $(cat "$D/sfp.err")"
+srcfp_val=$(printf '%s' "$srcfp" | sed 's/^.*\(SHA256:[A-Za-z0-9+/=]*\).*$/\1/')
+srckey_md5=$(md5sum "$S/etc/dropbear/dropbear_ed25519_host_key" | awk '{print $1}')
+
+G="$D/tgt"
+mkdir -p "$G/etc/config" "$G/etc/dropbear"
+cp /etc/board.json "$G/etc/board.json"; cp /etc/glversion "$G/etc/glversion"
+dropbearkey -t ed25519 -f "$G/etc/dropbear/dropbear_ed25519_host_key" >/dev/null 2>&1
+tgt_md5_before=$(md5sum "$G/etc/dropbear/dropbear_ed25519_host_key" | awk '{print $1}')
+out=$(GPB_ROOT="$G" sh "$GPB" restore --keep-host-keys "$sarch" 2>"$D/r1.err"); r=$?
+last=$(printf '%s\n' "$out" | tail -n 1)
+[ "$r" = 0 ] && [ "$last" = "RESTORE_OK" ]; r2=$?
+judge 'synthetic: restore --keep-host-keys exits 0 with RESTORE_OK' "$r2" "rc=$r last stdout line: $last"
+grep -q -F "Keeping this device's SSH host keys" "$D/r1.err"; r=$?
+judge 'synthetic: restore --keep-host-keys says so' "$r" "$(grep -F -e 'Keeping' -e 'WARNING' "$D/r1.err" | tr '\n' ';')"
+tgt_md5_after=$(md5sum "$G/etc/dropbear/dropbear_ed25519_host_key" | awk '{print $1}')
+[ "$tgt_md5_before" = "$tgt_md5_after" ] && [ "$tgt_md5_after" != "$srckey_md5" ]; r=$?
+judge 'synthetic: --keep-host-keys left the target host key alone' "$r" \
+    "target md5 before=$tgt_md5_before after=$tgt_md5_after source=$srckey_md5"
+[ "$(cat "$G/etc/dropbear/authorized_keys" 2>/dev/null)" = 'ssh-ed25519 AAAAsmokeauthorizedkey smoke' ]; r=$?
+judge 'synthetic: authorized_keys restored even with --keep-host-keys' "$r" "$(cat "$G/etc/dropbear/authorized_keys" 2>&1)"
+[ -f "$G/etc/config/cellular/x.json" ]; r=$?
+judge 'synthetic: /etc/config directories restored (B3: cellular/, gl_nas/)' "$r" \
+    "$(find "$G/etc/config" | sed "s|$G|TGT|" | sort | tr '\n' ' ')"
+
+G2="$D/tgt2"
+mkdir -p "$G2/etc/config" "$G2/etc/dropbear"
+cp /etc/board.json "$G2/etc/board.json"; cp /etc/glversion "$G2/etc/glversion"
+dropbearkey -t ed25519 -f "$G2/etc/dropbear/dropbear_ed25519_host_key" >/dev/null 2>&1
+out2=$(GPB_ROOT="$G2" sh "$GPB" restore "$sarch" 2>"$D/r2.err"); r=$?
+last2=$(printf '%s\n' "$out2" | tail -n 1)
+[ "$r" = 0 ] && [ "$last2" = "RESTORE_OK" ]; r2=$?
+judge 'synthetic: plain restore exits 0 with RESTORE_OK' "$r2" "rc=$r last stdout line: $last2"
+grep -q -F "WARNING: this archive restores the source's SSH host keys" "$D/r2.err" \
+    && grep -q -F "$srcfp_val" "$D/r2.err" \
+    && grep -q -F 'WARNING: this archive restores /etc/shadow' "$D/r2.err"; r=$?
+judge 'synthetic: plain restore warns about the host keys (with the fingerprint) and /etc/shadow' "$r" \
+    "$(grep -F 'WARNING' "$D/r2.err" | tr '\n' ';')"
+tgt2_md5=$(md5sum "$G2/etc/dropbear/dropbear_ed25519_host_key" | awk '{print $1}')
+[ "$tgt2_md5" = "$srckey_md5" ]; r=$?
+judge 'synthetic: plain restore installed the archive host key' "$r" "target2 md5=$tgt2_md5 source md5=$srckey_md5"
+
+echo "== i. the live configuration is untouched =="
+snapshot > "$D/md5.after"
+cmp -s "$D/md5.before" "$D/md5.after"; r=$?
+if [ "$r" = 0 ]; then
+    judge 'live files untouched' 0 "$(wc -l < "$D/md5.before") files compared: /etc/dropbear/*, /etc/config/network, /etc/config/gl_ddns — md5 records identical"
+else
+    judge 'live files untouched' 1 "$(awk 'NR==FNR{h[$2]=$1;next} h[$2]!=$1{print "CHANGED: " $2}' "$D/md5.before" "$D/md5.after" | tr '\n' ' ')"
+fi
+
+echo "passed=$pass failed=$fail"
+[ "$fail" = 0 ]
+REMOTE_DRIVER
+
+reach() { ssh $SSH_OPTS "$REMOTE" "mkdir -p $D/tmp" >/dev/null 2>&1; }
+attempt=1
+while ! reach; do
+    if [ "$attempt" -ge 3 ]; then
+        echo "BLOCKED: $REMOTE unreachable after $attempt attempts" | tee -a "$LOG" >&2
+        exit 3
+    fi
+    echo "router unreachable, retrying in 60s (attempt $attempt)" >&2
+    attempt=$((attempt + 1))
+    sleep 60
+done
+
+scp -O $SSH_OPTS "$BACKEND" "$REMOTE:$D/gl-portable-backup" >/dev/null || { echo "scp of the backend failed" >&2; exit 3; }
+scp -O $SSH_OPTS "$TMP/driver.sh" "$REMOTE:$D/driver.sh" >/dev/null || { echo "scp of the driver failed" >&2; exit 3; }
+
+{
+    echo "gl-portable-backup on-router smoke test"
+    echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)  target: $REMOTE"
+    echo "backend: $BACKEND"
+    echo
+} > "$LOG"
+
+ssh $SSH_OPTS "$REMOTE" "sh $D/driver.sh" 2>&1 | tee -a "$LOG"
+
+summary=$(tail -n 1 "$LOG")
+echo "log: $LOG"
+case "$summary" in
+    "passed="*" failed=0") exit 0 ;;
+    "passed="*" failed="*) exit 1 ;;
+    *) echo "FAIL: the driver did not report a summary (last line: $summary)"; exit 1 ;;
+esac
