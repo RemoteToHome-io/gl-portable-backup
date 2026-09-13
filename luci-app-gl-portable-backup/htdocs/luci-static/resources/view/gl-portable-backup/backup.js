@@ -634,7 +634,7 @@ return view.extend({
 						E('label', {}, [
 							E('input', { type: 'radio', name: 'backup_mode', value: 'clone', checked: 'checked' }),
 							' ', E('strong', {}, _('Clone')),
-							' — ', _('Full configuration for same-model deployment. Strips hardware IDs.')
+							' — ', _('Full configuration for same-model deployment. Strips hardware IDs, VPN keys and per-device identity (ZeroTier node secret, Tailscale state, TLS and SSH keys). Capture is tested; this mode\'s restore has not yet been run end to end on a router.')
 						])
 					]),
 
@@ -642,7 +642,7 @@ return view.extend({
 						E('label', {}, [
 							E('input', { type: 'radio', name: 'backup_mode', value: 'remote-safe' }),
 							' ', E('strong', {}, _('Remote-Safe')),
-							' — ', _('Same as Clone, but preserves ZeroTier, GoodCloud, Tailscale, and SSH config. Use when restoring a device you are connected to remotely.')
+							' — ', _('Same as Clone, but preserves the ZeroTier, GoodCloud, Tailscale and SSH config files. Use when restoring a device you are connected to remotely. In this release the target\'s ZeroTier/Tailscale network and firewall sections are NOT preserved — re-enable those services after the restore — and this mode\'s restore has not yet been run end to end on a router.')
 						])
 					]),
 

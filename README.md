@@ -1,6 +1,6 @@
 # GL Portable Backup
 
-**v1.1:** Full, Clone, and Remote-Safe modes are production-ready. Profile capture follows the firmware's RPC module map (`lan` on 4.8/4.9, `vlan_subnet` on 4.11+). Profile *restore* is currently limited to timezone, DNS mode, DNS hosts, LED on/off, and DHCP static bindings (the last only on firmware that still has the `lan` API) — Wi-Fi and LAN restore are not yet implemented. If you need full cross-model transfer today, see [zippyy/GL.iNet-CrossModel-BackupRestoreUtility](https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility) until Profile restore v2 lands.
+**v1.1 status.** **Full** backup *and* restore are production-ready: the round trip has been run end to end on real hardware, including across a firmware upgrade. **Clone** and **Remote-Safe** *capture* is tested, but neither *restore* has been live-run on a router yet — and Remote-Safe's restore does not yet preserve the target's own ZeroTier/Tailscale `network` and `firewall` sections: the excluded config *files* are kept, but the interface, zone and forwarding sections are overwritten with the archive's filtered copies, so those services need re-enabling after the restore. The CLI and the LuCI dialog both say so before you start. **Profile** capture follows the firmware's RPC module map (`lan` on 4.8/4.9, `vlan_subnet` on 4.11+); Profile *restore* is currently limited to timezone, DNS mode, DNS hosts, LED on/off, and DHCP static bindings (the last only on firmware that still has the `lan` API) — Wi-Fi and LAN restore are not yet implemented. If you need full cross-model transfer today, see [zippyy/GL.iNet-CrossModel-BackupRestoreUtility](https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility) until Profile restore v2 lands.
 
 Portable configuration backup and restore for GL.iNet routers. Creates backups with four modes tailored to different deployment scenarios — from fleet cloning to cross-model profile transfer.
 
@@ -14,12 +14,12 @@ GL Portable Backup's portable modes (Clone and Remote-Safe) strip that material 
 
 ## Four Backup Modes
 
-| Mode | Portability | Use Case |
-|------|-------------|----------|
-| **Full** | Same device only | Disaster recovery — complete raw backup of one specific device |
-| **Clone** | Same model | Fleet deployment — golden-image one router, deploy to N others |
-| **Remote-Safe** | Same model | Remote restore without losing ZeroTier/GoodCloud/Tailscale/SSH tunnel |
-| **Profile** | Any model | Transfer Wi-Fi/LAN/DNS/firewall basics across different models |
+| Mode | Portability | Use Case | Status in 1.1 |
+|------|-------------|----------|---------------|
+| **Full** | Same device only | Disaster recovery — complete raw backup of one specific device | Capture and restore tested on hardware |
+| **Clone** | Same model | Fleet deployment — golden-image one router, deploy to N others | Capture tested; restore not yet live-run |
+| **Remote-Safe** | Same model | Remote restore without losing the ZeroTier/GoodCloud/Tailscale/SSH tunnel | Capture tested; restore not yet live-run, and does not yet preserve the target's ZT/TS `network`/`firewall` sections |
+| **Profile** | Any model | Transfer Wi-Fi/LAN/DNS/firewall basics across different models | Capture tested; restore limited (see below) |
 
 ### Full
 
@@ -33,8 +33,11 @@ Captures all UCI config files plus non-UCI persistent files. Strips MAC addresse
 
 Same as Clone, but additionally excludes remote access configurations so you don't cut off the tunnel you're connected through:
 
-- **Entire files excluded**: `zerotier`, `tailscale`, `gl-cloud`, `rtty`, `dropbear`, `wan-access`
+- **Entire config files excluded**: `zerotier`, `tailscale`, `gl-cloud`, `rtty`, `dropbear`, `wan-access`
+- **Also excluded from `extra/`**: `/etc/dropbear/authorized_keys` (on top of everything Clone leaves out, including `/etc/tailscale/`)
 - **Selective exclusion**: ZeroTier/Tailscale interface sections filtered from `network`; matching zones/rules/forwards filtered from `firewall`
+
+**Limitation in 1.1 — read before restoring over a tunnel.** Restore preserves the *excluded config files* listed above by copying the target's own copies back afterwards, but it does **not** preserve the target's `zerotier*`/`tailscale*` sections inside `network` and `firewall`: those are overwritten with the archive's filtered copies, which have none. The tunnel daemon keeps running with its own config, but the interface, its firewall zone and its forwardings are gone until you re-enable the service in the GL admin panel. The CLI prints this notice before applying, and the mode has not yet been live-run end to end on a router.
 
 ### Profile
 
@@ -178,6 +181,8 @@ A **Full** archive carries the source router's dropbear SSH host keys and its `/
 
 One tested data point so far: a Full archive created on a GL-MT3000 running firmware 4.9.0 (beta4) was restored onto the same unit after a clean flash to 4.11.0 (beta1), with GL's "Keep Settings" off. Every item checked came back: LAN/guest/IoT subnets, Wi-Fi SSIDs and passwords, WireGuard and OpenVPN client profiles, ZeroTier and Tailscale node identities, GoodCloud binding, hostname, DNS settings, WAN MAC mode, IPv6 mode, deleted default DHCP domains, and DDNS re-registration.
 
+Two caveats on that result, because they change what it proves. It was run with the **1.0.0** CLI, and the archive was **filtered by hand** before restoring — plugin files, vendor scripts that differ on the newer firmware, modem cron files, the package-keep list, DPI engine files and opkg conffile backups were all removed manually first. Version 1.1's automatic exclusion rules (see "What Is Excluded, and Why") are the productisation of that hand filter, but they are not the same set — they compare against the *source's* `/rom`, and nothing drops configs belonging to a package the target firmware no longer ships. **The 1.1 rules have not yet been exercised on a cross-firmware restore.**
+
 At first boot, 4.11 rewrote some of the restored config on its own: `network.iot` gained `vlan_id`, `display_name`, and `delegate` and lost `ip6assign`; the old-style `guest` section was left unconverted (but still worked); `dhcp.iot.ndp` was added; `gl-dns-v2` gained `manual_enable`/`manual_type`/`manual_local_dns`; and the wireless BSSIDs were regenerated. On 4.11 the `lan` RPC module no longer exists — Profile mode uses `vlan_subnet` instead (see Profile above).
 
 The firmware-mismatch warning on restore is unchanged by any of this — it warns, but does not block. This is one tested result on one model; treat it as a data point, not a guarantee for other models or other firmware jumps.
@@ -238,7 +243,7 @@ Output: `build/out/luci-app-gl-portable-backup_<version>_all.ipk`. This is also 
 
 ## Compatibility
 
-- **Firmware**: GL.iNet 4.x. Full backup and restore after a factory reset were tested on a GL-MT3000 at firmware 4.8.2; a Full archive from 4.9.0-beta4 was restored onto the same unit after a clean flash of 4.11.0-beta1 (see Restoring Across Firmware Versions). API module inventories were checked on GL-MT5000 4.8.4 and GL-AXT1800 4.8.2. Profile capture and the full create/inspect/fingerprint/restore path were exercised on a GL-MT3000 at 4.11.0-beta1 by the on-router smoke test (1.1.0). Not tested on other models or firmware versions.
+- **Firmware**: GL.iNet 4.x. Full backup and restore after a factory reset were tested on a GL-MT3000 at firmware 4.8.2; a Full archive from 4.9.0-beta4 was restored onto the same unit after a clean flash of 4.11.0-beta1 (see Restoring Across Firmware Versions). API module inventories were checked on GL-MT5000 4.8.4 and GL-AXT1800 4.8.2. The on-router smoke test (1.1.0) exercised all four capture modes, Full-mode create/inspect/fingerprint and a restore into a scratch root on a GL-MT3000 at 4.11.0-beta1 — the restore ran against a synthetic source tree, not the live configuration, and no Clone, Remote-Safe or Profile restore was run. Not tested on other models or firmware versions.
 - **Models**: Architecture-independent package — installs on any GL.iNet router. Actual behavior is verified only on the models above; Clone, Remote-Safe, and Full restores are hard-blocked to the same model regardless.
 - **Dependencies**: None beyond stock GL.iNet firmware (`jsonfilter`, `uci`, `curl`, `awk`, `tar`, `dropbearkey` for host-key fingerprints)
 - **Package install**: Uses `/usr/libexec/opkg-call` from `luci-app-opkg` (present on all GL.iNet firmware)
@@ -248,8 +253,7 @@ Output: `build/out/luci-app-gl-portable-backup_<version>_all.ipk`. This is also 
 ```
 gl-portable-backup/
 ├── README.md
-├── dist/                                 # Built .ipk packages
-├── backups/                              # Test backup archives (not committed)
+├── build/out/                            # Built .ipk packages (not committed)
 ├── docs/
 │   └── device-specific-identifiers.md    # Reference: HW ID sources
 ├── pkg/                                  # No-SDK ipk build: build.sh, control, postinst, prerm
