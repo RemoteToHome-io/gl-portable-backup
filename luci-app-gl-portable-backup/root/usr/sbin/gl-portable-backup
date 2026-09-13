@@ -538,15 +538,18 @@ filter_firewall_remote_safe() {
 # authoritative list — a bare file for a Lua module, NAME.so for a compiled one.
 api_module_present() { [ -e "$ROOT/usr/lib/oui-httpd/rpc/$1" ] || [ -e "$ROOT/usr/lib/oui-httpd/rpc/$1.so" ]; }
 
-# Capture one getter. A module this firmware does not ship is skipped, and a JSON-RPC error
-# reply is reported instead of being stored: the previous version wrote every reply to its file,
-# so an archive could carry "method not found" errors that looked like captured settings.
+# Capture one getter. A module this firmware does not ship is skipped. A JSON-RPC reply carries
+# either "result" or "error" at its top level, and only a "result" reply is data worth storing;
+# anything else is reported instead. Testing for "error" would be wrong twice over: a result of
+# its own may carry an "error" field, and the "message" printed for it would then come out of the
+# result body — which on wifi.get_config is SSIDs and keys, and stderr is no place for those.
 capture_api() {   # sid module method outfile
-    local reply
+    local reply msg
     api_module_present "$2" || { vlog "module $2 absent — skipping $2.$3"; return 0; }
     reply=$(gl_api "$1" "$2" "$3") || { echo "  WARNING: $2.$3: transport failure" >&2; return 0; }
-    if printf '%s' "$reply" | grep -q '"error"'; then echo "  WARNING: $2.$3: $(printf '%s' "$reply" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')" >&2; return 0; fi
-    printf '%s' "$reply" > "$4"
+    if printf '%s' "$reply" | grep -q '"result"'; then printf '%s' "$reply" > "$4"; return 0; fi
+    msg=$(printf '%s' "$reply" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -c 200)
+    echo "  WARNING: $2.$3: ${msg:-$(printf '%s' "$reply" | head -c 120)}" >&2
 }
 
 # One file per call, named module.method.json (format 4). Format 3 named files after the setting
@@ -752,7 +755,7 @@ cmd_create() {
     if [ "$mode" = "profile" ]; then
         # Profile mode: API-only capture
         capture_profile "$archdir/api"
-        sections=$(cd "$archdir/api" && for f in *.json; do printf '"%s", ' "${f%.json}"; done | sed 's/, $//')
+        sections=$(cd "$archdir/api" && for f in *.json; do [ -e "$f" ] || continue; printf '"%s", ' "${f%.json}"; done | sed 's/, $//')
         echo "  Captured API profile data" >&2
     else
         # Clone, Remote-Safe, Full: copy UCI config files
