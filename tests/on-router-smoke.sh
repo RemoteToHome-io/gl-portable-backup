@@ -8,6 +8,9 @@
 #
 # Usage: tests/on-router-smoke.sh <router-ip> [user]     (key-based SSH; scp -O, no sftp on GL)
 #
+# Writes a full log to tests/smoke-logs/smoke-<YYYYmmdd-HHMMSS>.log. That directory is git-ignored
+# and a log is never committed: it carries the target's hostname, archive names and fingerprints.
+#
 # What it touches on the router: nothing outside /tmp/gpb-smoke*, removed by the remote driver's
 # EXIT trap. Nothing is installed. `create` reads the live configuration — that is the point — but
 # every archive it writes lands in /tmp/gpb-smoke/. `restore` runs only against a synthetic source
@@ -30,9 +33,9 @@ SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 REMOTE="$USER_@$IP"
 D=/tmp/gpb-smoke
 
-LOGDIR="$HERE/build"
+LOGDIR="$HERE/tests/smoke-logs"
 mkdir -p "$LOGDIR" || exit 2
-LOG="$LOGDIR/smoke-$(date +%Y%m%d-%H%M).log"
+LOG="$LOGDIR/smoke-$(date +%Y%m%d-%H%M%S).log"
 
 TMP=$(mktemp -d) || exit 2
 trap 'rm -rf "$TMP"' EXIT INT TERM
@@ -56,6 +59,13 @@ judge() {
     if [ "$2" = 0 ]; then pass=$((pass + 1)); echo "OK: $1"; else fail=$((fail + 1)); echo "FAIL: $1"; fi
     if [ -n "${3:-}" ]; then printf '%s\n' "$3" | sed 's/^/    | /'; fi
     return 0
+}
+
+# tar -tzf into a file, keeping BOTH its exit status and its size. Every "must not contain" check
+# below is vacuously true against an empty or unreadable listing, so both are judged before use.
+listing() {   # archive listfile ; sets LIST_RC and LIST_N
+    tar -tzf "$1" > "$2" 2>"$2.err"; LIST_RC=$?
+    LIST_N=$(wc -l < "$2" 2>/dev/null); [ -n "$LIST_N" ] || LIST_N=0
 }
 
 mkdir -p "$D/tmp" "$D/out" "$D/x" "$D/fakebin" || exit 2
@@ -136,6 +146,21 @@ fp=$(dropbearkey -y -f "$D/k" 2>/dev/null | grep -i '^Fingerprint:')
 case "$fp" in "Fingerprint: SHA256:"*) r=0 ;; *) r=1 ;; esac
 judge 'applet: dropbearkey -y -f prints a SHA256 fingerprint (host-key warning)' "$r" "$fp"
 
+# The guard that makes the "must not contain" checks non-vacuous is itself checked in both
+# directions: an empty listing must fail the predicate, a populated clean one must pass it.
+: > "$D/empty.list"
+printf 'gl-portable-backup/manifest.json\ngl-portable-backup/config/network\n' > "$D/clean.list"
+vacuity_guard() {   # 0 only when the listing is usable AND carries no offending member
+    vn=$(wc -l < "$1" 2>/dev/null); [ -n "$vn" ] || vn=0
+    vm=$(grep -E '^gl-portable-backup/extra/(usr|lib|var)/' "$1")
+    [ "$vn" -gt 0 ] && [ -z "$vm" ]
+}
+vacuity_guard "$D/empty.list"; ve=$?
+vacuity_guard "$D/clean.list"; vc=$?
+[ "$ve" != 0 ] && [ "$vc" = 0 ]; r=$?
+judge 'vacuity guard: an empty listing fails the exclusion predicate, a populated clean one passes' "$r" \
+    "empty listing rc=$ve (expected non-zero)   populated clean listing rc=$vc (expected 0)"
+
 echo "== c. create --mode full on the live configuration =="
 arch=$(sh "$GPB" create --mode full --output "$D/out" 2>"$D/full.err"); r=$?
 arch=${arch:-$D/no-archive}
@@ -148,14 +173,18 @@ skp=$(sed -n 's/.*Skipped \([0-9][0-9]*\) firmware-owned, \([0-9][0-9]*\) identi
 judge 'create full: reports the captured and skipped counts' "$r" \
     "$(grep -F -e 'Captured' -e 'Skipped' "$D/full.err" | tr '\n' ';')"
 
-tar -tzf "$arch" > "$D/full.list" 2>"$D/full.list.err"
+listing "$arch" "$D/full.list"; full_n=$LIST_N
+[ "$LIST_RC" = 0 ] && [ "$full_n" -gt 0 ]; r=$?
+judge 'create full: the archive listing is readable and non-empty' "$r" \
+    "tar rc=$LIST_RC members=$full_n $(cat "$D/full.list.err")"
 grep -q -F -x 'gl-portable-backup/manifest.json' "$D/full.list" && grep -q -F -x 'gl-portable-backup/config/network' "$D/full.list"; r=$?
 judge 'create full: archive holds manifest.json and config/network' "$r" \
     "$(grep -F -x -e 'gl-portable-backup/manifest.json' -e 'gl-portable-backup/config/network' "$D/full.list" | tr '\n' ' ')$(cat "$D/full.list.err")"
 
 outside=$(grep -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/full.list" | head -n 5 | tr '\n' ' ')
-[ -z "$outside" ]; r=$?
-judge 'create full: nothing outside /etc (no extra/usr, extra/lib, extra/var)' "$r" "members: ${outside:-<none>}"
+[ "$full_n" -gt 0 ] && [ -z "$outside" ]; r=$?
+judge 'create full: nothing outside /etc (no extra/usr, extra/lib, extra/var)' "$r" \
+    "listing lines=$full_n   members: ${outside:-<none>}"
 
 sh "$GPB" inspect "$arch" > "$D/insp.json" 2>"$D/insp.err"; r=$?
 fv=$(jsonfilter -e '@.format_version' < "$D/insp.json" 2>/dev/null)
@@ -181,48 +210,60 @@ arch2="$D/out/full-include-plugins.tar.gz"
 sh "$GPB" create --mode full --include-plugins --output "$arch2" >"$D/plug.out" 2>"$D/plug.err"; r=$?
 [ "$r" = 0 ] && [ -f "$arch2" ]; r2=$?
 judge 'create --mode full --include-plugins' "$r2" "rc=$r $(grep -F -e 'Captured' -e 'Skipped' "$D/plug.err" | tr '\n' ';')"
-inc=$(tar -tzf "$arch2" 2>/dev/null | grep -c -E '^gl-portable-backup/extra/(usr|lib|var)/')
+listing "$arch2" "$D/plug.list"; plug_n=$LIST_N
+inc=$(grep -c -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/plug.list")
 noinc=$(grep -c -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/full.list")
 judge 'observation: members outside /etc, with and without --include-plugins' 0 \
-    "--include-plugins: $inc    default: $noinc    sample: $(tar -tzf "$arch2" 2>/dev/null | grep -E '^gl-portable-backup/extra/(usr|lib|var)/' | head -n 3 | tr '\n' ' ')"
+    "--include-plugins: $inc of $plug_n members (tar rc=$LIST_RC)    default: $noinc of $full_n    sample: $(grep -E '^gl-portable-backup/extra/(usr|lib|var)/' "$D/plug.list" | head -n 3 | tr '\n' ' ')"
 
 echo "== e. create --mode clone and --mode remote-safe =="
 cl=$(sh "$GPB" create --mode clone --output "$D/out" 2>"$D/clone.err"); r=$?
 cl=${cl:-$D/no-clone}
 [ "$r" = 0 ] && [ -f "$cl" ]; r2=$?
 judge 'create --mode clone' "$r2" "rc=$r archive=$cl"
-tar -tzf "$cl" > "$D/clone.list" 2>/dev/null
+listing "$cl" "$D/clone.list"; clone_n=$LIST_N
+[ "$LIST_RC" = 0 ] && [ "$clone_n" -gt 0 ]; r=$?
+judge 'create clone: the archive listing is readable and non-empty' "$r" \
+    "tar rc=$LIST_RC members=$clone_n $(cat "$D/clone.list.err")"
 sh "$GPB" inspect "$cl" > "$D/clone.insp" 2>/dev/null
 grep -q -F '"restores_ssh_host_keys": false' "$D/clone.insp" && grep -q -F '"restores_root_password": false' "$D/clone.insp"; r=$?
 judge 'inspect clone: both overwrite flags false' "$r" \
     "$(grep -F -e 'restores_ssh_host_keys' -e 'restores_root_password' "$D/clone.insp" | tr '\n' ' ')"
 leak=$(grep -E 'extra/etc/dropbear/dropbear_|extra/etc/shadow$' "$D/clone.list" | tr '\n' ' ')
-[ -z "$leak" ]; r=$?
-judge 'create clone: no SSH host keys and no /etc/shadow in the archive' "$r" "members: ${leak:-<none>}"
+[ "$clone_n" -gt 0 ] && [ -z "$leak" ]; r=$?
+judge 'create clone: no SSH host keys and no /etc/shadow in the archive' "$r" \
+    "listing lines=$clone_n   members: ${leak:-<none>}"
 
 rs=$(sh "$GPB" create --mode remote-safe --output "$D/out" 2>"$D/rs.err"); r=$?
 rs=${rs:-$D/no-rs}
 [ "$r" = 0 ] && [ -f "$rs" ]; r2=$?
 judge 'create --mode remote-safe' "$r2" "rc=$r archive=$rs"
-tar -tzf "$rs" > "$D/rs.list" 2>/dev/null
+listing "$rs" "$D/rs.list"; rs_n=$LIST_N
+[ "$LIST_RC" = 0 ] && [ "$rs_n" -gt 0 ]; r=$?
+judge 'create remote-safe: the archive listing is readable and non-empty' "$r" \
+    "tar rc=$LIST_RC members=$rs_n $(cat "$D/rs.list.err")"
 sh "$GPB" inspect "$rs" > "$D/rs.insp" 2>/dev/null
 grep -q -F '"restores_ssh_host_keys": false' "$D/rs.insp" && grep -q -F '"restores_root_password": false' "$D/rs.insp"; r=$?
 judge 'inspect remote-safe: both overwrite flags false' "$r" \
     "$(grep -F -e 'restores_ssh_host_keys' -e 'restores_root_password' "$D/rs.insp" | tr '\n' ' ')"
 leak=$(grep -E 'extra/etc/dropbear/dropbear_|extra/etc/shadow$' "$D/rs.list" | tr '\n' ' ')
-[ -z "$leak" ]; r=$?
-judge 'create remote-safe: no SSH host keys and no /etc/shadow in the archive' "$r" "members: ${leak:-<none>}"
+[ "$rs_n" -gt 0 ] && [ -z "$leak" ]; r=$?
+judge 'create remote-safe: no SSH host keys and no /etc/shadow in the archive' "$r" \
+    "listing lines=$rs_n   members: ${leak:-<none>}"
 leak=$(grep -E 'config/(zerotier|tailscale|gl-cloud)$' "$D/rs.list" | tr '\n' ' ')
-[ -z "$leak" ]; r=$?
+[ "$rs_n" -gt 0 ] && [ -z "$leak" ]; r=$?
 judge 'create remote-safe: zerotier, tailscale and gl-cloud configs excluded' "$r" \
-    "members: ${leak:-<none>}   (clone for contrast: $(grep -E 'config/(zerotier|tailscale|gl-cloud)$' "$D/clone.list" | tr '\n' ' '))"
+    "listing lines=$rs_n   members: ${leak:-<none>}   (clone for contrast: $(grep -E 'config/(zerotier|tailscale|gl-cloud)$' "$D/clone.list" | tr '\n' ' '))"
 
 echo "== f. create --mode profile (real local-API authentication) =="
 pr=$(sh "$GPB" create --mode profile --output "$D/out" 2>"$D/profile.err"); r=$?
 pr=${pr:-$D/no-profile}
 [ "$r" = 0 ] && [ -f "$pr" ]; r2=$?
 judge 'create --mode profile' "$r2" "rc=$r archive=$pr"
-tar -tzf "$pr" > "$D/profile.list" 2>/dev/null
+listing "$pr" "$D/profile.list"; profile_n=$LIST_N
+[ "$LIST_RC" = 0 ] && [ "$profile_n" -gt 0 ]; r=$?
+judge 'create profile: the archive listing is readable and non-empty' "$r" \
+    "tar rc=$LIST_RC members=$profile_n $(cat "$D/profile.list.err")"
 sh "$GPB" inspect "$pr" > "$D/profile.insp" 2>/dev/null
 fv=$(jsonfilter -e '@.format_version' < "$D/profile.insp" 2>/dev/null)
 [ "$fv" = 4 ]; r=$?
@@ -236,8 +277,27 @@ done
 judge 'create profile: the four required API captures are present' "$r" \
     "missing:${missing:- <none>}   captured: $apis"
 lanmem=$(grep -E '^gl-portable-backup/api/lan\.' "$D/profile.list" | tr '\n' ' ')
-[ -z "$lanmem" ]; r=$?
-judge 'create profile: no lan.* capture on this firmware (4.11 replaced lan with vlan_subnet)' "$r" "members: ${lanmem:-<none>}"
+[ "$profile_n" -gt 0 ] && [ -z "$lanmem" ]; r=$?
+judge 'create profile: no lan.* capture on this firmware (4.11 replaced lan with vlan_subnet)' "$r" \
+    "listing lines=$profile_n   members: ${lanmem:-<none>}"
+# The argument shape issue #1's B1 broke: gl_api WITH a params object. No capture call passes one,
+# so nothing above exercises it. system.get_info is a getter, so this stays read-only. The reply
+# body is never printed — it carries the hostname and MAC addresses.
+cat > "$D/api4.sh" <<'EOS'
+GPB_LIB_ONLY=1 . "$1" || exit 9
+sid=$(gl_auth) || exit 9
+reply=$(gl_api "$sid" system get_info '{}') || exit 8
+has_result=no; has_parse_error=no
+case "$reply" in *'"result"'*) has_result=yes ;; esac
+case "$reply" in *-32700*) has_parse_error=yes ;; esac
+echo "result=$has_result parse_error=$has_parse_error"
+[ "$has_result" = yes ] && [ "$has_parse_error" = no ]
+EOS
+a4=$(sh "$D/api4.sh" "$GPB" 2>"$D/api4.err"); r=$?
+a4err=""; [ "$r" = 0 ] || a4err="   stderr: $(head -c 160 "$D/api4.err")"
+judge 'gl_api with a params argument returns a result, not -32700 (issue #1 B1, the shape that broke)' "$r" \
+    "rc=$r  $a4$a4err"
+
 warns=$(grep -F 'WARNING:' "$D/profile.err" | sed 's/^ *//' | tr '\n' ';')
 judge 'observation: API calls this firmware refused' 0 "${warns:-<none>}"
 
@@ -253,13 +313,14 @@ judge 'auth failure: no archive created' "$r" "$(ls -d "$D/out2" 2>&1)"
 
 echo "== h. synthetic-root create and restore =="
 S="$D/src"
-mkdir -p "$S/etc/config/cellular" "$S/etc/dropbear" "$S/usr/lib/opkg" "$S/lib/upgrade/keep.d"
+mkdir -p "$S/etc/config/cellular" "$S/etc/config/gl_nas" "$S/etc/dropbear" "$S/usr/lib/opkg" "$S/lib/upgrade/keep.d"
 cp /etc/board.json "$S/etc/board.json"
 cp /etc/glversion "$S/etc/glversion"
 cp /etc/openwrt_release "$S/etc/openwrt_release"
 printf 'Package: gpb-smoke-pkg\nStatus: install user installed\n' > "$S/usr/lib/opkg/status"
 echo "config interface 'smoke'" > "$S/etc/config/network"
 echo '{"smoke":true}' > "$S/etc/config/cellular/x.json"
+echo 'smoke-not-a-certificate' > "$S/etc/config/gl_nas/y.pem"
 printf '/etc/dropbear/\n' > "$S/lib/upgrade/keep.d/dropbear"
 printf '/etc/shadow\n' > "$S/lib/upgrade/keep.d/base-files-essential"
 dropbearkey -t ed25519 -f "$S/etc/dropbear/dropbear_ed25519_host_key" >/dev/null 2>&1
@@ -273,10 +334,15 @@ sarch="$D/out3"
 GPB_ROOT="$S" sh "$GPB" create --mode full --output "$sarch" >"$D/syn.out" 2>"$D/syn.err"; r=$?
 [ "$r" = 0 ] && [ -f "$sarch" ]; r2=$?
 judge 'synthetic: create --mode full with GPB_ROOT' "$r2" "rc=$r $(grep -F -e 'Captured' -e 'Skipped' "$D/syn.err" | tr '\n' ';')"
-tar -tzf "$sarch" > "$D/syn.list" 2>/dev/null
-grep -q -F 'gl-portable-backup/config/cellular/x.json' "$D/syn.list" && grep -q -F 'gl-portable-backup/extra/etc/dropbear/authorized_keys' "$D/syn.list"; r=$?
-judge 'synthetic: the config directory and the keep.d files are in the archive' "$r" \
-    "$(grep -E 'cellular|dropbear|shadow' "$D/syn.list" | tr '\n' ' ')"
+listing "$sarch" "$D/syn.list"; syn_n=$LIST_N
+[ "$LIST_RC" = 0 ] && [ "$syn_n" -gt 0 ]; r=$?
+judge 'synthetic: the archive listing is readable and non-empty' "$r" \
+    "tar rc=$LIST_RC members=$syn_n $(cat "$D/syn.list.err")"
+grep -q -F 'gl-portable-backup/config/cellular/x.json' "$D/syn.list" \
+    && grep -q -F 'gl-portable-backup/config/gl_nas/y.pem' "$D/syn.list" \
+    && grep -q -F 'gl-portable-backup/extra/etc/dropbear/authorized_keys' "$D/syn.list"; r=$?
+judge 'synthetic: both config directories and the keep.d files are in the archive' "$r" \
+    "$(grep -E 'cellular|gl_nas|dropbear|shadow' "$D/syn.list" | tr '\n' ' ')"
 
 srcfp=$(dropbearkey -y -f "$S/etc/dropbear/dropbear_ed25519_host_key" 2>/dev/null | grep -i '^Fingerprint:')
 arcfp=$(sh "$GPB" fingerprint "$sarch" 2>"$D/sfp.err")
@@ -302,7 +368,7 @@ judge 'synthetic: --keep-host-keys left the target host key alone' "$r" \
     "target md5 before=$tgt_md5_before after=$tgt_md5_after source=$srckey_md5"
 [ "$(cat "$G/etc/dropbear/authorized_keys" 2>/dev/null)" = 'ssh-ed25519 AAAAsmokeauthorizedkey smoke' ]; r=$?
 judge 'synthetic: authorized_keys restored even with --keep-host-keys' "$r" "$(cat "$G/etc/dropbear/authorized_keys" 2>&1)"
-[ -f "$G/etc/config/cellular/x.json" ]; r=$?
+[ -f "$G/etc/config/cellular/x.json" ] && [ -f "$G/etc/config/gl_nas/y.pem" ]; r=$?
 judge 'synthetic: /etc/config directories restored (B3: cellular/, gl_nas/)' "$r" \
     "$(find "$G/etc/config" | sed "s|$G|TGT|" | sort | tr '\n' ' ')"
 
@@ -315,7 +381,7 @@ last2=$(printf '%s\n' "$out2" | tail -n 1)
 [ "$r" = 0 ] && [ "$last2" = "RESTORE_OK" ]; r2=$?
 judge 'synthetic: plain restore exits 0 with RESTORE_OK' "$r2" "rc=$r last stdout line: $last2"
 grep -q -F "WARNING: this archive restores the source's SSH host keys" "$D/r2.err" \
-    && grep -q -F "$srcfp_val" "$D/r2.err" \
+    && [ -n "$srcfp_val" ] && grep -q -F "$srcfp_val" "$D/r2.err" \
     && grep -q -F 'WARNING: this archive restores /etc/shadow' "$D/r2.err"; r=$?
 judge 'synthetic: plain restore warns about the host keys (with the fingerprint) and /etc/shadow' "$r" \
     "$(grep -F 'WARNING' "$D/r2.err" | tr '\n' ';')"

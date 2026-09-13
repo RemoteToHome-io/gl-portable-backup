@@ -13,3 +13,6 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# On-router smoke-test logs (target hostname, archive names, fingerprints)
+/tests/smoke-logs/
