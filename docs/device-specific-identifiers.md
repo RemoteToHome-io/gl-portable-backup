@@ -93,7 +93,7 @@ These are read-only API responses — the API does not set MACs.
 - It is NOT captured in `sysupgrade -b` backups.
 - **Clone/Remote-Safe:** nothing to strip from `/etc/config/` — the serial number was never
   there. **Profile:** captured — the stored `system.get_info` reply includes `sn`, `sn_bak`, and
-  the base `mac`.
+  the WAN `mac` (see §1.4).
 
 ---
 
@@ -455,7 +455,7 @@ nothing else in this table is in our archives at all:
 | ZeroTier node identity (files) | `/var/lib/zerotier-one/identity.*` | Auto-generated if missing |
 
 Serial number is not in `/etc/config/` either, but it is left out of this table because Profile
-mode does capture it, via the stored `system.get_info` reply (`sn`, `sn_bak`, plus the base
+mode does capture it, via the stored `system.get_info` reply (`sn`, `sn_bak`, plus the WAN
 `mac`) — see §2.
 
 ### Captured, But Only in Some Modes

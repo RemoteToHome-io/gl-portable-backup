@@ -19,7 +19,7 @@ GL Portable Backup's portable modes (Clone and Remote-Safe) strip that material 
 | **Full** | Same device only | Disaster recovery — complete raw backup of one specific device | Capture and restore tested on hardware |
 | **Clone** | Same model | Fleet deployment — golden-image one router, deploy to N others | Capture tested; restore not yet live-run |
 | **Remote-Safe** | Same model | Remote restore without losing the ZeroTier/GoodCloud/Tailscale/SSH tunnel | Capture tested; restore not yet live-run, and does not yet preserve the target's ZT/TS `network`/`firewall` sections |
-| **Profile** | Any model | Move one user's complete setup — Wi-Fi, LAN, DNS, firewall, VPN client tunnels with their keys — to a different model | Capture tested; restore limited (see below) |
+| **Profile** | Any model | Move one user's complete portable setup — Wi-Fi, LAN, DNS, firewall, VPN client tunnels with their keys — to a different model | Capture tested; restore limited (see below) |
 
 ### Full
 
@@ -44,14 +44,14 @@ Same as Clone, but additionally excludes remote access configurations so you don
 Uses the GL.iNet JSON-RPC API instead of raw UCI files. One JSON file is written per API call (`api/<module>.<method>.json`); a module the firmware doesn't ship is skipped, and a JSON-RPC error reply is logged as a warning rather than stored. On firmware 4.11+, where the `lan` RPC module was replaced by `vlan_subnet`, LAN subnets and DHCP static bindings are captured via `vlan_subnet.get_subnets` / `vlan_subnet.get_static_bind_list`; on earlier firmware, via `lan.get_config_list` / `lan.get_static_bind_list`. Also captured when the firmware ships the module: Wi-Fi, DNS (config + hosts), firewall (rules, port forwards, WAN access), timezone, system info, LED, IPv6, per-port MAC mode, Tailscale, ZeroTier, every VPN client tunnel with its keys and credentials plus the active tunnel name, saved repeater access points (with their passwords), timers, switch-button config, and network mode. Capture makes no model-specific assumptions — the same RPC calls run regardless of router model, gated only by whether the firmware ships each module.
 
 **What a Profile archive contains, and what it does not.** A Profile archive is one user's
-complete portable setup, and that includes the secrets: the Wi-Fi password of every SSID, every
-VPN client tunnel's private key, pre-shared key, and OpenVPN credentials, and the saved passwords
-of access points this router has joined — all in cleartext. Handle it exactly like a Full backup:
-it is a secret, not a settings file. It does **not** contain this device's identity — no
-GoodCloud binding (`cloud.get_config` is deliberately not captured), no SSH host keys, no
-`authorized_keys`, and no root password. It does still carry `hardware.json` (the source
-device's MAC addresses and DDNS identity, kept for reference) and the `system.get_info` reply,
-which includes the serial number and the base MAC.
+complete portable setup, and that includes the secrets: the Wi-Fi password of every SSID,
+every VPN client tunnel's private key, pre-shared key, and OpenVPN credentials, and the saved
+passwords of access points this router has joined — all in cleartext. Handle it exactly like a
+Full backup: it is a secret, not a settings file. It leaves out the identity a different device
+must not inherit: no GoodCloud binding (`cloud.get_config` is deliberately not captured), no
+SSH host keys, no `authorized_keys`, and no root password. Two device-specific items are still
+present, for reference: `hardware.json` (the source's MAC addresses and DDNS identity) and the
+`system.get_info` reply (serial number and WAN MAC).
 
 **Restore is currently limited** to timezone, DNS mode/force_dns, DNS hosts, LED on/off, and DHCP static bindings — and the static-binding restore only runs on firmware that still exposes the `lan` API (on 4.11+ it prints a skip notice, since the equivalent `vlan_subnet` write hasn't been implemented yet). Wi-Fi and LAN restore are placeholders that print a message and make no changes. Full cross-model restore (Profile restore v2) is planned, not yet shipped.
 
