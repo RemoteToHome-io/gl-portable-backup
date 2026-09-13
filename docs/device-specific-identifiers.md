@@ -42,7 +42,7 @@ to a different device overwrites the target's MACs — breaking networking.
 | `/etc/config/wireless` | `wireless.wifi5g.macaddr` | 5 GHz main interface | `8A:53:8C:A0:3C:92` |
 | `/etc/config/wireless` | `wireless.guest2g.macaddr` | 2.4 GHz guest interface | `16:8D:F3:BB:4E:B1` |
 | `/etc/config/wireless` | `wireless.guest5g.macaddr` | 5 GHz guest interface | `22:3E:88:27:53:9D` |
-| `/etc/config/wireless` | `wireless.<iface>.factory_macaddr` | Hardware radio MAC, firmware 4.9+ | (vendor-assigned) |
+| `/etc/config/wireless` | `wireless.<iface>.factory_macaddr` | Hardware MAC, firmware 4.9+ | (vendor-assigned) |
 
 **Notes:**
 - Wi-Fi MACs are **locally-administered** (LAA bit set) — generated per-device
@@ -50,11 +50,11 @@ to a different device overwrites the target's MACs — breaking networking.
 - These are NOT in `board.json`. They are only in `/etc/config/wireless`.
 - Number of interfaces varies by model (some have 6G, some have only 2G+5G).
 - On restore, the target device's existing Wi-Fi MACs must be preserved.
-- `factory_macaddr` (firmware 4.9+) is the radio's hardware-burned MAC, distinct from the
+- `factory_macaddr` (firmware 4.9+) is the radio's hardware MAC, distinct from the
   locally-administered `macaddr` above. It is stripped in Clone and Remote-Safe alongside
   `macaddr`.
 
-### 1.3 Repeater and Per-Port Hardware MACs (firmware 4.9+/4.11)
+### 1.3 Repeater (observed on firmware 4.9+) and Per-Port Hardware MACs (firmware 4.11)
 
 | Location | UCI Path | Description |
 |----------|----------|-------------|
@@ -64,6 +64,8 @@ to a different device overwrites the target's MACs — breaking networking.
 
 **Notes:**
 - Both files are stripped in Clone and Remote-Safe mode, the same as the MAC fields in §1.1–1.2.
+- Repeater `macaddr` fields were observed on firmware 4.9+; earlier firmware was not checked for
+  this file.
 - `eth_ports_config_map` is new in firmware 4.11 (per-port MAC-mode mapping); it does not exist
   on 4.9 or earlier.
 
@@ -247,9 +249,9 @@ first start. These form a PKI identity unique to the device.
 - The node identity (cryptographic keypair) lives in `/var/lib/zerotier-one/` — NOT in
   `/etc/config/`, and not captured by our backup. On firmware 4.9 and later, GL.iNet also mirrors
   the node's private key into UCI as `zerotier.gl.secret`; this copy IS in `/etc/config/zerotier`
-  and IS captured whenever that file is (Full and Clone). It's why a **Full** restore brings the
-  source's ZT node ID back rather than leaving the target with a fresh identity — the UCI copy
-  reaches the daemon the same as the `/var/lib` files would.
+  and IS captured whenever that file is (Full and Clone). Observed outcome: after a **Full**
+  restore onto a clean flash, the node came back with its previous node ID rather than a fresh
+  one.
 - The ZT node identity determines the device's ZT address (10-digit hex).
   Changing it means the device appears as a new node on the network.
 - **Excluded entirely in Remote-Safe mode** — both the UCI config file (so `zerotier.gl.secret`
@@ -387,7 +389,7 @@ network.wan.macaddr  = "94:83:c4:6b:0d:80"
 
 | Location | Description |
 |----------|-------------|
-| `/etc/config/cellular/slot_map.json` | Per-slot modem/SIM state; one file inside the 4.9+ cellular subsystem's config directory, shipped on all hardware, cellular or not |
+| `/etc/config/cellular/slot_map.json` | Per-slot modem/SIM state; one file inside the 4.9+ cellular subsystem's config directory, present on non-cellular models too (verified on a GL-MT3000) |
 
 **Notes:**
 - On firmware 4.9 and later, `/etc/config/cellular` is a directory of JSON state files (not a

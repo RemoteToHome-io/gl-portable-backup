@@ -1,6 +1,6 @@
 # GL Portable Backup
 
-**v1.1:** Full, Clone, and Remote-Safe modes are production-ready. Profile capture works across firmware 4.8 through 4.11. Profile *restore* is currently limited to timezone, DNS mode, DNS hosts, LED on/off, and DHCP static bindings (the last only on firmware that still has the `lan` API) — Wi-Fi and LAN restore are not yet implemented. If you need full cross-model transfer today, see [zippyy/GL.iNet-CrossModel-BackupRestoreUtility](https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility) until Profile restore v2 lands.
+**v1.1:** Full, Clone, and Remote-Safe modes are production-ready. Profile capture follows the firmware's RPC module map (`lan` on 4.8/4.9, `vlan_subnet` on 4.11+). Profile *restore* is currently limited to timezone, DNS mode, DNS hosts, LED on/off, and DHCP static bindings (the last only on firmware that still has the `lan` API) — Wi-Fi and LAN restore are not yet implemented. If you need full cross-model transfer today, see [zippyy/GL.iNet-CrossModel-BackupRestoreUtility](https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility) until Profile restore v2 lands.
 
 Portable configuration backup and restore for GL.iNet routers. Creates backups with four modes tailored to different deployment scenarios — from fleet cloning to cross-model profile transfer.
 
@@ -38,7 +38,7 @@ Same as Clone, but additionally excludes remote access configurations so you don
 
 ### Profile
 
-Uses the GL.iNet JSON-RPC API instead of raw UCI files. One JSON file is written per API call (`api/<module>.<method>.json`); a module the firmware doesn't ship is skipped, and a JSON-RPC error reply is logged as a warning rather than stored. On firmware 4.11+, where the `lan` RPC module was replaced by `vlan_subnet`, LAN subnets and DHCP static bindings are captured via `vlan_subnet.get_subnets` / `vlan_subnet.get_static_bind_list`; on earlier firmware, via `lan.get_config_list` / `lan.get_static_bind_list`. Also captured when the firmware ships the module: Wi-Fi, DNS (config + hosts), firewall (rules, port forwards, WAN access), timezone, system info, LED, IPv6, per-port MAC mode, GoodCloud, Tailscale, ZeroTier, VPN client tunnels, timers, switch-button config, saved repeater APs, and network mode. No model restriction on capture — works across any GL.iNet 4.x router.
+Uses the GL.iNet JSON-RPC API instead of raw UCI files. One JSON file is written per API call (`api/<module>.<method>.json`); a module the firmware doesn't ship is skipped, and a JSON-RPC error reply is logged as a warning rather than stored. On firmware 4.11+, where the `lan` RPC module was replaced by `vlan_subnet`, LAN subnets and DHCP static bindings are captured via `vlan_subnet.get_subnets` / `vlan_subnet.get_static_bind_list`; on earlier firmware, via `lan.get_config_list` / `lan.get_static_bind_list`. Also captured when the firmware ships the module: Wi-Fi, DNS (config + hosts), firewall (rules, port forwards, WAN access), timezone, system info, LED, IPv6, per-port MAC mode, GoodCloud, Tailscale, ZeroTier, VPN client tunnels, timers, switch-button config, saved repeater APs, and network mode. Capture makes no model-specific assumptions — the same RPC calls run regardless of router model, gated only by whether the firmware ships each module.
 
 **Restore is currently limited** to timezone, DNS mode/force_dns, DNS hosts, LED on/off, and DHCP static bindings — and the static-binding restore only runs on firmware that still exposes the `lan` API (on 4.11+ it prints a skip notice, since the equivalent `vlan_subnet` write hasn't been implemented yet). Wi-Fi and LAN restore are placeholders that print a message and make no changes. Full cross-model restore (Profile restore v2) is planned, not yet shipped.
 
@@ -222,11 +222,11 @@ Output: `build/out/luci-app-gl-portable-backup_<version>_all.ipk`. This is also 
 ./tests/run.sh
 ```
 
-`tests/on-router-smoke.sh <router-ip>` re-runs the target-sensitive checks against a real GL router from `/tmp`, without installing anything.
+`tests/on-router-smoke.sh <router-ip>` (shipped with 1.1.0) re-runs the target-sensitive checks against a real GL router from `/tmp`, without installing anything.
 
 ## Compatibility
 
-- **Firmware**: GL.iNet 4.x. Full backup/restore, including factory reset, tested on GL-MT3000 at firmware 4.8.2, 4.9.0-beta4, and 4.11.0-beta1. Profile capture (API inventory) also checked on GL-MT5000 4.8.4 and GL-AXT1800 4.8.2. Not tested on other models or firmware versions.
+- **Firmware**: GL.iNet 4.x. Full backup and restore after a factory reset were tested on a GL-MT3000 at firmware 4.8.2; a Full archive from 4.9.0-beta4 was restored onto the same unit after a clean flash of 4.11.0-beta1 (see Restoring Across Firmware Versions). API module inventories were checked on GL-MT5000 4.8.4 and GL-AXT1800 4.8.2. Not tested on other models or firmware versions.
 - **Models**: Architecture-independent package — installs on any GL.iNet router. Actual behavior is verified only on the models above; Clone, Remote-Safe, and Full restores are hard-blocked to the same model regardless.
 - **Dependencies**: None beyond stock GL.iNet firmware (`jsonfilter`, `uci`, `curl`, `awk`, `tar`, `dropbearkey` for host-key fingerprints)
 - **Package install**: Uses `/usr/libexec/opkg-call` from `luci-app-opkg` (present on all GL.iNet firmware)
