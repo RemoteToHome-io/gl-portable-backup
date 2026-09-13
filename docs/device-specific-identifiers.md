@@ -256,10 +256,13 @@ first start. These form a PKI identity unique to the device.
   Changing it means the device appears as a new node on the network.
 - **Excluded entirely in Remote-Safe mode** — both the UCI config file (so `zerotier.gl.secret`
   too) and the associated network/firewall interface sections.
-- In Clone mode, the ZT config file IS captured, including `zerotier.gl.secret` on firmware 4.9+
-  — so a Clone restore carries the source's node identity onto the target rather than leaving it
-  with a fresh one. This is the same same-device-only caution as the SSH host keys (§6) and
-  OpenVPN PKI (§5) above: two devices sharing one ZT node identity will conflict on the network.
+- In Clone mode the ZT config file IS captured, but `option secret` is stripped from it, so the
+  archive carries the network join ID (the deployment setting being cloned) and not the node
+  identity. GL regenerates an identity when the field is absent. Without that strip two devices
+  restored from one archive would share a single ZT node identity and conflict on the network —
+  the same same-device-only caution as the SSH host keys (§6) and OpenVPN PKI (§5) above.
+- A **Full** archive keeps `zerotier.gl.secret` verbatim. That is the point of Full mode: after a
+  clean flash the same unit comes back with its previous node ID rather than a fresh one.
 
 ---
 
@@ -274,9 +277,11 @@ first start. These form a PKI identity unique to the device.
 - Tailscale node identity is stored in `/etc/tailscale/`, not in UCI config.
 - The UCI config controls whether Tailscale is enabled and basic settings.
 - Overwriting the UCI config can disrupt the Tailscale connection.
-- **Excluded entirely in Remote-Safe mode.**
-- In Clone mode, the UCI config IS captured. On restore, Tailscale will need
-  to be re-authenticated on the target device.
+- **Excluded entirely in Remote-Safe mode** — the UCI config file and `/etc/tailscale/`.
+- In Clone mode the UCI config IS captured, but `/etc/tailscale/` is NOT: the node's private key
+  and state stay on the source unit. On restore, Tailscale needs to be re-authenticated on the
+  target device.
+- Only a **Full** archive carries `/etc/tailscale/`, for same-device recovery.
 
 ---
 
@@ -418,6 +423,8 @@ network.wan.macaddr  = "94:83:c4:6b:0d:80"
 | DDNS identity | `gl_ddns` | username, password, domain, param_enc, lookup_host (v4+v6) |
 | WG server keys | `wireguard_server` | private_key, public_key, preshared_key |
 | WG/AWG client keys | `network` | private_key, public_key, preshared_key |
+| ZT node identity | `zerotier` | `option secret` (firmware 4.9+); the `join` network ID is kept |
+| WebDAV TLS key | `gl_nas/ssl_webdav.pem` | Whole file dropped from `config/` |
 
 ### Remote-Safe Mode (additional exclusions)
 
@@ -454,14 +461,17 @@ via the `extra/` keep.d mechanism, in the modes marked below:
 | SSH host keys | `/etc/dropbear/dropbear_*_host_key` | yes | no (stripped) | no (stripped) |
 | Root password hash | `/etc/shadow` | yes | no | no |
 | OpenVPN PKI (CA, certs, keys) | `/etc/openvpn/` | yes | yes | yes |
-| Tailscale node state | `/etc/tailscale/` | yes | yes | no (excluded) |
+| Tailscale node state | `/etc/tailscale/` | yes | no (excluded) | no (excluded) |
+| uhttpd / nginx TLS keys | `/etc/uhttpd.key`, `/etc/nginx/nginx.key` | yes | no (excluded) | no (excluded) |
+| `authorized_keys` | `/etc/dropbear/authorized_keys` | yes | yes | no (excluded) |
 
 A "yes" here is a caution, not just a feature: SSH host keys, the root password, and OpenVPN PKI
 are same-device identity (see §§5, 6, and 12 above). Restoring a Full archive onto anything but the exact
 source device, or a Clone/Remote-Safe archive's OpenVPN PKI onto a different physical unit, hands
 that unit the source's identity rather than fresh material of its own. The ZeroTier node secret
 mirrored into UCI on firmware 4.9+ (`zerotier.gl.secret`, §7) is the same caution again, but it
-travels with `/etc/config/zerotier` rather than through `extra/`.
+travels with `/etc/config/zerotier` rather than through `extra/` — so it is stripped from that file
+in Clone and Remote-Safe rather than excluded as a whole path.
 
 ---
 

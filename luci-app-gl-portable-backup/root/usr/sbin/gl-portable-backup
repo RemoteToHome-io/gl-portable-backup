@@ -302,12 +302,16 @@ capture_extra_files() {
             esac
         fi
 
-        # Clone + Remote-Safe: exclude device-generated TLS/SSH keys
+        # Clone + Remote-Safe: exclude device-generated TLS/SSH keys and per-device node identity.
+        # /etc/tailscale/ holds tailscaled.state, i.e. this unit's Tailscale node private key —
+        # same-device identity, like the host keys beside it, so the target re-authenticates
+        # instead of inheriting the source's node.
         if [ "$mode" = "clone" ] || [ "$mode" = "remote-safe" ]; then
             case "$filepath" in
                 /etc/dropbear/dropbear_*_host_key) continue ;;
                 /etc/uhttpd.crt|/etc/uhttpd.key) continue ;;
                 /etc/nginx/nginx.cer|/etc/nginx/nginx.key) continue ;;
+                /etc/tailscale/*) continue ;;
             esac
         fi
 
@@ -315,7 +319,6 @@ capture_extra_files() {
         if [ "$mode" = "remote-safe" ]; then
             case "$filepath" in
                 /etc/dropbear/authorized_keys) continue ;;
-                /etc/tailscale/*) continue ;;
             esac
         fi
 
@@ -422,6 +425,12 @@ sanitize_configs() {
         sed -i "/option public_key/d" "$confdir/network"
         sed -i "/option preshared_key/d" "$confdir/network"
     fi
+
+    # Strip the ZeroTier node identity. Firmware 4.9+ mirrors the node's private key into UCI as
+    # zerotier.gl.secret; two units restored from one archive would otherwise share one ZT node
+    # identity and collide on the network. The join ID stays — which network to join is the
+    # deployment setting being cloned, and GL generates a fresh identity when the field is absent.
+    [ -f "$confdir/zerotier" ] && sed -i "/option secret/d" "$confdir/zerotier"
 
     # Strip OpenVPN client credentials
     if [ -f "$confdir/ovpnclient" ]; then
@@ -793,6 +802,10 @@ cmd_create() {
         if [ "$mode" = "clone" ] || [ "$mode" = "remote-safe" ]; then
             # Strip hardware-specific fields
             sanitize_configs "$archdir/config"
+            # /etc/config/gl_nas is a directory on 4.9+; ssl_webdav.pem in it is this unit's
+            # WebDAV TLS private key — device-generated material, same treatment as the uhttpd
+            # and nginx keys dropped from extra/ above.
+            rm -f "$archdir/config/gl_nas/ssl_webdav.pem"
             echo "  Stripped hardware-specific fields" >&2
         fi
 

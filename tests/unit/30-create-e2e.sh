@@ -5,7 +5,8 @@ load_backend
 not_contains() { case "$1" in *"$2"*) echo "  not_contains FAILED (${3:-}): [$2] is present"; exit 1;; esac; }
 
 R="$T/root"
-mkdir -p "$R/etc/config" "$R/etc/userconf" "$R/etc/netifyd" "$R/etc/gl_crontabs/crontabs.d" \
+mkdir -p "$R/etc/config" "$R/etc/config/gl_nas" "$R/etc/userconf" "$R/etc/netifyd" \
+         "$R/etc/gl_crontabs/crontabs.d" "$R/etc/tailscale" \
          "$R/rom/etc/gl_crontabs/crontabs.d" "$R/usr/bin" "$R/usr/lib/opkg" "$R/lib/upgrade/keep.d"
 cat > "$R/etc/board.json" <<'JSON'
 {"model":{"id":"glinet,mt3000-snand","name":"Test Router"},
@@ -19,7 +20,9 @@ echo "config interface 'lan'" > "$R/etc/config/network"
 echo "config interface 'lan'" > "$R/etc/config/network-opkg"   # opkg conffile backup, not user config
 echo 'system.@system[0].hostname=TESTHOST' >> "$MOCK_UCI_FILE"
 printf '/etc/userconf/\n/usr/bin/plugin-bin\n' > "$R/lib/upgrade/keep.d/fixture"
-printf '/etc/netifyd/\n/etc/gl_crontabs/crontabs.d/\n' >> "$R/lib/upgrade/keep.d/fixture"
+printf '/etc/netifyd/\n/etc/gl_crontabs/crontabs.d/\n/etc/tailscale/\n' >> "$R/lib/upgrade/keep.d/fixture"
+echo tsnodekey > "$R/etc/tailscale/tailscaled.state"              # node identity  -> full only
+echo webdavkey > "$R/etc/config/gl_nas/ssl_webdav.pem"            # TLS key        -> full only
 echo conf > "$R/etc/userconf/a.conf"                              # user config      -> captured
 echo bin  > "$R/usr/bin/plugin-bin"                               # plugin binary    -> skipped
 echo uuid > "$R/etc/netifyd/agent.uuid"                           # firmware-owned   -> skipped
@@ -46,9 +49,11 @@ not_contains "$listing" "plugin-bin" "plugin binary excluded"
 not_contains "$listing" "agent.uuid" "firmware-owned excluded"
 not_contains "$listing" "auto_timezone" "rom-identical excluded"
 not_contains "$listing" "network-opkg" "opkg conffile backup excluded"
+assert_contains "$listing" "gl-portable-backup/extra/etc/tailscale/tailscaled.state" "full keeps Tailscale state"
+assert_contains "$listing" "gl-portable-backup/config/gl_nas/ssl_webdav.pem" "full keeps the WebDAV TLS key"
 
 err=$(cat "$T/err")
-assert_contains "$err" "Captured 2 extra persistent files" "captured count"
+assert_contains "$err" "Captured 3 extra persistent files" "captured count"
 assert_contains "$err" "Skipped 2 firmware-owned, 1 identical to /rom" "skipped counts"
 mkdir -p "$T/x"; tar -xzf "$archive" -C "$T/x" gl-portable-backup/backup-info.txt
 assert_contains "$(cat "$T/x/gl-portable-backup/backup-info.txt")" \
@@ -60,4 +65,15 @@ archive2=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode full --output "$T/o
 assert_eq "$rc" 0 "cmd_create exit code (--include-plugins)"
 assert_contains "$(tar -tzf "$archive2")" "gl-portable-backup/extra/usr/bin/plugin-bin" "plugin binary included"
 assert_contains "$(cat "$T/err2")" "Skipped 1 firmware-owned" "skipped count (--include-plugins)"
+
+# Clone is the fleet mode: the archive goes onto N other units, so per-device secret identity must
+# not ride along. Same fixture tree as the Full archive above, which keeps both.
+mkdir -p "$T/out3"
+archive3=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode clone --output "$T/out3" 2>"$T/err3"); rc=$?
+assert_eq "$rc" 0 "cmd_create exit code (clone)"
+listing3=$(tar -tzf "$archive3")
+not_contains "$listing3" "extra/etc/tailscale/" "clone excludes Tailscale node state"
+not_contains "$listing3" "config/gl_nas/ssl_webdav.pem" "clone excludes the WebDAV TLS key"
+assert_contains "$listing3" "gl-portable-backup/extra/etc/userconf/a.conf" "clone still captures user config"
+assert_contains "$(cat "$T/err3")" "Captured 2 extra persistent files" "captured count (clone)"
 echo "ok 30-create-e2e"

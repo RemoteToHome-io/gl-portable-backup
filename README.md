@@ -8,9 +8,9 @@ Built as a LuCI plugin that installs on any GL.iNet router running firmware 4.x.
 
 ## Why Not Stock Backup?
 
-The built-in OpenWrt backup (`sysupgrade -b`) does a raw overlay dump. Restoring it to a different device of the same model overwrites hardware-specific values — MAC addresses, DDNS device identity, WireGuard keys, ZeroTier/Tailscale node IDs — making the target device unreachable or misconfigured.
+The built-in OpenWrt backup (`sysupgrade -b`) does a raw overlay dump. Restoring it to a different device of the same model carries the source's device-specific material across — MAC addresses, DDNS device identity, WireGuard keys, the ZeroTier node secret, Tailscale node state — leaving the target unreachable, misconfigured, or fighting the source over one identity.
 
-GL Portable Backup solves this by stripping hardware identifiers from portable backups and re-injecting the target device's own identity on restore.
+GL Portable Backup's portable modes (Clone and Remote-Safe) strip that material and re-inject the target device's own identity on restore. The exact list is in "Hardware Fields Stripped" below. **Full** mode deliberately keeps all of it — it is same-device disaster recovery, not a portable archive.
 
 ## Four Backup Modes
 
@@ -27,7 +27,7 @@ Raw backup of everything, including hardware identifiers and all key material. C
 
 ### Clone
 
-Captures all UCI config files plus non-UCI persistent files. Strips MAC addresses, DDNS device identity, WireGuard/AmneziaWG keys, and OpenVPN credentials. On restore, the target device's own hardware IDs are re-injected from `board.json`. Includes user-installed package list for post-restore review.
+Captures all UCI config files plus non-UCI persistent files. Strips MAC addresses, DDNS device identity, WireGuard/AmneziaWG keys, OpenVPN credentials, and the ZeroTier node secret; and leaves out the device-generated key material entirely — SSH host keys, the uhttpd and nginx TLS keys, the WebDAV TLS key, and the Tailscale node state under `/etc/tailscale/` (the target re-authenticates to Tailscale rather than inheriting the source's node). On restore, the target device's own hardware IDs are re-injected from `board.json`. Includes user-installed package list for post-restore review.
 
 ### Remote-Safe
 
@@ -137,6 +137,16 @@ In Clone and Remote-Safe modes, these device-specific fields are removed:
 | `wireguard_server` | `private_key`, `public_key`, `preshared_key` (server + all peers) |
 | `wireguard` | `private_key`, `public_key`, `preshared_key` (WG client peers) |
 | `ovpnclient` | `username`, `password` (OVPN client credentials) |
+| `zerotier` | `option secret` (the ZT node private identity, mirrored into UCI on firmware 4.9+; the `join` network ID is kept) |
+
+Files left out of Clone and Remote-Safe archives entirely, rather than stripped field by field:
+
+| Path | Why |
+|------|-----|
+| `/etc/dropbear/dropbear_*_host_key` | SSH host identity — the target keeps its own |
+| `/etc/uhttpd.crt`, `/etc/uhttpd.key`, `/etc/nginx/nginx.cer`, `/etc/nginx/nginx.key` | device-generated TLS keys |
+| `/etc/config/gl_nas/ssl_webdav.pem` | device-generated WebDAV TLS key |
+| `/etc/tailscale/` | Tailscale node private key and state — the target re-authenticates |
 
 On restore, the target device's MACs are read from `board.json` (factory-set, read-only) and re-injected via UCI.
 
