@@ -1737,6 +1737,91 @@ cmd_update_check() {
         "$(json_escape "$UPD_RELEASE_URL")" "$(json_escape "$msg")"
 }
 
+upd_set_status() {   # status message
+    printf '{"status":"%s","message":"%s"}\n' "$1" "$(json_escape "$2")" > "$UPD_STATUS"
+}
+
+# Guaranteed terminal state: a worker that dies mid-step (set -e, a killed curl) would otherwise leave
+# "running" behind and the dialog would spin forever. The working directory goes; the status file stays
+# for the UI to read.
+upd_cleanup() {
+    if grep -q '"status":"running"' "$UPD_STATUS" 2>/dev/null; then
+        upd_set_status error "Interrupted during: ${UPD_STEP:-start} — check the network and retry"
+    fi
+    rm -rf "$UPD_DIR"
+}
+
+cmd_update_start() {
+    local fetch_only=""
+    [ "${1:-}" = "--fetch-only" ] && fetch_only="--fetch-only"
+    # Probe the lock without keeping it: the worker's own flock is the authority, this only reports.
+    if ! ( exec 9>>"$UPD_LOCK"; flock -n 9 ) 2>/dev/null; then
+        echo '{"status":"error","message":"An update is already running"}'; return 0
+    fi
+    mkdir -p "$UPD_DIR" 2>/dev/null || { echo '{"status":"error","message":"Cannot create the working directory"}'; return 0; }
+    cp "$0" "$UPD_DIR/worker.sh" 2>/dev/null || { echo '{"status":"error","message":"Cannot stage the update worker"}'; return 0; }
+    upd_set_status running "Starting..."
+    # Detached: GL's BusyBox has no nohup or setsid; an orphaned subshell with its stdio closed outlives
+    # the rpcd exec call that started it (verified on 4.11). The copy, not this file, does the work.
+    ( GPB_LIB_ONLY= GPB_UPDATE_DIR="$UPD_DIR" GPB_UPDATE_API_URL="$UPD_API_URL" GPB_UPDATE_BASE_URL="$UPD_BASE_URL" \
+      sh "$UPD_DIR/worker.sh" update-install $fetch_only </dev/null >"$UPD_DIR/worker.log" 2>&1 & )
+    echo '{"status":"started"}'
+}
+
+cmd_update_install() {
+    local fetch_only="" installed ver ipk free_kb rc code pkgver now
+    [ "${1:-}" = "--fetch-only" ] && fetch_only=1
+    mkdir -p "$UPD_DIR"
+    exec 9>>"$UPD_LOCK"
+    flock -n 9 || exit 0          # another worker owns the status file: say nothing
+    trap upd_cleanup EXIT
+    trap 'exit 1' INT TERM
+    UPD_STEP="checking the latest version"; upd_set_status running "Checking the latest version..."
+    upd_query_latest 2>"$UPD_DIR/query.err" || { upd_set_status error "$(head -n 1 "$UPD_DIR/query.err" | sed 's/^update: //')"; exit 1; }
+    [ -n "$UPD_LATEST" ] || { upd_set_status error "No stable release is published yet"; exit 1; }
+    ver="$UPD_LATEST"
+    if [ -z "$fetch_only" ]; then
+        installed=$(upd_installed_version) || installed=""
+        [ -n "$installed" ] || { upd_set_status error "The plugin is not installed through opkg — self-update is unavailable"; exit 1; }
+        ver_gt "$ver" "$installed" || { upd_set_status success "Already up to date ($installed)"; exit 0; }
+    fi
+    ipk="${UPD_PKG}_${ver}_all.ipk"
+    UPD_STEP="checking free space"
+    free_kb=$(df -k "$ROOT/overlay" 2>/dev/null | tail -n 1 | awk '{print $4}') || free_kb=""
+    if [ -n "$free_kb" ] && [ "$free_kb" -lt 2048 ] 2>/dev/null; then
+        upd_set_status error "Not enough free space on /overlay (${free_kb} KB free, 2048 KB needed)"; exit 1
+    fi
+    UPD_STEP="downloading $ipk"; upd_set_status running "Downloading version $ver..."
+    rc=0; code=$(curl -fsSL --connect-timeout 15 --max-time 300 -o "$UPD_DIR/$ipk" -w '%{http_code}' "$UPD_BASE_URL/v$ver/$ipk") || rc=$?
+    [ "$rc" -eq 0 ] || { upd_set_status error "Download of $ipk failed (HTTP ${code:-000}, curl exit $rc)"; exit 1; }
+    rc=0; code=$(curl -fsSL --connect-timeout 15 --max-time 60 -o "$UPD_DIR/SHA256SUMS" -w '%{http_code}' "$UPD_BASE_URL/v$ver/SHA256SUMS") || rc=$?
+    [ "$rc" -eq 0 ] || { upd_set_status error "Download of SHA256SUMS failed (HTTP ${code:-000}, curl exit $rc)"; exit 1; }
+    UPD_STEP="verifying the checksum"; upd_set_status running "Verifying the checksum..."
+    # Only the line for this exact asset counts (SHA256SUMS also lists the _latest_ alias).
+    awk -v n="$ipk" '$2 == n' "$UPD_DIR/SHA256SUMS" > "$UPD_DIR/expected.sums"
+    [ -s "$UPD_DIR/expected.sums" ] || { upd_set_status error "SHA256SUMS carries no entry for $ipk"; exit 1; }
+    ( cd "$UPD_DIR" && sha256sum -c expected.sums >/dev/null 2>&1 ) || { upd_set_status error "Checksum mismatch for $ipk — the download was rejected"; exit 1; }
+    UPD_STEP="checking the package version"
+    # The control file's Version must be the release's: a stale or swapped asset is rejected here.
+    pkgver=$(tar -xzOf "$UPD_DIR/$ipk" ./control.tar.gz 2>/dev/null | tar -xzOf - 2>/dev/null | sed -n 's/^Version: //p' | head -n 1) || pkgver=""
+    [ "$pkgver" = "$ver" ] || { upd_set_status error "The package says version '${pkgver:-?}' but the release is $ver — rejected"; exit 1; }
+    if [ -n "$fetch_only" ]; then
+        upd_set_status success "Verified $ipk (version $ver); install skipped (--fetch-only)"; exit 0
+    fi
+    UPD_STEP="installing version $ver"; upd_set_status running "Installing version $ver..."
+    # No force flags: a same-or-lower version must fail here rather than downgrade or reinstall.
+    if ! opkg install "$UPD_DIR/$ipk" > "$UPD_DIR/opkg.log" 2>&1; then
+        upd_set_status error "opkg install failed: $(tail -n 1 "$UPD_DIR/opkg.log" | head -c 200)"; exit 1
+    fi
+    now=$(upd_installed_version) || now=""
+    [ "$now" = "$ver" ] || { upd_set_status error "opkg reported success but the installed version is '${now:-?}', not $ver"; exit 1; }
+    upd_set_status success "Updated to $ver — reload this page to use the new version"
+}
+
+cmd_update_status() {
+    if [ -f "$UPD_STATUS" ]; then cat "$UPD_STATUS"; else echo '{"status":"idle","message":""}'; fi
+}
+
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 # Library mode for tests: source with GPB_LIB_ONLY=1 and call functions directly.
@@ -1775,11 +1860,22 @@ case "${1:-}" in
         shift
         cmd_update_check "$@"
         ;;
+    update-start)
+        shift
+        cmd_update_start "$@"
+        ;;
+    update-install)
+        shift
+        cmd_update_install "$@"
+        ;;
+    update-status)
+        cmd_update_status
+        ;;
     version)
         echo "${TOOL_NAME} ${VERSION}"
         ;;
     *)
-        echo "Usage: gl-portable-backup {create|restore|inspect|fingerprint|packages|install-package|update-check|version}" >&2
+        echo "Usage: gl-portable-backup {create|restore|inspect|fingerprint|packages|install-package|update-check|update-start|update-install|update-status|version}" >&2
         echo "" >&2
         echo "Commands:" >&2
         echo "  create           Create a backup archive" >&2
@@ -1789,6 +1885,9 @@ case "${1:-}" in
         echo "  packages         Compare archive packages vs this device" >&2
         echo "  install-package  Install a single package via opkg" >&2
         echo "  update-check     Report the installed and the newest stable release version (JSON)" >&2
+        echo "  update-start     Start a detached self-update to the newest stable release [--fetch-only]" >&2
+        echo "  update-install   The update worker itself (normally started by update-start) [--fetch-only]" >&2
+        echo "  update-status    Show the running or last update's status (JSON)" >&2
         echo "  version          Show version" >&2
         echo "" >&2
         echo "Options:" >&2
