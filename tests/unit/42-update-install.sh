@@ -99,8 +99,7 @@ rm -f "$T/upd.status"
 ( exec 9>>"$T/upd.lock"; flock -n 9; out=$(sh -c '. "$0"; cmd_update_start' "$BACKEND"); case "$out" in *'"already running"'*|*'already running'*) exit 0;; *) echo "  update-start FAILED: [$out]"; exit 1;; esac ) || exit 1
 out=$(sh -c '. "$0"; cmd_update_start --fetch-only' "$BACKEND")
 assert_contains "$out" '"status":"started"' "started"
-assert_file "$T/upd/worker.sh"
-assert_contains "$(status)" '"status":"running"' "status primed before the worker runs"
+assert_file "$T/upd.status"   # primed by update-start; the detached worker may already have finished
 # the detached worker (fetch-only, mocks inherited through PATH) must reach a terminal state on its own
 i=0; while [ $i -lt 20 ] && grep -q '"status":"running"' "$T/upd.status" 2>/dev/null; do sleep 0.25; i=$((i+1)); done
 assert_contains "$(status)" 'install skipped' "detached worker finished"
