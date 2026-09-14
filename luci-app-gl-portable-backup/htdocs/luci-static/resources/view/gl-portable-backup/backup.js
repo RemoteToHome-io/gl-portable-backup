@@ -667,6 +667,15 @@ return view.extend({
 		return m ? m[1] : 'unknown';
 	},
 
+	/* Only a page under the project's own GitHub releases may be linked: the URL came over the network.
+	 * A dot segment would let github.com resolve the link elsewhere on the site, so those are refused too. */
+	releaseLinkOk: function(url) {
+		if (typeof url !== 'string' || url.indexOf(RELEASES_URL_PREFIX) !== 0)
+			return false;
+		var rest = url.substring(RELEASES_URL_PREFIX.length);
+		return !/(^|\/)\.\.?(\/|$)/.test(rest) && !/[\s\\]/.test(rest);
+	},
+
 	load: function() {
 		return fs.exec(BACKEND, ['version']).then(L.bind(function(res) {
 			return { version: this.parseVersion(res.stdout) };
@@ -684,9 +693,9 @@ return view.extend({
 			nodes.push(E('p', {}, [ _('Not installed through opkg, so self-update is unavailable — install a release package first.') ]));
 		if (state.update_available) {
 			var line = [ _('Version %s is available.').format(state.latest) ];
-			if (typeof state.release_url === 'string' && state.release_url.indexOf(RELEASES_URL_PREFIX) === 0) {
+			if (this.releaseLinkOk(state.release_url)) {
 				line.push(' ');
-				line.push(E('a', { 'href': state.release_url, 'target': '_blank', 'rel': 'noopener' }, [ _('Release notes') ]));
+				line.push(E('a', { 'href': state.release_url, 'target': '_blank', 'rel': 'noopener noreferrer' }, [ _('Release notes') ]));
 			}
 			nodes.push(E('p', {}, line));
 			nodes.push(E('button', {
@@ -712,13 +721,16 @@ return view.extend({
 		var btn = ev.target;
 		btn.disabled = true;
 		return fs.exec(BACKEND, ['update-check']).then(L.bind(function(res) {
-			var st;
-			try { st = JSON.parse((res.stdout || '').trim()); }
-			catch (e) { st = { message: _('The update check returned an unreadable reply.') }; }
+			var st = null;
+			if (res.code === 0) {
+				try { st = JSON.parse((res.stdout || '').trim()); } catch (e) { st = null; }
+			}
+			if (!st)
+				st = { message: _('The update check failed: %s').format(((res.stderr || res.stdout || '').trim()) || _('no details were reported')) };
 			st.checked = true;
 			this.setUpdateState(st);
 		}, this)).catch(L.bind(function(e) {
-			this.setUpdateState({ message: _('Update check failed: %s').format(e.message), checked: true });
+			this.setUpdateState({ message: _('The update check failed: %s').format((e && e.message) || _('request error')), checked: true });
 		}, this)).finally(function() { btn.disabled = false; });
 	},
 
@@ -740,43 +752,56 @@ return view.extend({
 			E('p', { 'class': 'spinning', 'id': 'gl-pb-update-progress' }, [ _('Starting…') ])
 		]);
 		return fs.exec(BACKEND, ['update-start']).then(L.bind(function(res) {
-			var st = {};
-			try { st = JSON.parse((res.stdout || '').trim()); } catch (e) {}
-			if (st.status !== 'started') {
-				this.finishUpdate({ status: 'error', message: st.message || _('The update could not be started.') });
+			var st = null;
+			if (res.code === 0) {
+				try { st = JSON.parse((res.stdout || '').trim()); } catch (e) { st = null; }
+			}
+			if (!st || st.status !== 'started') {
+				this.finishUpdate({ status: 'error', message: (st && st.message) || ((res.stderr || res.stdout || '').trim()) || _('The update could not be started.') });
 				return;
 			}
-			this.pollUpdate();
+			this.pollUpdate(Date.now() + 15 * 60 * 1000);
 		}, this)).catch(L.bind(function(e) {
-			this.finishUpdate({ status: 'error', message: e.message });
+			this.finishUpdate({ status: 'error', message: (e && e.message) || _('The update could not be started.') });
 		}, this));
 	},
 
-	pollUpdate: function() {
-		return fs.exec(BACKEND, ['update-status']).then(L.bind(function(res) {
-			var st = {};
-			try { st = JSON.parse((res.stdout || '').trim()); } catch (e) {}
-			if (st.status === 'running' || st.status === 'idle') {
-				var p = document.getElementById('gl-pb-update-progress');
-				if (p && st.message)
-					dom.content(p, [ '' + st.message ]);
-				window.setTimeout(L.bind(this.pollUpdate, this), 2000);
+	/* Polls update-status every 2 s until a terminal status. A reply that cannot be read — the backend file
+	 * is being replaced by opkg mid-install — keeps the poll going; only the deadline ends it. */
+	pollUpdate: function(deadline) {
+		var self = this;
+		var again = function() {
+			if (Date.now() > deadline) {
+				self.finishUpdate({ status: 'timeout', message: _('The update is still running after 15 minutes. Reload the page to see the installed version, or run "gl-portable-backup update-status" over SSH.') });
 				return;
 			}
-			this.finishUpdate(st);
-		}, this)).catch(L.bind(function() {
-			window.setTimeout(L.bind(this.pollUpdate, this), 2000);
-		}, this));
+			window.setTimeout(function() { self.pollUpdate(deadline); }, 2000);
+		};
+		return fs.exec(BACKEND, ['update-status']).then(function(res) {
+			var st = null;
+			if (res.code === 0) {
+				try { st = JSON.parse((res.stdout || '').trim()); } catch (e) { st = null; }
+			}
+			if (!st || st.status === 'running' || st.status === 'idle') {
+				var p = document.getElementById('gl-pb-update-progress');
+				if (p && st && st.message)
+					dom.content(p, [ '' + st.message ]);
+				again();
+				return;
+			}
+			self.finishUpdate(st);
+		}).catch(again);
 	},
 
 	finishUpdate: function(st) {
 		var ok = (st.status === 'success');
-		ui.showModal(ok ? _('Update finished') : _('Update failed'), [
-			E('p', {}, [ '' + (st.message || '') ]),
+		var title = ok ? _('Update finished') : (st.status === 'timeout' ? _('Update still running') : _('Update failed'));
+		var msg = st.message || (ok ? _('Done.') : _('No details were reported.'));
+		ui.showModal(title, [
+			E('p', {}, [ '' + msg ]),
 			E('div', { 'class': 'right' }, [
-				ok
-					? E('button', { 'class': 'btn cbi-button-action', 'click': function() { window.location.reload(); } }, [ _('Reload page') ])
-					: E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Close') ])
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Close') ]), ' ',
+				E('button', { 'class': 'btn cbi-button-action', 'click': function() { window.location.reload(); } }, [ _('Reload page') ])
 			])
 		]);
 	},

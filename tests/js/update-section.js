@@ -24,7 +24,7 @@ var stubs = {
 	} },
 	_: function(s) { return s; },
 	dom: { content: function() {} }, fs: {}, rpc: {},
-	ui: { createHandlerFn: function(self, fn) { return function() {}; }, hideModal: function() {}, showModal: function() {} }
+	ui: { createHandlerFn: function(self, fn, arg) { return { handler: fn, arg: arg }; }, hideModal: function() {}, showModal: function() {} }
 };
 var view = new Function('view', 'dom', 'fs', 'ui', 'rpc', 'L', 'E', '_', src)(
 	stubs.view, stubs.dom, stubs.fs, stubs.ui, stubs.rpc, stubs.L, E, stubs._);
@@ -62,15 +62,28 @@ var s1 = view.renderUpdateState({ installed: '1.1.0', installed_via_opkg: true, 
 check(allText(s1).indexOf('Version 1.2.0 is available.') >= 0, 'available: sentence');
 var a = find(s1, 'a');
 check(a.length === 1 && a[0].attrs.href === 'https://github.com/RemoteToHome-io/gl-portable-backup/releases/tag/v1.2.0'
-	&& a[0].attrs.target === '_blank' && a[0].attrs.rel === 'noopener', 'available: release link with noopener');
+	&& a[0].attrs.target === '_blank' && a[0].attrs.rel.indexOf('noopener') === 0, 'available: release link with noopener');
 var b = find(s1, 'button');
 check(b.length === 1 && text(b[0]) === 'Update to 1.2.0', 'available: update button');
+check(b[0].attrs.click && b[0].attrs.click.handler === 'handleUpdateNow' && b[0].attrs.click.arg === '1.2.0', 'available: button wired to handleUpdateNow with the version');
+check(a[0].attrs.rel === 'noopener noreferrer', 'available: noreferrer');
 
 /* 4. a release URL outside the project renders no link, the button stays */
 var s2 = view.renderUpdateState({ installed: '1.1.0', installed_via_opkg: true, latest: '1.2.0', update_available: true,
 	release_url: 'https://evil.example/x', message: '', checked: true });
 check(find(s2, 'a').length === 0, 'foreign url: no link');
 check(find(s2, 'button').length === 1, 'foreign url: button stays');
+
+/* 4b. the gate is a prefix match at position 0, with no dot segments */
+check(view.releaseLinkOk('https://github.com/RemoteToHome-io/gl-portable-backup/releases/tag/v1.2.0') === true, 'gate: project release page');
+check(view.releaseLinkOk('https://evil.example/#https://github.com/RemoteToHome-io/gl-portable-backup/') === false, 'gate: prefix elsewhere in the URL');
+check(view.releaseLinkOk('https://github.com/RemoteToHome-io/gl-portable-backup/../../evil') === false, 'gate: dot segments');
+check(view.releaseLinkOk('https://github.com/RemoteToHome-io/gl-portable-backup/releases/./x') === false, 'gate: single-dot segment');
+check(view.releaseLinkOk('https://github.com.evil.example/RemoteToHome-io/gl-portable-backup/') === false, 'gate: look-alike host');
+check(view.releaseLinkOk('javascript:alert(1)') === false, 'gate: scheme');
+var s2b = view.renderUpdateState({ installed: '1.1.0', installed_via_opkg: true, latest: '1.2.0', update_available: true,
+	release_url: 'https://evil.example/#https://github.com/RemoteToHome-io/gl-portable-backup/', message: '', checked: true });
+check(find(s2b, 'a').length === 0, 'gate in rendering: prefix elsewhere renders no link');
 
 /* 5. a message that looks like markup is a text child */
 var s3 = view.renderUpdateState({ installed: '1.1.0', message: '<img src=x onerror=alert(1)>', checked: true });
@@ -81,6 +94,7 @@ check(p.length === 1 && p[0].children.length === 1 && p[0].children[0] === '<img
 var s4 = view.renderUpdateState({ installed: '1.1.0', installed_via_opkg: false, latest: '1.2.0', update_available: false, message: '', checked: true });
 check(allText(s4).indexOf('Not installed through opkg') >= 0, 'not via opkg: notice');
 check(find(s4, 'button').length === 0, 'not via opkg: no button');
+check(allText(s4).indexOf('Up to date.') < 0, 'not via opkg: no "Up to date."');
 
 /* 7. checked and current */
 var s5 = view.renderUpdateState({ installed: '1.2.0', installed_via_opkg: true, latest: '1.2.0', update_available: false, message: '', checked: true });
