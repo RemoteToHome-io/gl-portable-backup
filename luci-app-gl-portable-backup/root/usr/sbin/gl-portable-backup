@@ -1655,9 +1655,15 @@ cmd_install_package() {
 UPD_REPO="RemoteToHome-io/gl-portable-backup"
 UPD_API_URL="${GPB_UPDATE_API_URL:-https://api.github.com/repos/$UPD_REPO/releases/latest}"
 UPD_BASE_URL="${GPB_UPDATE_BASE_URL:-https://github.com/$UPD_REPO/releases/download}"
-UPD_DIR="${GPB_UPDATE_DIR:-/tmp/gl-portable-backup-update}"
-UPD_STATUS="$UPD_DIR.status"
-UPD_LOCK="$UPD_DIR.lock"
+# Two fixed state paths — the status file update-status reads and the lock update-start probes. Both are
+# refused when anything but a regular file sits there, and the status file is replaced atomically, so a
+# path planted under /tmp by a local process is never followed by root.
+UPD_STATE="${GPB_UPDATE_STATE:-/tmp/gl-portable-backup-update}"
+UPD_STATUS="$UPD_STATE.status"
+UPD_LOCK="$UPD_STATE.lock"
+# The per-run working directory (staged worker copy, downloads, logs) is a fresh mktemp directory that
+# update-start hands to the worker; update-install creates its own when run directly.
+UPD_DIR="${GPB_UPDATE_DIR:-}"
 UPD_PKG="luci-app-gl-portable-backup"
 UPD_LATEST=""
 UPD_RELEASE_URL=""
@@ -1737,8 +1743,28 @@ cmd_update_check() {
         "$(json_escape "$UPD_RELEASE_URL")" "$(json_escape "$msg")"
 }
 
+# One JSON reply line for update-start.
+upd_reply() {   # status message
+    printf '{"status":"%s","message":"%s"}\n' "$1" "$(json_escape "$2")"
+}
+
+# The two fixed paths must be absent or regular files: a symlink planted there by a local process would
+# otherwise be followed by root.
+upd_state_paths_ok() {
+    local p
+    for p in "$UPD_STATUS" "$UPD_LOCK"; do
+        if [ -L "$p" ] || { [ -e "$p" ] && [ ! -f "$p" ]; }; then return 1; fi
+    done
+    return 0
+}
+
+# Written atomically beside the status path, then moved over it: a reader never sees a partial file, and a
+# symlink at the path is replaced rather than followed. Only printable ASCII reaches the JSON string.
 upd_set_status() {   # status message
-    printf '{"status":"%s","message":"%s"}\n' "$1" "$(json_escape "$2")" > "$UPD_STATUS"
+    local tmp
+    tmp=$(mktemp "$UPD_STATUS.XXXXXX") || return 1
+    printf '{"status":"%s","message":"%s"}\n' "$1" "$(json_escape "$(printf '%s' "$2" | tr -cd ' -~')")" > "$tmp" \
+        && mv -f "$tmp" "$UPD_STATUS"
 }
 
 # Guaranteed terminal state: a worker that dies mid-step (set -e, a killed curl) would otherwise leave
@@ -1746,34 +1772,49 @@ upd_set_status() {   # status message
 # for the UI to read.
 upd_cleanup() {
     if grep -q '"status":"running"' "$UPD_STATUS" 2>/dev/null; then
-        upd_set_status error "Interrupted during: ${UPD_STEP:-start} — check the network and retry"
+        upd_set_status error "Interrupted during: ${UPD_STEP:-start} - check the network and retry"
     fi
-    rm -rf "$UPD_DIR"
+    [ -n "$UPD_DIR" ] && rm -rf "$UPD_DIR"
 }
 
 cmd_update_start() {
-    local fetch_only=""
-    [ "${1:-}" = "--fetch-only" ] && fetch_only="--fetch-only"
-    # Probe the lock without keeping it: the worker's own flock is the authority, this only reports.
-    if ! ( exec 9>>"$UPD_LOCK"; flock -n 9 ) 2>/dev/null; then
-        echo '{"status":"error","message":"An update is already running"}'; return 0
-    fi
-    mkdir -p "$UPD_DIR" 2>/dev/null || { echo '{"status":"error","message":"Cannot create the working directory"}'; return 0; }
-    cp "$0" "$UPD_DIR/worker.sh" 2>/dev/null || { echo '{"status":"error","message":"Cannot stage the update worker"}'; return 0; }
-    upd_set_status running "Starting..."
+    local fetch_only="" rc err dir
+    case "${1:-}" in
+        '') ;;
+        --fetch-only) fetch_only="--fetch-only" ;;
+        *) upd_reply error "Unknown option: $1"; return 0 ;;
+    esac
+    upd_state_paths_ok || { upd_reply error "Unexpected file at $UPD_STATE.status or $UPD_STATE.lock - remove it and retry"; return 0; }
+    # Probe the lock without keeping it: rc 1 means a worker holds it; anything else is a broken lock
+    # mechanism and is reported as such rather than mistaken for a running update.
+    rc=0; err=$( ( exec 9>>"$UPD_LOCK"; flock -n 9 ) 2>&1 ) || rc=$?
+    if [ "$rc" -eq 1 ]; then upd_reply error "An update is already running"; return 0; fi
+    [ "$rc" -eq 0 ] || { upd_reply error "Cannot take the update lock (exit $rc): ${err:-no details}"; return 0; }
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/gl-portable-backup-update.XXXXXX") || { upd_reply error "Cannot create a working directory"; return 0; }
+    cp "$0" "$dir/worker.sh" 2>/dev/null || { rm -rf "$dir"; upd_reply error "Cannot stage the update worker"; return 0; }
+    upd_set_status running "Starting..." || { rm -rf "$dir"; upd_reply error "Cannot write the status file"; return 0; }
     # Detached: GL's BusyBox has no nohup or setsid; an orphaned subshell with its stdio closed outlives
-    # the rpcd exec call that started it (verified on 4.11). The copy, not this file, does the work.
-    ( GPB_LIB_ONLY= GPB_UPDATE_DIR="$UPD_DIR" GPB_UPDATE_API_URL="$UPD_API_URL" GPB_UPDATE_BASE_URL="$UPD_BASE_URL" \
-      sh "$UPD_DIR/worker.sh" update-install $fetch_only </dev/null >"$UPD_DIR/worker.log" 2>&1 & )
-    echo '{"status":"started"}'
+    # the rpcd exec call that started it (verified on firmware 4.11). The copy, not this file, does the work.
+    ( GPB_LIB_ONLY= GPB_UPDATE_DIR="$dir" GPB_UPDATE_STATE="$UPD_STATE" GPB_UPDATE_API_URL="$UPD_API_URL" GPB_UPDATE_BASE_URL="$UPD_BASE_URL" \
+      sh "$dir/worker.sh" update-install $fetch_only </dev/null >"$dir/worker.log" 2>&1 & )
+    upd_reply started ""
 }
 
 cmd_update_install() {
     local fetch_only="" installed ver ipk free_kb rc code pkgver now
-    [ "${1:-}" = "--fetch-only" ] && fetch_only=1
-    mkdir -p "$UPD_DIR"
+    case "${1:-}" in
+        '') ;;
+        --fetch-only) fetch_only=1 ;;
+        *) die "update-install: unknown option: $1" ;;
+    esac
+    upd_state_paths_ok || die "update-install: unexpected file at $UPD_STATE.status or $UPD_STATE.lock"
+    if [ -z "$UPD_DIR" ]; then
+        UPD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gl-portable-backup-update.XXXXXX") || die "update-install: cannot create a working directory"
+    fi
     exec 9>>"$UPD_LOCK"
-    flock -n 9 || exit 0          # another worker owns the status file: say nothing
+    rc=0; flock -n 9 || rc=$?
+    if [ "$rc" -eq 1 ]; then rm -rf "$UPD_DIR"; exit 0; fi          # another worker owns the status file: say nothing
+    [ "$rc" -eq 0 ] || { upd_set_status error "Cannot take the update lock (flock exit $rc)"; rm -rf "$UPD_DIR"; exit 1; }
     trap upd_cleanup EXIT
     trap 'exit 1' INT TERM
     UPD_STEP="checking the latest version"; upd_set_status running "Checking the latest version..."
@@ -1782,7 +1823,7 @@ cmd_update_install() {
     ver="$UPD_LATEST"
     if [ -z "$fetch_only" ]; then
         installed=$(upd_installed_version) || installed=""
-        [ -n "$installed" ] || { upd_set_status error "The plugin is not installed through opkg — self-update is unavailable"; exit 1; }
+        [ -n "$installed" ] || { upd_set_status error "The plugin is not installed through opkg - self-update is unavailable"; exit 1; }
         ver_gt "$ver" "$installed" || { upd_set_status success "Already up to date ($installed)"; exit 0; }
     fi
     ipk="${UPD_PKG}_${ver}_all.ipk"
@@ -1800,11 +1841,11 @@ cmd_update_install() {
     # Only the line for this exact asset counts (SHA256SUMS also lists the _latest_ alias).
     awk -v n="$ipk" '$2 == n' "$UPD_DIR/SHA256SUMS" > "$UPD_DIR/expected.sums"
     [ -s "$UPD_DIR/expected.sums" ] || { upd_set_status error "SHA256SUMS carries no entry for $ipk"; exit 1; }
-    ( cd "$UPD_DIR" && sha256sum -c expected.sums >/dev/null 2>&1 ) || { upd_set_status error "Checksum mismatch for $ipk — the download was rejected"; exit 1; }
+    ( cd "$UPD_DIR" && sha256sum -c expected.sums >/dev/null 2>&1 ) || { upd_set_status error "Checksum mismatch for $ipk - the download was rejected"; exit 1; }
     UPD_STEP="checking the package version"
     # The control file's Version must be the release's: a stale or swapped asset is rejected here.
     pkgver=$(tar -xzOf "$UPD_DIR/$ipk" ./control.tar.gz 2>/dev/null | tar -xzOf - 2>/dev/null | sed -n 's/^Version: //p' | head -n 1) || pkgver=""
-    [ "$pkgver" = "$ver" ] || { upd_set_status error "The package says version '${pkgver:-?}' but the release is $ver — rejected"; exit 1; }
+    [ "$pkgver" = "$ver" ] || { upd_set_status error "The package says version '${pkgver:-?}' but the release is $ver - rejected"; exit 1; }
     if [ -n "$fetch_only" ]; then
         upd_set_status success "Verified $ipk (version $ver); install skipped (--fetch-only)"; exit 0
     fi
@@ -1815,11 +1856,17 @@ cmd_update_install() {
     fi
     now=$(upd_installed_version) || now=""
     [ "$now" = "$ver" ] || { upd_set_status error "opkg reported success but the installed version is '${now:-?}', not $ver"; exit 1; }
-    upd_set_status success "Updated to $ver — reload this page to use the new version"
+    upd_set_status success "Updated to $ver - reload this page to use the new version"
 }
 
 cmd_update_status() {
-    if [ -f "$UPD_STATUS" ]; then cat "$UPD_STATUS"; else echo '{"status":"idle","message":""}'; fi
+    if [ -L "$UPD_STATUS" ] || { [ -e "$UPD_STATUS" ] && [ ! -f "$UPD_STATUS" ]; }; then
+        upd_reply error "Unexpected file at $UPD_STATUS"
+    elif [ -f "$UPD_STATUS" ]; then
+        cat "$UPD_STATUS"
+    else
+        echo '{"status":"idle","message":""}'
+    fi
 }
 
 # ─── Main ──────────────────────────────────────────────────────────────────────

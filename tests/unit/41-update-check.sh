@@ -3,7 +3,7 @@
 # transport failure), and the not-installed-via-opkg case. The mock curl serves GET fixtures from
 # $MOCK_CURL_DIR/get/<last URL component>; the API URL below ends in "latest", so the fixture is get/latest.
 . "$(dirname "$0")/../lib.sh"
-export GPB_UPDATE_DIR="$T/upd" GPB_UPDATE_API_URL="https://example.invalid/api/latest" GPB_UPDATE_BASE_URL="https://example.invalid/download"
+export GPB_UPDATE_STATE="$T/upd" GPB_UPDATE_API_URL="https://example.invalid/api/latest" GPB_UPDATE_BASE_URL="https://example.invalid/download"
 load_backend
 not_contains() { case "$1" in *"$2"*) echo "  not_contains FAILED (${3:-}): [$2] is present"; exit 1;; esac; }
 gt() { ver_gt "$1" "$2" || { echo "  ver_gt FAILED: $1 should be newer than $2"; exit 1; }; }
