@@ -73,11 +73,13 @@ jobs:
              "luci-app-gl-portable-backup_latest_all.ipk"
           sha256sum luci-app-gl-portable-backup_*.ipk > SHA256SUMS
 
-      - name: Publish GitHub release (beta / prerelease)
+      - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          prerelease: true
+          # A tag with a suffix (v1.2.0-beta.1, v1.2.0-rc1) is a prerelease; a plain vX.Y.Z is stable, so
+          # GitHub's releases/latest — what the plugin's self-updater follows — resolves to it.
+          prerelease: ${{ contains(steps.vars.outputs.version, '-') }}
           generate_release_notes: true
           files: |
             build/out/luci-app-gl-portable-backup_${{ steps.vars.outputs.version }}_all.ipk
