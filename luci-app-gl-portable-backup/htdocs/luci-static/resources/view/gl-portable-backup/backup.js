@@ -78,6 +78,46 @@ return view.extend({
 		});
 	},
 
+	/* The archive's contents, from the manifest the backend's inspect command returned. Rendered
+	 * collapsed: a Full archive lists roughly 80 config files and 100 extra files. Every entry is
+	 * an archive-controlled string, so each one is passed to E() inside an array — LuCI renders a
+	 * bare string child as HTML. Returns null for a manifest that carries neither list. */
+	renderContents: function(manifest) {
+		var sections = Array.isArray(manifest.sections) ? manifest.sections : null;
+		var extra = Array.isArray(manifest.extra_files) ? manifest.extra_files : null;
+		if (!sections && !extra)
+			return null;
+
+		var isProfile = (manifest.mode === 'profile');
+		var counts = [];
+		if (sections)
+			counts.push(isProfile ? _('%d API captures').format(sections.length)
+			                      : _('%d config files').format(sections.length));
+		if (extra && !isProfile)
+			counts.push(_('%d extra files').format(extra.length));
+
+		var listOf = function(items) {
+			return E('ul', { 'style': 'margin: 0 0 0.5em 1.2em; padding: 0' }, items.map(function(item) {
+				return E('li', {}, [ '' + item ]);
+			}));
+		};
+
+		var body = [];
+		if (sections) {
+			body.push(E('strong', {}, [ isProfile ? _('API captures') : _('Config files') ]));
+			body.push(listOf(sections));
+		}
+		if (extra && extra.length > 0) {
+			body.push(E('strong', {}, [ _('Extra files') ]));
+			body.push(listOf(extra));
+		}
+
+		return E('details', { 'style': 'margin: 0.5em 0' }, [
+			E('summary', {}, [ _('Contents: %s').format(counts.join(', ')) ]),
+			E('div', { 'style': 'max-height: 12em; overflow: auto; font-family: monospace; font-size: 90%; padding: 0.25em 0 0 0.5em' }, body)
+		]);
+	},
+
 	handleRestore: function(ev) {
 		var btn = ev.target;
 		return ui.uploadFile('/tmp/gl-portable-restore.tar.gz', btn)
@@ -141,6 +181,10 @@ return view.extend({
 						E('li', {}, [ _('Created: %s').format(manifest.created_at || 'unknown') ])
 					])
 				];
+				/* The archive's contents — collapsed, so the warnings below stay in view */
+				var contents = this.renderContents(manifest);
+				if (contents)
+					bodyItems.push(contents);
 
 				/* Firmware version mismatch warning */
 				if (!fwMatch && deviceFw !== 'unknown' && backupFw !== 'unknown'
