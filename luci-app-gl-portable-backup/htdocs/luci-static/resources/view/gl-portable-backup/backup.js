@@ -12,6 +12,9 @@
 
 var BACKEND = '/usr/sbin/gl-portable-backup';
 
+/* Only release pages under the project are ever rendered as a link; the URL comes from the network. */
+var RELEASES_URL_PREFIX = 'https://github.com/RemoteToHome-io/gl-portable-backup/';
+
 return view.extend({
 
 	handleCreate: function(ev) {
@@ -656,9 +659,132 @@ return view.extend({
 		installNext();
 	},
 
+	/* ── Plugin self-update ──────────────────────────────────────────── */
+
+	/* "gl-portable-backup 1.1.0" → "1.1.0"; anything else → "unknown". */
+	parseVersion: function(stdout) {
+		var m = /(\d+(?:\.\d+)*(?:-[\w.]+)?)\s*$/.exec((stdout || '').trim());
+		return m ? m[1] : 'unknown';
+	},
+
+	load: function() {
+		return fs.exec(BACKEND, ['version']).then(L.bind(function(res) {
+			return { version: this.parseVersion(res.stdout) };
+		}, this)).catch(function() { return { version: 'unknown' }; });
+	},
+
+	/* The Plugin section's body for one state (the update-check reply plus `installed` and `checked`).
+	 * Every string that came over the network is an array child of E(): LuCI renders a bare string
+	 * child as HTML. */
+	renderUpdateState: function(state) {
+		var nodes = [ E('p', {}, [ _('Installed version: %s').format(state.installed || 'unknown') ]) ];
+		if (state.message)
+			nodes.push(E('p', { 'class': 'alert-message' }, [ '' + state.message ]));
+		if (state.installed_via_opkg === false)
+			nodes.push(E('p', {}, [ _('Not installed through opkg, so self-update is unavailable — install a release package first.') ]));
+		if (state.update_available) {
+			var line = [ _('Version %s is available.').format(state.latest) ];
+			if (typeof state.release_url === 'string' && state.release_url.indexOf(RELEASES_URL_PREFIX) === 0) {
+				line.push(' ');
+				line.push(E('a', { 'href': state.release_url, 'target': '_blank', 'rel': 'noopener' }, [ _('Release notes') ]));
+			}
+			nodes.push(E('p', {}, line));
+			nodes.push(E('button', {
+				'class': 'btn cbi-button-action important',
+				'click': ui.createHandlerFn(this, 'handleUpdateNow', state.latest)
+			}, [ _('Update to %s').format(state.latest) ]));
+		} else if (state.checked && !state.message && state.installed_via_opkg !== false) {
+			nodes.push(E('p', {}, [ _('Up to date.') ]));
+		}
+		return nodes;
+	},
+
+	setUpdateState: function(state) {
+		var box = document.getElementById('gl-pb-update');
+		if (!box)
+			return;
+		if (!state.installed)
+			state.installed = this.installedVersion || 'unknown';
+		dom.content(box, this.renderUpdateState(state));
+	},
+
+	handleUpdateCheck: function(ev) {
+		var btn = ev.target;
+		btn.disabled = true;
+		return fs.exec(BACKEND, ['update-check']).then(L.bind(function(res) {
+			var st;
+			try { st = JSON.parse((res.stdout || '').trim()); }
+			catch (e) { st = { message: _('The update check returned an unreadable reply.') }; }
+			st.checked = true;
+			this.setUpdateState(st);
+		}, this)).catch(L.bind(function(e) {
+			this.setUpdateState({ message: _('Update check failed: %s').format(e.message), checked: true });
+		}, this)).finally(function() { btn.disabled = false; });
+	},
+
+	handleUpdateNow: function(version, ev) {
+		ui.showModal(_('Update the plugin?'), [
+			E('p', {}, [ _('Version %s will be downloaded from GitHub over HTTPS, verified against the release\'s SHA256SUMS, and installed with opkg. Reload the page when it finishes.').format(version) ]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
+				E('button', {
+					'class': 'btn cbi-button-action important',
+					'click': ui.createHandlerFn(this, 'handleUpdateStart')
+				}, [ _('Update now') ])
+			])
+		]);
+	},
+
+	handleUpdateStart: function(ev) {
+		ui.showModal(_('Updating…'), [
+			E('p', { 'class': 'spinning', 'id': 'gl-pb-update-progress' }, [ _('Starting…') ])
+		]);
+		return fs.exec(BACKEND, ['update-start']).then(L.bind(function(res) {
+			var st = {};
+			try { st = JSON.parse((res.stdout || '').trim()); } catch (e) {}
+			if (st.status !== 'started') {
+				this.finishUpdate({ status: 'error', message: st.message || _('The update could not be started.') });
+				return;
+			}
+			this.pollUpdate();
+		}, this)).catch(L.bind(function(e) {
+			this.finishUpdate({ status: 'error', message: e.message });
+		}, this));
+	},
+
+	pollUpdate: function() {
+		return fs.exec(BACKEND, ['update-status']).then(L.bind(function(res) {
+			var st = {};
+			try { st = JSON.parse((res.stdout || '').trim()); } catch (e) {}
+			if (st.status === 'running' || st.status === 'idle') {
+				var p = document.getElementById('gl-pb-update-progress');
+				if (p && st.message)
+					dom.content(p, [ '' + st.message ]);
+				window.setTimeout(L.bind(this.pollUpdate, this), 2000);
+				return;
+			}
+			this.finishUpdate(st);
+		}, this)).catch(L.bind(function() {
+			window.setTimeout(L.bind(this.pollUpdate, this), 2000);
+		}, this));
+	},
+
+	finishUpdate: function(st) {
+		var ok = (st.status === 'success');
+		ui.showModal(ok ? _('Update finished') : _('Update failed'), [
+			E('p', {}, [ '' + (st.message || '') ]),
+			E('div', { 'class': 'right' }, [
+				ok
+					? E('button', { 'class': 'btn cbi-button-action', 'click': function() { window.location.reload(); } }, [ _('Reload page') ])
+					: E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Close') ])
+			])
+		]);
+	},
+
 	/* ── Render ──────────────────────────────────────────────────────────── */
 
-	render: function() {
+	render: function(data) {
+		this.installedVersion = (data && data.version) || 'unknown';
 		var body = [];
 
 		/* ── Header ─────────────────────────────────────────────────── */
@@ -743,6 +869,20 @@ return view.extend({
 					'class': 'btn cbi-button-neutral',
 					'click': ui.createHandlerFn(this, 'handlePackageReviewStandalone')
 				}, [ _('Review packages in archive…') ])
+			])
+		]));
+
+		/* ── Plugin Section ─────────────────────────────────────────── */
+		body.push(E('div', { 'class': 'cbi-section' }, [
+			E('h3', {}, _('Plugin')),
+			E('div', { 'class': 'cbi-section-descr' },
+				_('Checks GitHub for a newer stable release only when you click. An update is downloaded over HTTPS, verified against the release\'s SHA256SUMS, checked for its own version, and installed with opkg.')),
+			E('div', { 'id': 'gl-pb-update' }, this.renderUpdateState({ installed: this.installedVersion })),
+			E('div', { 'class': 'cbi-page-actions' }, [
+				E('button', {
+					'class': 'btn cbi-button-action',
+					'click': ui.createHandlerFn(this, 'handleUpdateCheck')
+				}, [ _('Check for updates') ])
 			])
 		]));
 
