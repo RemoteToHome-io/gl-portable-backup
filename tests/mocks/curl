@@ -1,11 +1,32 @@
 #!/bin/sh
-# mock curl: records the -d payload, replies from $MOCK_CURL_DIR/<key>.json, exit code $MOCK_CURL_EXIT.
-# $MOCK_CURL_FAIL_KEY fails one call only — the one whose <module>.<method> key matches — with
-# exit 22, which is what `curl -f` returns for an HTTP status of 400 or above.
-data=""
-while [ $# -gt 0 ]; do case "$1" in -d) data="$2"; shift 2;; *) shift;; esac; done
-printf '%s\n' "$data" >> "${MOCK_CURL_LOG:-/dev/null}"
-[ "${MOCK_CURL_EXIT:-0}" != 0 ] && exit "$MOCK_CURL_EXIT"
+# mock curl. JSON-RPC POSTs (-d) reply from $MOCK_CURL_DIR/<method>.json or <module>.<method>.json, as
+# before. Plain GETs (no -d) reply from $MOCK_CURL_DIR/get/<last path component of the URL>, honouring
+# -o FILE and -w '%{http_code}'; a missing GET fixture behaves like curl -f on a 404 (exit 22, code 404).
+# $MOCK_CURL_EXIT fails every call with that exit code (transport failure: -w prints 000).
+# $MOCK_CURL_FAIL_KEY fails one JSON-RPC call only — the <module>.<method> that matches — with exit 22.
+data=""; out=""; wfmt=""; url=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d) data="$2"; shift 2 ;;
+        -o) out="$2"; shift 2 ;;
+        -w) wfmt="$2"; shift 2 ;;
+        --connect-timeout|--max-time) shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+printf '%s\n' "${data:-GET $url}" >> "${MOCK_CURL_LOG:-/dev/null}"
+if [ "${MOCK_CURL_EXIT:-0}" != 0 ]; then [ -n "$wfmt" ] && printf '000'; exit "$MOCK_CURL_EXIT"; fi
+if [ -z "$data" ]; then
+    f="${MOCK_CURL_DIR:-.}/get/${url##*/}"
+    if [ -f "$f" ]; then
+        if [ -n "$out" ]; then cat "$f" > "$out"; else cat "$f"; fi
+        [ -n "$wfmt" ] && printf '200'
+        exit 0
+    fi
+    [ -n "$wfmt" ] && printf '404'
+    exit 22
+fi
 key=$(printf '%s' "$data" | sed -n 's/.*"method":"\([a-z]*\)".*/\1/p')
 if [ "$key" = call ]; then key=$(printf '%s' "$data" | sed -n 's/.*"params":\["[^"]*","\([^"]*\)","\([^"]*\)".*/\1.\2/p'); fi
 [ -n "${MOCK_CURL_FAIL_KEY:-}" ] && [ "$key" = "$MOCK_CURL_FAIL_KEY" ] && exit 22

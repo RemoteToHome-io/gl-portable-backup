@@ -1,2 +1,14 @@
 #!/bin/sh
-case "$1" in list-changed-conffiles) cat "${MOCK_OPKG_CONFFILES:-/dev/null}";; list-installed) cat "${MOCK_OPKG_INSTALLED:-/dev/null}";; list) cat "${MOCK_OPKG_AVAILABLE:-/dev/null}";; *) echo "mock opkg: unmocked subcommand: $*" >&2; exit 1;; esac
+# mock opkg. status: prints $MOCK_OPKG_STATUS (empty = package not installed). install: logs the file to
+# $MOCK_OPKG_LOG, then — if $MOCK_OPKG_STATUS_AFTER names a file — copies it over $MOCK_OPKG_STATUS so a
+# following `opkg status` reports the new version; exits $MOCK_OPKG_INSTALL_EXIT (default 0).
+case "$1" in
+    list-changed-conffiles) cat "${MOCK_OPKG_CONFFILES:-/dev/null}" ;;
+    list-installed) cat "${MOCK_OPKG_INSTALLED:-/dev/null}" ;;
+    list) cat "${MOCK_OPKG_AVAILABLE:-/dev/null}" ;;
+    status) cat "${MOCK_OPKG_STATUS:-/dev/null}" ;;
+    install) printf 'install %s\n' "$2" >> "${MOCK_OPKG_LOG:-/dev/null}"
+             [ -n "${MOCK_OPKG_STATUS_AFTER:-}" ] && cp "$MOCK_OPKG_STATUS_AFTER" "$MOCK_OPKG_STATUS"
+             exit "${MOCK_OPKG_INSTALL_EXIT:-0}" ;;
+    *) echo "mock opkg: unmocked subcommand: $*" >&2; exit 1 ;;
+esac

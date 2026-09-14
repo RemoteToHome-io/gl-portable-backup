@@ -1647,6 +1647,96 @@ cmd_install_package() {
         "$pkg" "$code" "$stdout" "$stderr"
 }
 
+# ─── Plugin self-update ───────────────────────────────────────────────────────
+# Manual, checksum-verified update from the project's GitHub releases. Only plain versions are offered: a
+# tag with a suffix (-beta.1, -rc1) is a prerelease, which releases/latest never returns anyway. The
+# worker runs from a copy of this script under /tmp, because opkg replaces this file mid-install.
+
+UPD_REPO="RemoteToHome-io/gl-portable-backup"
+UPD_API_URL="${GPB_UPDATE_API_URL:-https://api.github.com/repos/$UPD_REPO/releases/latest}"
+UPD_BASE_URL="${GPB_UPDATE_BASE_URL:-https://github.com/$UPD_REPO/releases/download}"
+UPD_DIR="${GPB_UPDATE_DIR:-/tmp/gl-portable-backup-update}"
+UPD_STATUS="$UPD_DIR.status"
+UPD_LOCK="$UPD_DIR.lock"
+UPD_PKG="luci-app-gl-portable-backup"
+UPD_LATEST=""
+UPD_RELEASE_URL=""
+UPD_STEP=""
+
+ver_base() { printf '%s' "$1" | sed 's/-.*//'; }
+
+# ver_gt A B: A is newer than B. Numeric dotted compare of the bases; with equal bases a version carrying
+# a suffix (1.0.0-beta.2) ranks below the plain one (1.0.0), and two suffixed versions are never ordered.
+ver_gt() {
+    local a b i x y
+    a=$(ver_base "$1"); b=$(ver_base "$2")
+    i=1
+    while [ $i -le 4 ]; do
+        x=$(printf '%s' "$a" | cut -d. -f$i | tr -dc '0-9'); y=$(printf '%s' "$b" | cut -d. -f$i | tr -dc '0-9')
+        x=${x:-0}; y=${y:-0}
+        [ "$x" -gt "$y" ] && return 0
+        [ "$x" -lt "$y" ] && return 1
+        i=$((i+1))
+    done
+    case "$1" in *-*) return 1 ;; esac
+    case "$2" in *-*) return 0 ;; esac
+    return 1
+}
+
+# Prints the installed package version from opkg; nothing when the plugin is not installed through opkg
+# (a copy run from /tmp, as the smoke test does).
+upd_installed_version() {
+    opkg status "$UPD_PKG" 2>/dev/null | sed -n 's/^Version: //p' | head -n 1
+}
+
+# Queries the release API. Sets UPD_LATEST (plain version, "" when no stable release exists or the tag is
+# unusable) and UPD_RELEASE_URL (kept only for the project's own GitHub pages). Returns 0 in those cases
+# and 1 — with one line on stderr — when the server could not be reached or answered with an error.
+upd_query_latest() {
+    local body code rc tag
+    UPD_LATEST=""; UPD_RELEASE_URL=""
+    body=$(mktemp) || { echo "update: cannot create a temporary file" >&2; return 1; }
+    rc=0; code=$(curl -fsS --connect-timeout 15 --max-time 60 -o "$body" -w '%{http_code}' "$UPD_API_URL") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        rm -f "$body"
+        case "$code" in
+            404) return 0 ;;
+            ""|000) echo "update: cannot reach the release server (curl exit $rc)" >&2; return 1 ;;
+            *) echo "update: the release server answered HTTP $code (curl exit $rc)" >&2; return 1 ;;
+        esac
+    fi
+    tag=$(jsonfilter -i "$body" -e '@.tag_name' 2>/dev/null) || tag=""
+    UPD_RELEASE_URL=$(jsonfilter -i "$body" -e '@.html_url' 2>/dev/null) || UPD_RELEASE_URL=""
+    rm -f "$body"
+    [ -n "$tag" ] || { echo "update: the release reply carries no tag_name" >&2; return 1; }
+    UPD_LATEST="${tag#v}"
+    # Never a prerelease, never anything that is not digits and dots (the value ends up in a URL path).
+    case "$UPD_LATEST" in *-*|''|*[!0-9.]*) UPD_LATEST=""; UPD_RELEASE_URL=""; return 0 ;; esac
+    case "$UPD_RELEASE_URL" in "https://github.com/$UPD_REPO/"*) ;; *) UPD_RELEASE_URL="" ;; esac
+    return 0
+}
+
+cmd_update_check() {
+    local installed via_opkg avail msg errfile
+    installed=$(upd_installed_version) || installed=""
+    if [ -n "$installed" ]; then via_opkg=true; else via_opkg=false; installed="$VERSION"; fi
+    avail=false; msg=""
+    errfile=$(mktemp) || errfile=/dev/null
+    if upd_query_latest 2>"$errfile"; then
+        if [ -z "$UPD_LATEST" ]; then
+            msg="No stable release is published yet"
+        elif [ "$via_opkg" = true ] && ver_gt "$UPD_LATEST" "$installed"; then
+            avail=true
+        fi
+    else
+        msg=$(head -n 1 "$errfile" | sed 's/^update: //')
+    fi
+    [ "$errfile" = /dev/null ] || rm -f "$errfile"
+    printf '{"installed":"%s","installed_via_opkg":%s,"latest":"%s","update_available":%s,"release_url":"%s","message":"%s"}\n' \
+        "$(json_escape "$installed")" "$via_opkg" "$(json_escape "$UPD_LATEST")" "$avail" \
+        "$(json_escape "$UPD_RELEASE_URL")" "$(json_escape "$msg")"
+}
+
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 # Library mode for tests: source with GPB_LIB_ONLY=1 and call functions directly.
@@ -1681,11 +1771,15 @@ case "${1:-}" in
         shift
         cmd_install_package "$@"
         ;;
+    update-check)
+        shift
+        cmd_update_check "$@"
+        ;;
     version)
         echo "${TOOL_NAME} ${VERSION}"
         ;;
     *)
-        echo "Usage: gl-portable-backup {create|restore|inspect|fingerprint|packages|install-package|version}" >&2
+        echo "Usage: gl-portable-backup {create|restore|inspect|fingerprint|packages|install-package|update-check|version}" >&2
         echo "" >&2
         echo "Commands:" >&2
         echo "  create           Create a backup archive" >&2
@@ -1694,6 +1788,7 @@ case "${1:-}" in
         echo "  fingerprint      Show the SSH host-key fingerprint an archive would install" >&2
         echo "  packages         Compare archive packages vs this device" >&2
         echo "  install-package  Install a single package via opkg" >&2
+        echo "  update-check     Report the installed and the newest stable release version (JSON)" >&2
         echo "  version          Show version" >&2
         echo "" >&2
         echo "Options:" >&2

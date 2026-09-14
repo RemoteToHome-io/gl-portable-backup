@@ -9,8 +9,8 @@ T=$(mktemp -d) || exit 2
 [ -n "$T" ] || exit 2
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/root/etc/config" "$T/root/rom/etc" "$T/root/lib/upgrade/keep.d" "$T/root/usr/lib/oui-httpd/rpc"
-export MOCK_CURL_LOG="$T/curl.log" MOCK_CURL_DIR="$T/curl" MOCK_UCI_FILE="$T/uci.txt" MOCK_UCI_LOG="$T/uci.log" MOCK_OPKG_CONFFILES="$T/conffiles.txt" MOCK_OPKG_AVAILABLE="$T/available.txt"
-mkdir -p "$MOCK_CURL_DIR"; : > "$MOCK_UCI_FILE"; : > "$MOCK_OPKG_CONFFILES"; : > "$MOCK_OPKG_AVAILABLE"
+export MOCK_CURL_LOG="$T/curl.log" MOCK_CURL_DIR="$T/curl" MOCK_UCI_FILE="$T/uci.txt" MOCK_UCI_LOG="$T/uci.log" MOCK_OPKG_CONFFILES="$T/conffiles.txt" MOCK_OPKG_AVAILABLE="$T/available.txt" MOCK_OPKG_STATUS="$T/opkg-status.txt" MOCK_OPKG_LOG="$T/opkg.log"
+mkdir -p "$MOCK_CURL_DIR/get"; : > "$MOCK_UCI_FILE"; : > "$MOCK_OPKG_CONFFILES"; : > "$MOCK_OPKG_AVAILABLE"; : > "$MOCK_OPKG_STATUS"; : > "$MOCK_OPKG_LOG"
 assert_eq() { [ "$1" = "$2" ] && return 0; echo "  assert_eq FAILED (${3:-}): expected [$2] got [$1]"; exit 1; }
 assert_contains() { case "$1" in *"$2"*) return 0;; esac; echo "  assert_contains FAILED (${3:-}): [$2] not in [$1]"; exit 1; }
 assert_file() { [ -e "$1" ] && return 0; echo "  assert_file FAILED: missing $1"; exit 1; }
