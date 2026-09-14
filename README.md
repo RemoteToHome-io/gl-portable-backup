@@ -72,6 +72,20 @@ ssh root@<router> opkg install /tmp/luci-app-gl-portable-backup_*.ipk
 
 **Note:** The plugin must be installed on the target router *before* restoring a backup. For fleet deployment: install the plugin first, then restore.
 
+### Updating
+
+The **Plugin** section at the bottom of the page shows the installed version. **Check for updates** asks
+GitHub for the newest stable release — only when you click; the router makes no background requests.
+**Update to X** downloads that release's package over HTTPS, verifies it against the release's
+`SHA256SUMS`, checks that the package itself carries that version, installs it with `opkg` (no force
+flags, never a downgrade), and asks you to reload the page. The same steps run from the command line as
+`gl-portable-backup update-check` and `update-start`.
+
+What this trusts: the TLS connection to github.com and the release published there. The checksum file
+comes from the same release as the package, so it catches a damaged download, not a compromised release;
+signed packages are planned together with the apk-based packaging for OpenWrt 25 firmware. Prereleases
+(tags with a suffix such as `-beta.1`) are never offered — install those by hand as described above.
+
 ## Backup Archive Format
 
 Archives are `.tar.gz` files with hostname, model, and firmware in the filename:
@@ -207,10 +221,14 @@ gl-portable-backup inspect ARCHIVE
 gl-portable-backup fingerprint ARCHIVE
 gl-portable-backup packages ARCHIVE
 gl-portable-backup install-package PKG
+gl-portable-backup update-check
+gl-portable-backup update-start [--fetch-only]
+gl-portable-backup update-status
+gl-portable-backup update-install [--fetch-only]
 gl-portable-backup version
 ```
 
-`-v`/`--verbose`, placed before the subcommand, prints each local API call including its request payload — a verbose log may contain keys and secrets, so don't share one. `--output` accepts a directory (the default filename is written inside it) or a full file path. `--include-plugins` also backs up files outside `/etc` — installed packages' binaries, libraries, and plugin files, including Tor's identity under `/var/lib/tor/` — which are excluded by default (see "What Is Excluded, and Why"). `--keep-host-keys` keeps this device's own SSH host keys during a restore instead of installing the archive's; it only matters for Full archives, since Clone, Remote-Safe, and Profile archives never carry host keys.
+`-v`/`--verbose`, placed before the subcommand, prints each local API call including its request payload — a verbose log may contain keys and secrets, so don't share one. `--output` accepts a directory (the default filename is written inside it) or a full file path. `--include-plugins` also backs up files outside `/etc` — installed packages' binaries, libraries, and plugin files, including Tor's identity under `/var/lib/tor/` — which are excluded by default (see "What Is Excluded, and Why"). `--keep-host-keys` keeps this device's own SSH host keys during a restore instead of installing the archive's; it only matters for Full archives, since Clone, Remote-Safe, and Profile archives never carry host keys. `update-check` prints one JSON line (installed and newest stable version, whether an update is offered); `update-start` detaches the worker (`update-install`) and `update-status` reports its progress; `--fetch-only` downloads and verifies without installing.
 
 ## Build
 
@@ -237,7 +255,7 @@ The package is architecture-independent (pure shell + LuCI JS/JSON), so a valid 
 ./pkg/build.sh [version]
 ```
 
-Output: `build/out/luci-app-gl-portable-backup_<version>_all.ipk`. This is also what `.github/workflows/build-ipk.yml` runs on every push and pull request (uploading the ipk as a build artifact), and, on `v*` tags, to publish a prerelease GitHub Release with the ipk attached.
+Output: `build/out/luci-app-gl-portable-backup_<version>_all.ipk`. This is also what `.github/workflows/build-ipk.yml` runs on every push and pull request (uploading the ipk as a build artifact), and, on `v*` tags, to publish a GitHub Release with the ipk and `SHA256SUMS` attached — marked as a prerelease when the tag carries a suffix (`v1.2.0-beta.1`), stable otherwise, which is what the plugin's self-updater follows.
 
 ## Tests
 
@@ -266,8 +284,9 @@ gl-portable-backup/
 │   └── device-specific-identifiers.md    # Reference: HW ID sources
 ├── pkg/                                  # No-SDK ipk build: build.sh, control, postinst, prerm
 ├── tests/                                # dash-based unit tests + on-router smoke test
+│   └── js/                               # node harnesses for the LuCI view (Contents block, Plugin section)
 ├── .github/workflows/
-│   └── build-ipk.yml                     # CI build; prerelease GitHub Release on v* tags
+│   └── build-ipk.yml                     # CI build; GitHub Release on v* tags (prerelease when the tag has a suffix)
 └── luci-app-gl-portable-backup/          # OpenWrt/LuCI package source
     ├── Makefile
     ├── htdocs/luci-static/resources/

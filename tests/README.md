@@ -18,3 +18,6 @@ the backend in a sub-shell instead: `sh -c '. "$0"; some_function args' "$BACKEN
 checks the restore dialog's Contents block (counts, headings, and that archive strings
 are rendered as text nodes). `tests/unit/40-restore-dialog-contents.sh` runs it and prints
 SKIP where node is absent.
+
+`tests/js/update-section.js` (wrapper `tests/unit/43-update-section.sh`) checks the Plugin section's
+rendering the same way.
