@@ -228,9 +228,12 @@ which says where each finding comes from.
 
 The plugin page opens with the result of an incident check, and the same check runs from the command
 line as `gl-portable-backup check`. It prints one line of JSON (`result`, the `indicators` found with
-an `id` and a fixed `detail` each, `goodcloud_enabled`, `uptime_since`, `rebooted_since_incident`,
-`checked_at` and a `note`) and exits 0, or 3 when an indicator was found. Every backup runs the same
-check first and records it in its manifest. What it looks for:
+an `id` and a fixed `detail` each, `cannot_clear` in the same form, `goodcloud_enabled`,
+`uptime_since`, `rebooted_since_incident`, `checked_at` and a `note`; every time in UTC) and exits 0,
+or 3 when a strong indicator was found. Every backup runs the same check first and records it in its
+manifest. What it looks for comes in two tiers.
+
+**Strong indicators** (`indicators`): each one is a trace of the attack itself.
 
 | id | What it means | Source |
 |----|---------------|--------|
@@ -242,26 +245,37 @@ check first and records it in its manifest. What it looks for:
 | `marker-dir` | `/etc/config/.gl` or `/etc/glinet/.cache`, the paths the cleanup in GL.iNet's KVM firmware removes | findings.md |
 | `boot-script-changed` | `/etc/init.d/urandom_seed` or `/lib/upgrade/keep.d/netifd` differs from its `/rom` copy (an unconfirmed report) | findings.md |
 | `nat-loopback-rule` | a firewall rule the remote-shell attack leaves, which stays until a reboot | router-reverse-shell.md |
-| `mp-ip-mapping-file` | `/etc/mp_ip_mapping_info` written on or after 2026-11-20 while multi-path tunnelling is off: the only trace known to survive a reboot | router-reverse-shell.md |
 | `conn-attacker-range` | an open TCP connection to 170.39.226.0/24, the range the remote shells connected to | findings.md |
 | `udhcpc-user-changed` | a file under `/etc/udhcpc.user.d/` that differs from its `/rom` copy or has none (an unconfirmed report) | findings.md |
-| `check-incomplete` | something the check needs could not be read; it counts as an indicator, never as none | — |
+
+**Cannot-clear findings** (`cannot_clear`): each one stops the check from clearing the router, and
+none of them shows a compromise.
+
+| id | What it means | Source |
+|----|---------------|--------|
+| `mp-ip-mapping-file` | `/etc/mp_ip_mapping_info` written on or after 2026-11-20 while multi-path tunnelling is off: the cloud client's handler that the attack used has run on this router. It is the only trace of that handler known to survive a restart. It was found on a compromised router and on routers with no other trace, and whether an ordinary cloud message also writes it is not known, so on its own it does not show a compromise and does not rule one out | router-reverse-shell.md, findings.md |
+| `restarted-since-incident` | the router has restarted since the attack window opened (about 20:47 UTC on 2026-11-20, from the incident record and open to revision); the remote shell and its traces do not survive a restart | router-reverse-shell.md |
+| `check-incomplete` | the check could not read something it needs: the process command lines under `/proc` (it then reads `ps w`), the process list, or the TCP connection table | — |
 
 Processes are read from `/proc/<pid>/cmdline`, which holds the whole command line. Only when no
-command line there can be read does the check fall back to `ps w` and add `check-incomplete`, because
-BusyBox cuts `ps w` lines at the terminal width and a pattern near the end of a long command line is
-then not seen. The check leaves out its own process, its parent shell and any process running
-`gl-portable-backup`, so a person running it over SSH is not reported. No command line, address or
-rule is printed: each indicator carries fixed text only.
+command line there can be read does the check fall back to `ps w`, and it adds `check-incomplete`,
+because BusyBox cuts `ps w` lines at the terminal width and a pattern near the end of a
+long command line is then not seen. The check leaves out only its own process and its ancestors (read
+from `/proc/<pid>/stat`), so the shell of a person running it over SSH is not reported; any other
+process is matched whatever its command line names. No command line, address or rule is printed:
+each indicator carries fixed text only.
 
 There are three results:
 
-- **`indicators`**: at least one indicator was found, or the check was incomplete. See below.
-- **`inconclusive`**: nothing was found, but the router has restarted since the attack window opened
-  (about 20:48 UTC on 2026-11-20). The remote shell and its traces do not survive a restart, so the
-  check cannot clear the router. If you have any other reason to suspect it, treat it as compromised.
-- **`none`**: nothing was found and the router has not restarted since then (or its uptime could not
-  be read). This does not show the router was never compromised: the known remote shell leaves no
+- **`indicators`**: at least one strong indicator was found. The backup is a record only and is not
+  restored. See below.
+- **`inconclusive`**: no strong indicator was found, but at least one cannot-clear finding was. The
+  backup is not a record: it restores, and `restore` first prints `WARNING: this archive was made on a
+  router that could not be cleared (<ids>). Restore its keys and passwords only if you accept that.`,
+  which the restore dialog shows too. If you have any other reason to suspect the router, treat it as
+  compromised and follow "If indicators are found".
+- **`none`**: nothing of either tier was found (a router whose uptime cannot be read counts as not
+  restarted). This does not show the router was never compromised: the known remote shell leaves no
   file and is gone after a reboot, and the check only knows the indicators above.
 
 ### If indicators are found
@@ -287,6 +301,10 @@ and selects it. After the reset and the fixed firmware, install the plugin again
 archive on the same router. Before rebooting, read every file the restore dialog flags as running at
 startup or controlling logins (see "Startup and login files" below). Full is the only mode whose
 restore has been run on a router (see Compatibility).
+
+With an `inconclusive` result the page still marks Full as the security incident backup and adds that
+you should treat the router as compromised if you have any other reason to suspect it; the archive
+restores, after the could-not-be-cleared warning.
 
 What each mode carries, among the files that matter here:
 
