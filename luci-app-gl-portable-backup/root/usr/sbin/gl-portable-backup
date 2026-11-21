@@ -273,13 +273,14 @@ is_rom_identical() { [ -f "$ROOT/rom$1" ] && cmp -s "$ROOT$1" "$ROOT/rom$1"; }
 
 # Capture the non-UCI persistent files discovered by enumerate_persistent_paths
 # Applies mode-specific filtering, copies to extra/ in archive
-# Outputs one line: "<captured> <firmware-owned skipped> <rom-identical skipped>"
+# Outputs one line: "<captured> <firmware-owned skipped> <rom-identical skipped> <hidden skipped>"
 capture_extra_files() {
     local archdir="$1"
     local mode="$2"
     local extradir="$archdir/extra"
     local skipped_owned=0
     local skipped_rom=0
+    local skipped_hidden=0
 
     mkdir -p "$extradir"
 
@@ -290,6 +291,10 @@ capture_extra_files() {
     while IFS= read -r filepath; do
         # Skip /etc/config/ — already captured in config/
         case "$filepath" in /etc/config/*) continue ;; esac
+
+        # A dot-named component hides an entry from a plain ls, which is where a foothold on a
+        # compromised router hides; the same rule as for /etc/config, and restore refuses them too.
+        case "$filepath" in */.*) skipped_hidden=$((skipped_hidden + 1)); vlog "skip hidden $filepath"; continue ;; esac
 
         # Router functionality rather than user configuration, and files nobody ever edited:
         # neither belongs in a configuration archive. Both counts reach backup-info.txt.
@@ -335,11 +340,11 @@ capture_extra_files() {
 
     rm -f "$pathlist"
 
-    # One line, three integers: captured, firmware-owned skipped, rom-identical skipped. The
-    # captured count comes from the archive itself (avoids subshell variable loss).
+    # One line, four integers: captured, firmware-owned skipped, rom-identical skipped, hidden
+    # skipped. The captured count comes from the archive itself (avoids subshell variable loss).
     local captured
     captured=$(find "$extradir" -type f 2>/dev/null | wc -l)
-    printf '%s %s %s\n' "$((captured))" "$skipped_owned" "$skipped_rom"
+    printf '%s %s %s %s\n' "$((captured))" "$skipped_owned" "$skipped_rom" "$skipped_hidden"
 }
 
 # ─── SSH Host Keys ────────────────────────────────────────────────────────────
@@ -368,34 +373,49 @@ archive_hostkey_fingerprint() {
     return 0
 }
 
-# Restore extra/ files from archive to filesystem
+# Restore extra/ files from archive to filesystem. Prints the number of files restored; one
+# warning line on stderr for each kind of entry that was NOT restored: anything under etc/config/
+# (configuration comes from config/ only), anything with a dot-named component, and anything that is
+# not a regular file (symlinks above all — a link could point anywhere). Returns 1 when a directory
+# or a copy fails, so the caller stops instead of reporting a restore that did not happen.
 restore_extra_files() {
     local tmpdir="$1"
-    [ -d "$tmpdir/extra" ] || return 0
+    [ -d "$tmpdir/extra" ] || { echo 0; return 0; }
 
     # The relative paths go through a file and are read one line at a time. A `for f in $(find …)`
     # form would word-split a name holding a space and pathname-expand one holding * or ?, so the
     # copy aborted part-way through a restore and the count counted the fragments. Reading from a
     # file rather than a pipe also keeps the loop in this shell, so the count survives it — the
     # same pattern capture_extra_files uses.
-    local pathlist=$(mktemp)
-    (cd "$tmpdir/extra" && find . -type f | sed 's|^\./||') > "$pathlist"
+    local pathlist
+    pathlist=$(mktemp) || return 1
+    (cd "$tmpdir/extra" && find . ! -type d | sed 's|^\./||') > "$pathlist" || { rm -f "$pathlist"; return 1; }
 
-    local count=0
+    local count=0 n_conf=0 n_hidden=0 n_other=0
     local relfile destdir
     while IFS= read -r relfile; do
+        if [ -L "$tmpdir/extra/$relfile" ] || [ ! -f "$tmpdir/extra/$relfile" ]; then
+            n_other=$((n_other + 1)); continue
+        fi
+        if extra_rel_skipped "$relfile"; then
+            case "$relfile" in etc/config/*) n_conf=$((n_conf + 1)) ;; *) n_hidden=$((n_hidden + 1)) ;; esac
+            continue
+        fi
         # --keep-host-keys leaves this unit's SSH identity alone. authorized_keys is never
         # skipped: which keys may log in is user configuration, the host key is identity.
         case "$relfile" in
             etc/dropbear/dropbear_*_host_key) [ "${GPB_KEEP_HOST_KEYS:-0}" = 1 ] && continue ;;
         esac
         destdir="$ROOT/$(dirname "$relfile")"
-        mkdir -p "$destdir"
-        cp -a "$tmpdir/extra/$relfile" "$ROOT/$relfile"
+        mkdir -p "$destdir" || { rm -f "$pathlist"; return 1; }
+        cp -a "$tmpdir/extra/$relfile" "$ROOT/$relfile" || { rm -f "$pathlist"; return 1; }
         count=$((count + 1))
     done < "$pathlist"
 
     rm -f "$pathlist"
+    [ "$n_conf" -eq 0 ] || echo "  WARNING: ${n_conf} entries under extra/etc/config/ in this archive were NOT restored" >&2
+    [ "$n_hidden" -eq 0 ] || echo "  WARNING: ${n_hidden} hidden entries under extra/ in this archive were NOT restored" >&2
+    [ "$n_other" -eq 0 ] || echo "  WARNING: ${n_other} symbolic links or other non-regular entries under extra/ in this archive were NOT restored" >&2
     echo "$count"
 }
 
@@ -724,12 +744,113 @@ strip_hidden_entries() {
     find "$1" -depth -name '.*' -exec rm -rf {} \; -exec printf x \; | wc -c
 }
 
+# ─── Archive Member Checks ─────────────────────────────────────────────────────
+
+# Every archive is attacker-controlled input restored as root, so what the archive holds is read from
+# its listing before anything is extracted, and every decision taken from that listing goes through
+# one normaliser. Filter: one member name per line in, the same name out with "//" collapsed, "/./"
+# removed, leading "./" and "/" stripped (tar strips a leading "/" on extraction) and a trailing "/."
+# turned into "/" (a directory stays recognisable by its trailing slash).
+normalize_member_paths() {
+    sed -e 's|//*|/|g' -e ':a' -e 's|/\./|/|g' -e 'ta' -e 's|^\(\./\)*||' -e 's|^/*||' \
+        -e 's|/\.$|/|' -e 's|^\.$||'
+}
+
+# archive_precheck ARCHIVE LISTFILE — refuses, before any extraction, an archive whose listing:
+#  - fails or is empty (absent is not clean);
+#  - has a member whose type is not a regular file, directory or symlink — GNU tar prints a hard link
+#    as "h", BusyBox tar as a regular-file line carrying " -> " (read on the router's BusyBox 1.33.2
+#    and on desktop BusyBox 1.36.1); fifos and device nodes are "p", "b", "c". A regular file whose
+#    own name contains " -> " is refused by the same rule, which is accepted: this tool never writes
+#    one. Symlinks are tolerated here; they are never restored, and the top-level names below are
+#    refused outright;
+#  - has a member with a ".." component, a control character or a backslash (GNU tar prints control
+#    characters as backslash escapes; under BusyBox a newline splits the name into a line that does
+#    not start with a type character, which the type rule above refuses);
+#  - holds a symlink where the tool reads its own files: the prefix directory, manifest.json, config,
+#    extra, api, packages.json, packages.txt.
+# Writes the normalised member list to LISTFILE. Every refusal names a count, never a member name.
+archive_precheck() {   # archive listfile
+    local a="$1" out="$2" res special unsafe toplink
+    rm -f "$out" "$out.v"
+    if ! tar -tzf "$a" > "$out.raw" 2>"$out.err" || ! tar -tvzf "$a" > "$out.v" 2>/dev/null || [ ! -s "$out.raw" ]; then
+        rm -f "$out.raw" "$out.v" "$out.err"
+        die "Invalid archive: it cannot be listed"
+    fi
+    normalize_member_paths < "$out.raw" > "$out"
+    rm -f "$out.raw"
+    # Desktop BusyBox tar (1.36.1) strips a "../" prefix while listing and says so on stderr, so the
+    # listing alone would not show it; GNU tar lists the name as stored. Either form is refused.
+    local stripped
+    stripped=$(grep -c -i 'removing leading .*\.\.' "$out.err") || stripped=0
+    rm -f "$out.err"
+    res=$(awk -v pre="$ARCHIVE_PREFIX" '
+        FILENAME == ARGV[1] {
+            t = substr($0, 1, 1); type[FNR] = t
+            if ((t != "-" && t != "d" && t != "l") || (t == "-" && index($0, " -> ") > 0)) special++
+            next
+        }
+        {
+            if ($0 ~ /[\001-\037\177\\]/ || ("/" $0 "/") ~ /\/\.\.\//) unsafe++
+            if (type[FNR] == "l") {
+                n = $0; sub(/\/$/, "", n)
+                rel = n; if (index(rel, pre "/") == 1) rel = substr(rel, length(pre) + 2)
+                if (n == pre) toplink = pre
+                else if (rel == "manifest.json" || rel == "config" || rel == "extra" || rel == "api" || \
+                         rel == "packages.json" || rel == "packages.txt") toplink = rel
+            }
+        }
+        END { printf "%d %d %s\n", special, unsafe, (toplink == "" ? "-" : toplink) }
+    ' "$out.v" "$out")
+    rm -f "$out.v"
+    set -- $res
+    special=$1; unsafe=$2; toplink=$3
+    [ "$unsafe" -gt 0 ] || unsafe=$stripped
+    [ "$special" -eq 0 ] || die "Invalid archive: it contains $special hard links, device nodes or other special members"
+    [ "$unsafe" -eq 0 ] || die "Invalid archive: $unsafe members have a '..' component, a control character or a backslash in their name"
+    [ "$toplink" = "-" ] || die "Invalid archive: $toplink is a symbolic link"
+    return 0
+}
+
+# After extraction: the prefix directory and the tool's own top-level entries must not be symlinks
+# (the listing check above refuses them already; this reads the extracted tree itself), and no name
+# anywhere may carry a newline, another control character or a backslash. A newline is caught by
+# counting entries two ways — lines versus one byte per entry — since no line-based reader sees it.
+assert_extracted_tree_safe() {   # extraction-dir base-dir
+    local x="$1" base="$2" n
+    [ -L "$x/$ARCHIVE_PREFIX" ] && die "Invalid archive: $ARCHIVE_PREFIX is a symbolic link"
+    for n in manifest.json config extra api packages.json packages.txt; do
+        [ -L "$base/$n" ] && die "Invalid archive: $n is a symbolic link"
+    done
+    [ "$(find "$x" | wc -l)" -eq "$(find "$x" -exec printf x \; | wc -c)" ] \
+        || die "Invalid archive: a member name contains a newline"
+    n=$(find "$x" | awk '/[\001-\037\177\\]/ { n++ } END { print n + 0 }')
+    [ "$n" -eq 0 ] || die "Invalid archive: $n members have a control character or a backslash in their name"
+    return 0
+}
+
+# The manifest layout this tool writes: an opening line, the keys, a closing brace alone on the last
+# line. inspect appends its keys before that brace; anything else could hide them.
+manifest_layout_ok() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ "$(tail -n 1 "$1" | tr -d ' \t\r')" = "}" ] && [ "$(wc -l < "$1")" -ge 3 ]
+}
+
+# Paths under extra/ (relative, etc/...) that restore never writes: anything under etc/config/
+# (configuration is restored from config/ only, and capture never puts a file there) and anything
+# with a dot-named component at any depth. Shared by restore_extra_files and the flagged list, so
+# the two can never disagree.
+extra_rel_skipped() {
+    case "$1" in etc/config/*|etc/config) return 0 ;; esac
+    case "/$1" in */.*) return 0 ;; esac
+    return 1
+}
+
 # ─── Compromise Markers ────────────────────────────────────────────────────────
 
-# Paths that the cleanup script inside GL's published KVM firmware treats as signs of the compromise
-# described in GL.iNet Security Notice 2026-11-20. GL has published no indicator list for routers,
-# so this is not one: finding none of these proves nothing about the router. Prints each path that
-# exists under $ROOT, one per line.
+# Paths that the cleanup script inside GL's published KVM firmware removes after the incident
+# described in GL.iNet Security Notice 2026-11-20. GL has published no such list for routers, so
+# this is not one: finding none of these proves nothing about the router, and finding one is not
+# proof of compromise. Prints each path that exists under $ROOT, one per line.
 suspect_markers() {
     local p
     for p in /etc/config/.gl /etc/glinet/.cache; do
@@ -747,21 +868,31 @@ is_startup_or_login() {
         */) return 1 ;;
         etc/rc.local|etc/crontabs/*|etc/dropbear/authorized_keys|etc/shadow|etc/passwd|etc/group|\
         etc/init.d/*|etc/rc.d/*|etc/hotplug.d/*|etc/uci-defaults/*|etc/sysupgrade.conf|\
-        etc/profile|etc/profile.d/*|etc/dropbear/dropbear_*_host_key) return 0 ;;
+        etc/profile|etc/profile.d/*|etc/dropbear/dropbear_*_host_key|\
+        etc/rc.button/*|etc/firewall.user|etc/sysctl.conf|etc/sysctl.d/*|etc/inittab|etc/opkg/*|\
+        etc/hotplug-preinit.d/*|etc/rc.common|etc/preinit) return 0 ;;
     esac
     return 1
 }
 
-# Read archive member names (one per line) on stdin; print the startup/login ones as /etc/... paths,
-# sorted and deduplicated. Both the prefixed (gl-portable-backup/extra/...) and the flat
-# (extra/...) layout match; a leading ./ is tolerated.
+# Read archive member names (one per line) on stdin; print, as absolute paths sorted and
+# deduplicated, the extra/ files a restore would write that are flagged: those that run at boot or
+# decide who may log in (is_startup_or_login), and every file outside /etc — those are binaries,
+# libraries and plugin files, carried only by --include-plugins archives. Names go through
+# normalize_member_paths first, so "etc//rc.local" or "./etc/./rc.local" cannot slip past. Both the
+# prefixed (gl-portable-backup/extra/...) and the flat (extra/...) layout match. Entries restore
+# never writes (extra_rel_skipped) are not listed.
 startup_login_members() {
-    local member rel
-    while IFS= read -r member; do
-        rel="${member#./}"
+    local rel
+    normalize_member_paths | while IFS= read -r rel; do
         rel="${rel#"${ARCHIVE_PREFIX}"/}"
-        case "$rel" in extra/etc/*) rel="${rel#extra/}" ;; *) continue ;; esac
-        if is_startup_or_login "$rel"; then printf '/%s\n' "$rel"; fi
+        case "$rel" in extra/?*) rel="${rel#extra/}" ;; *) continue ;; esac
+        case "$rel" in */) continue ;; esac
+        extra_rel_skipped "$rel" && continue
+        case "$rel" in
+            etc/*) is_startup_or_login "$rel" || continue ;;
+        esac
+        printf '/%s\n' "$rel"
     done | sort -u
 }
 
@@ -873,10 +1004,12 @@ cmd_create() {
     local markers suspect_json="" m
     markers=$(suspect_markers)
     if [ -n "$markers" ]; then
-        echo "WARNING: this router has paths that GL's own cleanup script treats as signs of the 2026-11-20 compromise:" >&2
+        echo "WARNING: this router has paths that the cleanup script in GL.iNet's KVM firmware removes after the 2026-11-20 incident. GL.iNet has published no such list for routers." >&2
         printf '%s\n' "$markers" | while IFS= read -r m; do echo "  $m" >&2; done
-        echo "  A backup of a compromised router can carry the attacker's changes back. Prefer Profile mode, which stores" >&2
-        echo "  no files, and treat every key and password in any backup of this router as exposed." >&2
+        echo "  A backup of a compromised router can carry the attacker's changes back. Prefer Profile mode. It stores no" >&2
+        echo "  files, but it still carries settings an attacker may have changed (DNS mode and hosts entries, port" >&2
+        echo "  forwards, WAN access, firewall rules, VPN client configurations): read those before restoring." >&2
+        echo "  Treat every key and password in any backup of this router as exposed." >&2
         suspect_json=$(printf '%s\n' "$markers" | while IFS= read -r m; do
             printf '"%s", ' "$(json_escape "$m")"
         done | sed 's/, $//')
@@ -924,12 +1057,13 @@ cmd_create() {
         # safe here: the option loop above consumed the arguments, so no positional parameter is
         # still needed. The command substitution keeps its own assignment line, because `set` is
         # a special builtin that returns 0 and would discard a failure inside the capture.
-        local extra_counts extra_count skip_owned skip_rom
+        local extra_counts extra_count skip_owned skip_rom skip_hidden
         extra_counts=$(capture_extra_files "$archdir" "$mode")
         set -- $extra_counts
-        extra_count=$1; skip_owned=$2; skip_rom=$3
+        extra_count=$1; skip_owned=$2; skip_rom=$3; skip_hidden=$4
         echo "  Captured ${extra_count} extra persistent files" >&2
         echo "  Skipped ${skip_owned} firmware-owned, ${skip_rom} identical to /rom" >&2
+        echo "  Skipped ${skip_hidden} hidden entries in the persistent-file list" >&2
 
         if [ "$mode" = "clone" ] || [ "$mode" = "remote-safe" ]; then
             # Strip hardware-specific fields
@@ -1014,13 +1148,16 @@ INFOEOF
 
 # ─── INSPECT ───────────────────────────────────────────────────────────────────
 
-# True when any of the literal substrings $2… occurs in the text $1. Used on a tar listing,
-# where the same member appears with or without the archive's prefix directory.
+# Members of a normalised listing relative to the archive root: the prefix directory stripped,
+# so the prefixed and the flat layout read alike.
+archive_rel_members() { sed "s|^${ARCHIVE_PREFIX}/||" "$1"; }
+
+# True when any of the exact paths $2… is a member of the normalised listing in file $1.
 listing_has() {
-    local text="$1" pat
+    local list="$1" pat
     shift
     for pat in "$@"; do
-        if printf '%s\n' "$text" | grep -q -F "$pat"; then return 0; fi
+        if archive_rel_members "$list" | grep -q -x -F "$pat"; then return 0; fi
     done
     return 1
 }
@@ -1033,46 +1170,58 @@ cmd_inspect() {
     local tmpdir=$(mktemp -d)
     trap "rm -rf '$tmpdir'" EXIT
 
-    # Try prefixed archive first, fall back to flat (backward compat)
-    tar -xzf "$archive" -C "$tmpdir" "${ARCHIVE_PREFIX}/manifest.json" 2>/dev/null \
-        || tar -xzf "$archive" -C "$tmpdir" manifest.json 2>/dev/null \
+    archive_precheck "$archive" "$tmpdir/listing"
+
+    # Only the manifest is extracted. Try the prefixed layout first, fall back to flat.
+    mkdir -p "$tmpdir/x"
+    tar -xzf "$archive" -C "$tmpdir/x" "${ARCHIVE_PREFIX}/manifest.json" 2>/dev/null \
+        || tar -xzf "$archive" -C "$tmpdir/x" manifest.json 2>/dev/null \
         || die "Invalid archive: no manifest.json"
+    [ -L "$tmpdir/x/${ARCHIVE_PREFIX}" ] && die "Invalid archive: ${ARCHIVE_PREFIX} is a symbolic link"
 
-    local manifest="$tmpdir/${ARCHIVE_PREFIX}/manifest.json"
-    [ -f "$manifest" ] || manifest="$tmpdir/manifest.json"
+    local manifest="$tmpdir/x/${ARCHIVE_PREFIX}/manifest.json"
+    [ -e "$manifest" ] || [ -L "$manifest" ] || manifest="$tmpdir/x/manifest.json"
+    [ -L "$manifest" ] && die "Invalid archive: manifest.json is a symbolic link"
 
-    # What restoring this archive overwrites beyond configuration. Both are read from the
-    # archive listing, which covers the prefixed and the flat layout alike.
-    local listing has_keys=false has_shadow=false
-    listing=$(tar -tzf "$archive")
-    if listing_has "$listing" "extra/etc/dropbear/dropbear_ed25519_host_key" \
+    # The keys below are appended to the OUTPUT only — the archive's own manifest.json is never
+    # rewritten. Built line-wise rather than with a sed replacement carrying a newline, which is not
+    # portable: every line but the closing brace, a comma on the new last line, then the keys and the
+    # brace. Any other layout could hide the appended keys from the reader, so it is refused.
+    manifest_layout_ok "$manifest" || die "Invalid archive: manifest.json is not in the layout this tool writes"
+
+    # What restoring this archive overwrites beyond configuration, from the normalised listing.
+    local has_keys=false has_shadow=false
+    if listing_has "$tmpdir/listing" "extra/etc/dropbear/dropbear_ed25519_host_key" \
             "extra/etc/dropbear/dropbear_rsa_host_key" \
             "extra/etc/dropbear/dropbear_ecdsa_host_key"; then
         has_keys=true
     fi
-    if listing_has "$listing" "extra/etc/shadow"; then
+    if listing_has "$tmpdir/listing" "extra/etc/shadow"; then
         has_shadow=true
     fi
-    # Files that run at boot or control logins, as a JSON array of /etc/... strings. Every name is
-    # archive-controlled, so each goes through json_escape; an empty list is [].
+    # Files a restore writes that run at boot, control logins, or lie outside /etc, as a JSON array.
+    # Every name is archive-controlled, so each goes through json_escape; an empty list is [].
     local startup_json
-    startup_json=$(printf '%s\n' "$listing" | startup_login_members | while IFS= read -r f; do
+    startup_json=$(startup_login_members < "$tmpdir/listing" | while IFS= read -r f; do
         printf '"%s", ' "$(json_escape "$f")"
     done | sed 's/, $//')
 
-    # The three keys are appended to the OUTPUT only — the archive's own manifest.json is never
-    # rewritten. Built line-wise rather than with a sed replacement carrying a newline, which is
-    # not portable: every line but the closing brace, a comma on the new last line, then the
-    # flags and the brace. That needs three lines at minimum — an opening line, something to carry
-    # the comma, and the closing brace — so a shorter manifest, or one whose last line is not a
-    # bare brace, is passed through untouched rather than rewritten into something invalid.
-    if [ "$(tail -n 1 "$manifest" | tr -d ' \t\r')" != "}" ] || [ "$(wc -l < "$manifest")" -lt 3 ]; then
-        cat "$manifest"
-        return 0
-    fi
-    sed '$d' "$manifest" | sed '$ s/$/,/'
-    printf '  "restores_ssh_host_keys": %s,\n  "restores_root_password": %s,\n  "startup_and_login_files": [%s]\n}\n' \
-        "$has_keys" "$has_shadow" "$startup_json"
+    { sed '$d' "$manifest" | sed '$ s/$/,/'
+      printf '  "restores_ssh_host_keys": %s,\n  "restores_root_password": %s,\n  "startup_and_login_files": [%s]\n}\n' \
+          "$has_keys" "$has_shadow" "$startup_json"
+    } > "$tmpdir/out"
+
+    # The keys must read back at the top level exactly as computed; a manifest that nests them inside
+    # an object of its own, or leaves the output unparseable, is refused rather than shown.
+    # Both sides go through jsonfilter, so its own output format is never assumed.
+    printf '{"k":%s,"p":%s,"v":[%s]}\n' "$has_keys" "$has_shadow" "$startup_json" > "$tmpdir/want"
+    local key want got
+    for key in restores_ssh_host_keys:k restores_root_password:p startup_and_login_files:v; do
+        want=$(jsonfilter -i "$tmpdir/want" -e "@.${key#*:}" 2>/dev/null) || want="<unreadable>"
+        got=$(jsonfilter -i "$tmpdir/out" -e "@.${key%%:*}" 2>/dev/null) || got="<absent>"
+        [ "$got" = "$want" ] || die "Invalid archive: manifest.json is not in the layout this tool writes"
+    done
+    cat "$tmpdir/out"
 }
 
 # ─── FINGERPRINT ───────────────────────────────────────────────────────────────
@@ -1088,19 +1237,23 @@ cmd_fingerprint() {
     local tmpdir=$(mktemp -d)
     trap "rm -rf '$tmpdir'" EXIT
 
+    archive_precheck "$archive" "$tmpdir/check"
+
     # Only the host keys are extracted, addressed by their exact names from the listing: no tar
     # wildcard support is required, and the prefixed and flat layouts both work.
+    mkdir -p "$tmpdir/x"
     tar -tzf "$archive" > "$tmpdir/listing"
     local member
     while IFS= read -r member; do
         case "$member" in
             *extra/etc/dropbear/dropbear_*_host_key)
-                tar -xzf "$archive" -C "$tmpdir" "$member" 2>/dev/null || true ;;
+                tar -xzf "$archive" -C "$tmpdir/x" "$member" 2>/dev/null || true ;;
         esac
     done < "$tmpdir/listing"
 
-    local base="$tmpdir"
-    [ -d "$tmpdir/${ARCHIVE_PREFIX}" ] && base="$tmpdir/${ARCHIVE_PREFIX}"
+    local base="$tmpdir/x"
+    [ -d "$tmpdir/x/${ARCHIVE_PREFIX}" ] && base="$tmpdir/x/${ARCHIVE_PREFIX}"
+    assert_extracted_tree_safe "$tmpdir/x" "$base"
     archive_hostkey_fingerprint "$base"
 }
 
@@ -1122,15 +1275,24 @@ cmd_restore() {
     local tmpdir=$(mktemp -d)
     trap "rm -rf '$tmpdir'" EXIT
 
+    # Nothing is extracted from an archive whose listing holds a hard link, a special file, a member
+    # name that could escape or hide, or a symlink where the tool reads its own files.
+    archive_precheck "$archive" "$tmpdir/listing"
+
     echo "Extracting backup..." >&2
-    tar -xzf "$archive" -C "$tmpdir"
+    mkdir -p "$tmpdir/x"
+    tar -xzf "$archive" -C "$tmpdir/x"
 
     # Resolve archive prefix (prefixed format or flat for backward compat)
-    if [ -d "$tmpdir/${ARCHIVE_PREFIX}" ]; then
-        tmpdir="$tmpdir/${ARCHIVE_PREFIX}"
+    local x="$tmpdir/x"
+    tmpdir="$x"
+    if [ -d "$x/${ARCHIVE_PREFIX}" ]; then
+        tmpdir="$x/${ARCHIVE_PREFIX}"
     fi
+    assert_extracted_tree_safe "$x" "$tmpdir"
 
     [ -f "$tmpdir/manifest.json" ] || die "Invalid archive: no manifest.json"
+    manifest_layout_ok "$tmpdir/manifest.json" || die "Invalid archive: manifest.json is not in the layout this tool writes"
 
     local mode=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.mode')
     local backup_model=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.source.model_id')
@@ -1179,7 +1341,7 @@ cmd_restore() {
     local startup
     startup=$(if [ -d "$tmpdir/extra" ]; then (cd "$tmpdir" && find extra ! -type d); fi | startup_login_members)
     if [ -n "$startup" ]; then
-        echo "WARNING: this archive restores files that run at startup or control logins:" >&2
+        echo "WARNING: this archive restores files that run at startup or control logins, or that lie outside /etc:" >&2
         printf '%s\n' "$startup" | while IFS= read -r f; do echo "  $f" >&2; done
         echo "  If the source router may have been compromised, inspect these before rebooting." >&2
     fi
@@ -1187,11 +1349,17 @@ cmd_restore() {
     while [ "$idx" -lt 64 ]; do
         marker=$(jsonfilter -i "$tmpdir/manifest.json" -e "@.suspect_markers[$idx]" 2>/dev/null) || marker=""
         [ -n "$marker" ] || break
+        # Archive-controlled text reaching the terminal: only a plain absolute path is printed, so a
+        # newline or an escape sequence in the value cannot forge a line of this tool's output.
+        case "$marker" in
+            /*) case "$marker" in *[!A-Za-z0-9._/-]*) marker="<unprintable entry>" ;; esac ;;
+            *) marker="<unprintable entry>" ;;
+        esac
         markers="${markers:+$markers, }$marker"
         idx=$((idx + 1))
     done
     if [ -n "$markers" ]; then
-        echo "WARNING: this archive was made on a router that showed signs of the 2026-11-20 compromise: $markers" >&2
+        echo "WARNING: this archive was made on a router that had paths the cleanup script in GL.iNet's KVM firmware removes after the 2026-11-20 incident: $markers" >&2
     fi
 
     case "$mode" in
@@ -1226,13 +1394,15 @@ restore_config_tree() {
         return 0
     fi
     local stage hidden other
-    stage=$(mktemp -d)
-    cp -a "$src"/. "$stage/"
+    stage=$(mktemp -d) || return 1
+    cp -a "$src"/. "$stage/" || { rm -rf "$stage"; return 1; }
     hidden=$(strip_hidden_entries "$stage")
     other=$(find "$stage" ! -type f ! -type d -exec rm -f {} \; -exec printf x \; | wc -c)
     [ -n "$countfile" ] && echo "$((hidden)) $((other))" > "$countfile"
-    mkdir -p "$ROOT/etc/config"
-    cp -a "$stage"/. "$ROOT/etc/config/"
+    mkdir -p "$ROOT/etc/config" || { rm -rf "$stage"; return 1; }
+    # A failing cp must stop the restore: under BusyBox ash errexit does not reach into the command
+    # substitution the caller runs this in, so the status is returned explicitly.
+    cp -a "$stage"/. "$ROOT/etc/config/" || { rm -rf "$stage"; return 1; }
     find "$stage" -type f | wc -l
     rm -rf "$stage"
 }
@@ -1241,8 +1411,8 @@ restore_config_tree() {
 # each kind of entry the archive held that was not restored.
 apply_config_tree() {
     local src="$1" countfile restored hidden other
-    countfile=$(mktemp)
-    restored=$(restore_config_tree "$src" "$countfile")
+    countfile=$(mktemp) || die "cannot create a temporary file"
+    restored=$(restore_config_tree "$src" "$countfile") || { rm -f "$countfile"; die "config restore failed — see the line above"; }
     read -r hidden other < "$countfile" || true
     rm -f "$countfile"
     echo "  Restored ${restored} config entries" >&2
@@ -1291,7 +1461,7 @@ restore_portable() {
     # Restore non-UCI persistent files (keep.d)
     if [ -d "$tmpdir/extra" ]; then
         local extra_restored
-        extra_restored=$(restore_extra_files "$tmpdir")
+        extra_restored=$(restore_extra_files "$tmpdir") || die "extra file restore failed — see the line above"
         echo "  Restored ${extra_restored} extra persistent files" >&2
     fi
 
@@ -1556,7 +1726,7 @@ restore_full() {
     # Restore non-UCI persistent files (keep.d)
     if [ -d "$tmpdir/extra" ]; then
         local extra_restored
-        extra_restored=$(restore_extra_files "$tmpdir")
+        extra_restored=$(restore_extra_files "$tmpdir") || die "extra file restore failed — see the line above"
         echo "  Restored ${extra_restored} extra persistent files" >&2
     fi
 
@@ -1576,12 +1746,20 @@ cmd_packages() {
     local tmpdir=$(mktemp -d)
     trap "rm -rf '$tmpdir'" EXIT
 
+    archive_precheck "$archive" "$tmpdir/check"
+    local f
+
     # Extract package data from archive (try prefixed, then flat for backward compat)
     local has_json=0 has_txt=0
     tar -xzf "$archive" -C "$tmpdir" "${ARCHIVE_PREFIX}/packages.json" 2>/dev/null && has_json=1
     [ "$has_json" = "0" ] && tar -xzf "$archive" -C "$tmpdir" packages.json 2>/dev/null && has_json=1
     tar -xzf "$archive" -C "$tmpdir" "${ARCHIVE_PREFIX}/packages.txt" 2>/dev/null && has_txt=1
     [ "$has_txt" = "0" ] && tar -xzf "$archive" -C "$tmpdir" packages.txt 2>/dev/null && has_txt=1
+    [ -L "$tmpdir/${ARCHIVE_PREFIX}" ] && die "Invalid archive: ${ARCHIVE_PREFIX} is a symbolic link"
+    for f in "$tmpdir/${ARCHIVE_PREFIX}/packages.json" "$tmpdir/${ARCHIVE_PREFIX}/packages.txt" \
+             "$tmpdir/packages.json" "$tmpdir/packages.txt"; do
+        [ -L "$f" ] && die "Invalid archive: $(basename "$f") is a symbolic link"
+    done
 
     [ "$has_json" = "0" ] && [ "$has_txt" = "0" ] && \
         die "Archive contains no package information"

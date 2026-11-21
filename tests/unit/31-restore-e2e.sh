@@ -77,16 +77,19 @@ assert_eq "$rc" 0 "cmd_fingerprint exit code"
 assert_contains "$fp" "SHA256:MOCKFINGERPRINT" "fingerprint subcommand"
 
 # The flag-appending rewrite needs an opening line, a line to carry the comma, and the closing
-# brace. A two-line manifest has nothing to carry the comma, so it must pass through untouched
-# rather than come out as "{," followed by the flags.
+# brace. A manifest in any other layout could hide the appended keys, so inspect refuses it, and
+# restore refuses it before anything is written.
 mkdir -p "$T/tiny/gl-portable-backup"
 printf '{\n}\n' > "$T/tiny/gl-portable-backup/manifest.json"
 tar -czf "$T/tiny.tar.gz" -C "$T/tiny" gl-portable-backup
-tinyinsp=$(sh -c '. "$0"; cmd_inspect "$@"' "$BACKEND" "$T/tiny.tar.gz"); rc=$?
-assert_eq "$rc" 0 "cmd_inspect exit code (two-line manifest)"
-assert_eq "$tinyinsp" "$(printf '{\n}')" "two-line manifest passed through untouched"
-printf '%s' "$tinyinsp" | python3 -m json.tool >/dev/null 2>&1 \
-    || { echo "  inspect output is not valid JSON: $tinyinsp"; exit 1; }
+rc=0; tinyinsp=$(sh -c '. "$0"; cmd_inspect "$@"' "$BACKEND" "$T/tiny.tar.gz" 2>"$T/tiny.err") || rc=$?
+assert_eq "$rc" 1 "cmd_inspect exit code (two-line manifest)"
+assert_eq "$tinyinsp" "" "nothing printed for a two-line manifest"
+assert_contains "$(cat "$T/tiny.err")" "Invalid archive: manifest.json is not in the layout this tool writes" "two-line manifest refused"
+BT="$T/btiny"; mkdir -p "$BT/etc/config"; cp "$A/etc/board.json" "$BT/etc/board.json"
+rc=0; GPB_ROOT="$BT" sh -c '. "$0"; cmd_restore "$@"' "$BACKEND" "$T/tiny.tar.gz" >/dev/null 2>"$T/tiny.err" || rc=$?
+assert_eq "$rc" 1 "cmd_restore exit code (two-line manifest)"
+assert_contains "$(cat "$T/tiny.err")" "Invalid archive: manifest.json is not in the layout this tool writes" "restore refuses it too"
 
 # A Clone archive carries neither: host keys and /etc/shadow are stripped at capture time.
 mkdir -p "$T/outc"
