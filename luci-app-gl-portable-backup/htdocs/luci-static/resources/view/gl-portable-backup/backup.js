@@ -116,16 +116,17 @@ return view.extend({
 		}
 
 		return E('details', { 'style': 'margin: 0.5em 0' }, [
-			E('summary', {}, [ _('Contents: %s').format(counts.join(', ')) ]),
+			E('summary', {}, [ _('Contents (as declared by the archive): %s').format(counts.join(', ')) ]),
 			E('div', { 'style': 'max-height: 12em; overflow: auto; font-family: monospace; font-size: 90%; padding: 0.25em 0 0 0.5em' }, body)
 		]);
 	},
 
 	/* Warnings for an archive that may come from a compromised router, from the keys the backend's
-	 * inspect command appends (startup_and_login_files) and the manifest records at backup time
-	 * (suspect_markers). Every path is an archive-controlled string, so each one is passed to E()
-	 * inside an array — LuCI renders a bare string child as HTML. Returns an array of nodes, empty
-	 * when neither list has entries. */
+	 * inspect command appends (startup_and_login_files: files that run at startup, control logins,
+	 * or lie outside /etc) and the manifest records at backup time (suspect_markers). Every path is
+	 * an archive-controlled string, so each one is passed to E() inside an array — LuCI renders a
+	 * bare string child as HTML. A list may not sit inside a <p>, so each block is a div. Returns an
+	 * array of nodes, empty when neither list has entries. */
 	renderCompromiseWarnings: function(manifest) {
 		var nodes = [];
 		var listOf = function(items) {
@@ -137,18 +138,33 @@ return view.extend({
 		var markers = Array.isArray(manifest.suspect_markers) ? manifest.suspect_markers : [];
 
 		if (startup.length > 0) {
-			nodes.push(E('p', { 'class': 'alert-message warning' }, [
-				_('WARNING: this archive restores files that run at startup or control logins. If the source router may have been compromised, inspect these before rebooting:'),
+			nodes.push(E('div', { 'class': 'alert-message warning' }, [
+				_('WARNING: this archive restores files that run at startup or control logins, or that lie outside /etc. If the source router may have been compromised, inspect these before rebooting:'),
 				listOf(startup)
 			]));
 		}
 		if (markers.length > 0) {
-			nodes.push(E('p', { 'class': 'alert-message danger' }, [
-				_('WARNING: this archive was made on a router that showed signs of the 2026-11-20 compromise. A backup of a compromised router can carry the attacker\'s changes back; treat every key and password in it as exposed. Paths found:'),
+			nodes.push(E('div', { 'class': 'alert-message danger' }, [
+				_('WARNING: this archive was made on a router that had paths the cleanup script in GL.iNet\'s KVM firmware removes after the 2026-11-20 incident. GL.iNet has published no such list for routers. A backup of a compromised router can carry the attacker\'s changes back; treat every key and password in it as exposed. Paths:'),
 				listOf(markers)
 			]));
 		}
 		return nodes;
+	},
+
+	/* The backend's WARNING lines from a restore that succeeded — the CLI prints them on stderr, and a
+	 * dialog that only showed stderr on failure would hide them. Rendered as one text child of a
+	 * <pre>; returns null when there are none. */
+	renderRestoreWarnings: function(stderr) {
+		var lines = String(stderr || '').split('\n').filter(function(l) {
+			return l.indexOf('WARNING') !== -1;
+		}).map(function(l) { return l.replace(/^\s+/, ''); });
+		if (lines.length === 0)
+			return null;
+		return E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The restore reported:') ]),
+			E('pre', { 'style': 'white-space: pre-wrap' }, [ lines.join('\n') ])
+		]);
 	},
 
 	handleRestore: function(ev) {
@@ -299,7 +315,7 @@ return view.extend({
 		args.push('/tmp/gl-portable-restore.tar.gz');
 
 		ui.showModal(_('Restoring…'), [
-			E('p', { 'class': 'spinning' }, _('Applying backup configuration. Please wait…'))
+			E('p', { 'class': 'spinning' }, [ _('Applying backup configuration. Please wait…') ])
 		]);
 
 		return fs.exec(BACKEND, args)
@@ -314,8 +330,10 @@ return view.extend({
 					return;
 				}
 
+				var warnings = this.renderRestoreWarnings(res.stderr);
 				ui.showModal(_('Restore complete'), [
 					E('p', _('Configuration has been restored. A reboot is recommended to apply all changes.')),
+					warnings || '',
 					E('div', { 'class': 'right' }, [
 						E('button', {
 							'class': 'btn',
