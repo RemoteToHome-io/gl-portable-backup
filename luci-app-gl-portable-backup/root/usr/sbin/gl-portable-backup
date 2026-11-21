@@ -691,6 +691,57 @@ count_packages_json() {
     echo "${n:-0}"
 }
 
+# ─── Hidden Entries ────────────────────────────────────────────────────────────
+
+# Delete every entry under $1 whose name starts with a dot, at any depth, files and directories
+# alike, and print how many were deleted. -depth visits children before their parent, and find
+# does not follow symlinks, so a hidden symlink is removed as a link, never through it. The count
+# is one byte per deletion, so a name holding a newline cannot inflate it.
+strip_hidden_entries() {
+    find "$1" -depth -name '.*' -exec rm -rf {} \; -exec printf x \; | wc -c
+}
+
+# ─── Compromise Markers ────────────────────────────────────────────────────────
+
+# Paths that the cleanup script inside GL's published KVM firmware treats as signs of the compromise
+# described in GL.iNet Security Notice 2026-11-20. GL has published no indicator list for routers,
+# so this is not one: finding none of these proves nothing about the router. Prints each path that
+# exists under $ROOT, one per line.
+suspect_markers() {
+    local p
+    for p in /etc/config/.gl /etc/glinet/.cache; do
+        if [ -e "$ROOT$p" ] || [ -L "$ROOT$p" ]; then printf '%s\n' "$p"; fi
+    done
+    return 0
+}
+
+# True when $1, a path relative to the archive's extra/ directory (etc/...), is a file that runs at
+# boot or decides who may log in — the places a foothold persists. A directory member (trailing
+# slash) never matches; `*` in a case pattern also matches a slash, so nested files under the
+# listed directories match.
+is_startup_or_login() {
+    case "$1" in
+        */) return 1 ;;
+        etc/rc.local|etc/crontabs/*|etc/dropbear/authorized_keys|etc/shadow|etc/passwd|etc/group|\
+        etc/init.d/*|etc/rc.d/*|etc/hotplug.d/*|etc/uci-defaults/*|etc/sysupgrade.conf|\
+        etc/profile|etc/profile.d/*|etc/dropbear/dropbear_*_host_key) return 0 ;;
+    esac
+    return 1
+}
+
+# Read archive member names (one per line) on stdin; print the startup/login ones as /etc/... paths,
+# sorted and deduplicated. Both the prefixed (gl-portable-backup/extra/...) and the flat
+# (extra/...) layout match; a leading ./ is tolerated.
+startup_login_members() {
+    local member rel
+    while IFS= read -r member; do
+        rel="${member#./}"
+        rel="${rel#"${ARCHIVE_PREFIX}"/}"
+        case "$rel" in extra/etc/*) rel="${rel#extra/}" ;; *) continue ;; esac
+        if is_startup_or_login "$rel"; then printf '/%s\n' "$rel"; fi
+    done | sort -u
+}
+
 # ─── Manifest ──────────────────────────────────────────────────────────────────
 
 write_manifest() {
@@ -700,6 +751,7 @@ write_manifest() {
     local sections="$4"
     local excluded="$5"
     local extra_files="$6"
+    local suspect="${7:-}"
 
     # The two free-text fields are the only ones a user or a hostname can put a quote or a
     # backslash into; unescaped, either ends the JSON string and leaves a manifest jsonfilter
@@ -726,6 +778,7 @@ write_manifest() {
   "sections": [${sections}],
   "excluded_sections": [${excluded}],
   "extra_files": [${extra_files}],
+  "suspect_markers": [${suspect}],
   "notes": "${notes}"
 }
 EOF
@@ -792,6 +845,20 @@ cmd_create() {
 
     echo "Creating ${mode} backup..." >&2
 
+    # Announced before capture and recorded in the manifest; the backup still runs. Nothing is
+    # printed when no marker is found, because their absence is not evidence of a clean router.
+    local markers suspect_json="" m
+    markers=$(suspect_markers)
+    if [ -n "$markers" ]; then
+        echo "WARNING: this router has paths that GL's own cleanup script treats as signs of the 2026-11-20 compromise:" >&2
+        printf '%s\n' "$markers" | while IFS= read -r m; do echo "  $m" >&2; done
+        echo "  A backup of a compromised router can carry the attacker's changes back. Prefer Profile mode, which stores" >&2
+        echo "  no files, and treat every key and password in any backup of this router as exposed." >&2
+        suspect_json=$(printf '%s\n' "$markers" | while IFS= read -r m; do
+            printf '"%s", ' "$(json_escape "$m")"
+        done | sed 's/, $//')
+    fi
+
     # Always capture hardware identity
     capture_hardware_ids "$archdir/hardware.json"
     echo "  Captured hardware identity" >&2
@@ -811,6 +878,11 @@ cmd_create() {
         # opkg leaves *-opkg copies of conffiles it replaced: package-manager bookkeeping, not
         # user config. rm -f is a no-op when the glob matches nothing, so set -e is unaffected.
         rm -f "$archdir"/config/*-opkg
+        # A name starting with a dot hides an entry from a plain ls, which is where a foothold on a
+        # compromised router hides; no UCI config is ever named that way.
+        local hidden_count
+        hidden_count=$(strip_hidden_entries "$archdir/config")
+        echo "  Skipped ${hidden_count} hidden entries under /etc/config" >&2
         echo "  Copied $(ls -A "$archdir/config/" | wc -l) UCI config files" >&2
 
         # Capture packages (enriched JSON + legacy text)
@@ -875,7 +947,7 @@ cmd_create() {
     fi
 
     # Write manifest
-    write_manifest "$archdir/manifest.json" "$mode" "$notes" "$sections" "$excluded" "$extra_files"
+    write_manifest "$archdir/manifest.json" "$mode" "$notes" "$sections" "$excluded" "$extra_files" "$suspect_json"
 
     # Write human-readable backup info and compatibility warning
     cat > "$archdir/backup-info.txt" <<INFOEOF
@@ -954,8 +1026,14 @@ cmd_inspect() {
     if listing_has "$listing" "extra/etc/shadow"; then
         has_shadow=true
     fi
+    # Files that run at boot or control logins, as a JSON array of /etc/... strings. Every name is
+    # archive-controlled, so each goes through json_escape; an empty list is [].
+    local startup_json
+    startup_json=$(printf '%s\n' "$listing" | startup_login_members | while IFS= read -r f; do
+        printf '"%s", ' "$(json_escape "$f")"
+    done | sed 's/, $//')
 
-    # The two flags are appended to the OUTPUT only — the archive's own manifest.json is never
+    # The three keys are appended to the OUTPUT only — the archive's own manifest.json is never
     # rewritten. Built line-wise rather than with a sed replacement carrying a newline, which is
     # not portable: every line but the closing brace, a comma on the new last line, then the
     # flags and the brace. That needs three lines at minimum — an opening line, something to carry
@@ -966,7 +1044,8 @@ cmd_inspect() {
         return 0
     fi
     sed '$d' "$manifest" | sed '$ s/$/,/'
-    printf '  "restores_ssh_host_keys": %s,\n  "restores_root_password": %s\n}\n' "$has_keys" "$has_shadow"
+    printf '  "restores_ssh_host_keys": %s,\n  "restores_root_password": %s,\n  "startup_and_login_files": [%s]\n}\n' \
+        "$has_keys" "$has_shadow" "$startup_json"
 }
 
 # ─── FINGERPRINT ───────────────────────────────────────────────────────────────
@@ -1067,6 +1146,26 @@ cmd_restore() {
     if [ -f "$tmpdir/extra/etc/shadow" ]; then
         echo "WARNING: this archive restores /etc/shadow — the root (admin) password becomes the source unit's password" >&2
     fi
+    # Files that run at boot or control logins are where an attacker's changes persist; a restore
+    # of an archive from a router that may have been compromised brings them back with root's
+    # rights, so they are named before anything is written. Neither warning blocks the restore.
+    local startup
+    startup=$(if [ -d "$tmpdir/extra" ]; then (cd "$tmpdir" && find extra ! -type d); fi | startup_login_members)
+    if [ -n "$startup" ]; then
+        echo "WARNING: this archive restores files that run at startup or control logins:" >&2
+        printf '%s\n' "$startup" | while IFS= read -r f; do echo "  $f" >&2; done
+        echo "  If the source router may have been compromised, inspect these before rebooting." >&2
+    fi
+    local markers="" marker idx=0
+    while [ "$idx" -lt 64 ]; do
+        marker=$(jsonfilter -i "$tmpdir/manifest.json" -e "@.suspect_markers[$idx]" 2>/dev/null) || marker=""
+        [ -n "$marker" ] || break
+        markers="${markers:+$markers, }$marker"
+        idx=$((idx + 1))
+    done
+    if [ -n "$markers" ]; then
+        echo "WARNING: this archive was made on a router that showed signs of the 2026-11-20 compromise: $markers" >&2
+    fi
 
     case "$mode" in
         clone|remote-safe)
@@ -1087,12 +1186,45 @@ cmd_restore() {
     echo "RESTORE_OK"
 }
 
+# Restore an archive's config/ tree onto /etc/config. The archive is attacker-influenced input, so
+# the tree is staged first and only directories and regular files with visible names go across:
+# no hidden entry (at any depth, even from an archive built by an older version or by hand) and no
+# symlink, which could point anywhere outside the tree. Prints the number of regular files restored.
+# With a second argument, writes "<hidden dropped> <non-regular dropped>" to that file.
 restore_config_tree() {
-    local src="$1"
-    [ -d "$src" ] || { echo 0; return 0; }
+    local src="$1" countfile="${2:-}"
+    if [ ! -d "$src" ]; then
+        [ -n "$countfile" ] && echo "0 0" > "$countfile"
+        echo 0
+        return 0
+    fi
+    local stage hidden other
+    stage=$(mktemp -d)
+    cp -a "$src"/. "$stage/"
+    hidden=$(strip_hidden_entries "$stage")
+    other=$(find "$stage" ! -type f ! -type d -exec rm -f {} \; -exec printf x \; | wc -c)
+    [ -n "$countfile" ] && echo "$((hidden)) $((other))" > "$countfile"
     mkdir -p "$ROOT/etc/config"
-    cp -a "$src"/. "$ROOT/etc/config/"
-    find "$src" -type f | wc -l
+    cp -a "$stage"/. "$ROOT/etc/config/"
+    find "$stage" -type f | wc -l
+    rm -rf "$stage"
+}
+
+# restore_config_tree plus what the operator is told: the restored count, and one warning line for
+# each kind of entry the archive held that was not restored.
+apply_config_tree() {
+    local src="$1" countfile restored hidden other
+    countfile=$(mktemp)
+    restored=$(restore_config_tree "$src" "$countfile")
+    read -r hidden other < "$countfile" || true
+    rm -f "$countfile"
+    echo "  Restored ${restored} config entries" >&2
+    if [ "${hidden:-0}" -gt 0 ]; then
+        echo "  WARNING: ${hidden} hidden entries under config/ in this archive were NOT restored" >&2
+    fi
+    if [ "${other:-0}" -gt 0 ]; then
+        echo "  WARNING: ${other} symbolic links or other non-regular entries under config/ in this archive were NOT restored" >&2
+    fi
 }
 
 restore_portable() {
@@ -1127,7 +1259,7 @@ restore_portable() {
     fi
 
     # Apply config files from archive
-    echo "  Restored $(restore_config_tree "$tmpdir/config") config entries" >&2
+    apply_config_tree "$tmpdir/config"
 
     # Restore non-UCI persistent files (keep.d)
     if [ -d "$tmpdir/extra" ]; then
@@ -1392,7 +1524,7 @@ restore_full() {
 
     echo "Applying full backup (hardware IDs will be overwritten)..." >&2
 
-    echo "  Restored $(restore_config_tree "$tmpdir/config") config entries" >&2
+    apply_config_tree "$tmpdir/config"
 
     # Restore non-UCI persistent files (keep.d)
     if [ -d "$tmpdir/extra" ]; then

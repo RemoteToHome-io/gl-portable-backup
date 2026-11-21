@@ -121,6 +121,36 @@ return view.extend({
 		]);
 	},
 
+	/* Warnings for an archive that may come from a compromised router, from the keys the backend's
+	 * inspect command appends (startup_and_login_files) and the manifest records at backup time
+	 * (suspect_markers). Every path is an archive-controlled string, so each one is passed to E()
+	 * inside an array — LuCI renders a bare string child as HTML. Returns an array of nodes, empty
+	 * when neither list has entries. */
+	renderCompromiseWarnings: function(manifest) {
+		var nodes = [];
+		var listOf = function(items) {
+			return E('ul', { 'style': 'margin: 0.25em 0 0 1.2em; padding: 0; font-family: monospace' }, items.map(function(item) {
+				return E('li', {}, [ '' + item ]);
+			}));
+		};
+		var startup = Array.isArray(manifest.startup_and_login_files) ? manifest.startup_and_login_files : [];
+		var markers = Array.isArray(manifest.suspect_markers) ? manifest.suspect_markers : [];
+
+		if (startup.length > 0) {
+			nodes.push(E('p', { 'class': 'alert-message warning' }, [
+				_('WARNING: this archive restores files that run at startup or control logins. If the source router may have been compromised, inspect these before rebooting:'),
+				listOf(startup)
+			]));
+		}
+		if (markers.length > 0) {
+			nodes.push(E('p', { 'class': 'alert-message danger' }, [
+				_('WARNING: this archive was made on a router that showed signs of the 2026-11-20 compromise. A backup of a compromised router can carry the attacker\'s changes back; treat every key and password in it as exposed. Paths found:'),
+				listOf(markers)
+			]));
+		}
+		return nodes;
+	},
+
 	handleRestore: function(ev) {
 		var btn = ev.target;
 		return ui.uploadFile('/tmp/gl-portable-restore.tar.gz', btn)
@@ -225,6 +255,11 @@ return view.extend({
 					bodyItems.push(E('p', { 'class': 'alert-message warning' },
 						_('WARNING: this archive restores /etc/shadow — the root (admin) password becomes the password of the source unit.')));
 				}
+
+				/* Startup/login files and compromise markers — archive-controlled paths */
+				this.renderCompromiseWarnings(manifest).forEach(function(node) {
+					bodyItems.push(node);
+				});
 
 				if (manifest.mode === 'clone' || manifest.mode === 'remote-safe') {
 					bodyItems.push(E('p', { 'class': 'alert-message' },

@@ -72,5 +72,37 @@ var hostile = view.renderContents({ mode: 'full', sections: ['<img src=x onerror
 var li = find(hostile, 'li')[0];
 check(li.children.length === 1 && li.children[0] === '<img src=x onerror=alert(1)>', 'markup-looking entry is a text child');
 
+/* 6. renderCompromiseWarnings: nothing for empty or absent arrays */
+check(Array.isArray(view.renderCompromiseWarnings({})) && view.renderCompromiseWarnings({}).length === 0,
+	'compromise warnings: none for a manifest without the keys');
+check(view.renderCompromiseWarnings({ startup_and_login_files: [], suspect_markers: [] }).length === 0,
+	'compromise warnings: none for empty arrays');
+check(view.renderCompromiseWarnings({ startup_and_login_files: '/etc/rc.local', suspect_markers: 'x' }).length === 0,
+	'compromise warnings: none for non-array values');
+
+/* 7. Startup/login files: one warning paragraph whose paths are text children */
+var sw = view.renderCompromiseWarnings({ startup_and_login_files: ['/etc/rc.local', '/etc/crontabs/root'] });
+check(sw.length === 1 && sw[0].tag === 'p' && sw[0].attrs['class'] === 'alert-message warning',
+	'startup files: one warning paragraph');
+var swLi = find(sw[0], 'li');
+check(swLi.length === 2 && swLi[0].children[0] === '/etc/rc.local' && swLi[1].children[0] === '/etc/crontabs/root',
+	'startup files: each path is an array text child');
+check(/run at startup or control logins/.test(text(sw[0])), 'startup files: fixed sentence present');
+
+/* 8. Suspect markers: one danger paragraph naming them */
+var mw = view.renderCompromiseWarnings({ suspect_markers: ['/etc/config/.gl'] });
+check(mw.length === 1 && mw[0].attrs['class'] === 'alert-message danger', 'markers: one danger paragraph');
+var mwLi = find(mw[0], 'li');
+check(mwLi.length === 1 && mwLi[0].children.length === 1 && mwLi[0].children[0] === '/etc/config/.gl',
+	'markers: path is an array text child');
+
+/* 9. Both present: startup warning first, then markers; markup-looking paths stay text */
+var both = view.renderCompromiseWarnings({ startup_and_login_files: ['<img src=x onerror=alert(1)>'],
+	suspect_markers: ['<script>alert(1)</script>'] });
+check(both.length === 2 && both[0].attrs['class'] === 'alert-message warning' && both[1].attrs['class'] === 'alert-message danger',
+	'both: two paragraphs in order');
+check(find(both[0], 'li')[0].children[0] === '<img src=x onerror=alert(1)>', 'both: markup-looking startup path is a text child');
+check(find(both[1], 'li')[0].children[0] === '<script>alert(1)</script>', 'both: markup-looking marker path is a text child');
+
 console.log(failed === 0 ? 'restore-contents: all checks passed' : ('restore-contents: ' + failed + ' check(s) failed'));
 process.exit(failed === 0 ? 0 : 1);
