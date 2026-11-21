@@ -244,16 +244,16 @@ manifest. What it looks for comes in two tiers.
 | `netstat-replaced` | a `netstat` that is neither a link to `busybox` nor identical to the firmware's `/rom` copy; it is read, never run | GL.iNet staff, via findings.md |
 | `marker-dir` | `/etc/config/.gl` or `/etc/glinet/.cache`, the paths the cleanup in GL.iNet's KVM firmware removes | findings.md |
 | `boot-script-changed` | `/etc/init.d/urandom_seed` or `/lib/upgrade/keep.d/netifd` differs from its `/rom` copy (an unconfirmed report) | findings.md |
-| `nat-loopback-rule` | a firewall rule the remote-shell attack leaves, which stays until a reboot | router-reverse-shell.md |
+| `nat-loopback-rule` | a firewall rule the remote-shell attack leaves, which stays until a reboot | router-reverse-shell.md, findings.md |
 | `conn-attacker-range` | an open TCP connection to 170.39.226.0/24, the range the remote shells connected to | findings.md |
-| `udhcpc-user-changed` | a file under `/etc/udhcpc.user.d/` that differs from its `/rom` copy or has none (an unconfirmed report) | findings.md |
+| `udhcpc-user-changed` | a file under `/etc/udhcpc.user.d/` that differs from its `/rom` copy (an unconfirmed report) | an unconfirmed forum report |
 
 **Cannot-clear findings** (`cannot_clear`): each one stops the check from clearing the router, and
 none of them shows a compromise.
 
 | id | What it means | Source |
 |----|---------------|--------|
-| `mp-ip-mapping-file` | `/etc/mp_ip_mapping_info` written on or after 2026-11-20 while multi-path tunnelling is off: the cloud client's handler that the attack used has run on this router. It is the only trace of that handler known to survive a restart. It was found on a compromised router and on routers with no other trace, and whether an ordinary cloud message also writes it is not known, so on its own it does not show a compromise and does not rule one out | router-reverse-shell.md, findings.md |
+| `mp-ip-mapping-file` | `/etc/mp_ip_mapping_info` written on or after 2026-11-20 while multi-path tunnelling is off: the cloud client's handler that the attack used has run on this router. It is the only trace of that handler known to survive a restart. We have read it on a compromised router and on routers with no other trace (21 November 2026), and whether an ordinary cloud message also writes it is not known, so on its own it does not show a compromise and does not rule one out | router-reverse-shell.md |
 | `restarted-since-incident` | the router has restarted since the attack window opened (about 20:47 UTC on 2026-11-20, from the incident record and open to revision); the remote shell and its traces do not survive a restart | router-reverse-shell.md |
 | `check-incomplete` | the check could not read something it needs: the process command lines under `/proc` (it then reads `ps w`), the process list, or the TCP connection table | — |
 

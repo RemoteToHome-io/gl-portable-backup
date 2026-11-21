@@ -330,10 +330,11 @@ echo hook > "$R/etc/udhcpc.user.d/10-gl"; cp "$R/etc/udhcpc.user.d/10-gl" "$R/ro
 expect_none "udhcpc hook identical to /rom"
 echo changed >> "$R/etc/udhcpc.user.d/10-gl"
 expect_ids "udhcpc hook differs" "udhcpc-user-changed"
-assert_eq "$(detail_of 0)" "/etc/udhcpc.user.d/10-gl differs from the firmware's copy or has none (named in an unconfirmed report)" "udhcpc detail"
+assert_eq "$(detail_of 0)" "/etc/udhcpc.user.d/10-gl differs from the firmware's copy (named in an unconfirmed report)" "udhcpc detail"
 cp "$R/rom/etc/udhcpc.user.d/10-gl" "$R/etc/udhcpc.user.d/10-gl"
+# A hook with no firmware copy is a plugin's own (third-party plugins install hooks here): no entry.
 echo x > "$R/etc/udhcpc.user.d/99-new"
-expect_ids "udhcpc hook with no /rom copy" "udhcpc-user-changed"
+expect_none "udhcpc hook with no /rom copy"
 rm -rf "$R/etc/udhcpc.user.d" "$R/rom/etc/udhcpc.user.d"
 
 # ─── 7f. restarted since the attack window: inconclusive, never none ──────────
@@ -406,7 +407,8 @@ run_check; printf '%s' "$out" | command grep -q -F '"goodcloud_enabled":null' ||
 procs 'crond -i /tmp/.log' '/bin/sh -i'
 printf '%s\n' "$TCPH" '   0: 0108A8C0:D2F4 DBE227AA:A603 01 0 0 0 0 0 1 1' > "$R/proc/net/tcp"
 printf '%s\n' '-A SDWAN_IP_MAPPING -d 127.0.0.1/32 -j DNAT --to-destination 127.0.0.1' > "$T/ipt.txt"; export MOCK_IPTABLES_FILE="$T/ipt.txt"
-: > "$R/etc/mp_ip_mapping_info"; mkdir -p "$R/etc/udhcpc.user.d"; echo x > "$R/etc/udhcpc.user.d/x"
+: > "$R/etc/mp_ip_mapping_info"; mkdir -p "$R/etc/udhcpc.user.d" "$R/rom/etc/udhcpc.user.d"
+echo x > "$R/etc/udhcpc.user.d/x"; echo y > "$R/rom/etc/udhcpc.user.d/x"
 mkfifo "$R/tmp/f"; : > "$R/tmp/.log"; echo x > "$R/bin/netstat"; mkdir -p "$R/etc/config/.gl"
 echo a > "$R/etc/init.d/urandom_seed"; echo b > "$R/rom/etc/init.d/urandom_seed"
 expect_ids "all indicators" "proc-crond-log proc-remote-shell tmp-fifo tmp-log netstat-replaced marker-dir boot-script-changed nat-loopback-rule conn-attacker-range udhcpc-user-changed"

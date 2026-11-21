@@ -986,8 +986,9 @@ suspect_markers() {
 #                        rule the attack leaves (iptables -S and nft list ruleset; a missing tool is
 #                        neither an indicator nor an incomplete check)
 #   conn-attacker-range  a TCP connection to 170.39.226.0/24 in /proc/net/tcp (netstat is not used)
-#   udhcpc-user-changed  a file under /etc/udhcpc.user.d/ that differs from its /rom copy or has none
-#                        (an unconfirmed report)
+#   udhcpc-user-changed  a file under /etc/udhcpc.user.d/ that has a /rom copy and differs from it
+#                        (an unconfirmed report); a file with no /rom copy is a plugin's own hook and
+#                        produces nothing, as for boot-script-changed
 # Cannot clear:
 #   mp-ip-mapping-file   /etc/mp_ip_mapping_info was modified on or after 2026-11-20 00:00 UTC while
 #                        mptun.global.enable is not 1. The cloud client's handler the attack abused
@@ -1165,12 +1166,13 @@ incident_check() {
         # The names are collected first: ic_add must run in this shell, not in a pipeline's subshell.
         t=$(cd "$ROOT/etc/udhcpc.user.d" && find . ! -type d 2>/dev/null | sed 's|^\./||' | sort | while IFS= read -r p; do
             [ -n "$p" ] || continue
-            if [ -f "$ROOT/rom/etc/udhcpc.user.d/$p" ] && cmp -s "$p" "$ROOT/rom/etc/udhcpc.user.d/$p"; then continue; fi
+            [ -f "$ROOT/rom/etc/udhcpc.user.d/$p" ] || continue
+            cmp -s "$p" "$ROOT/rom/etc/udhcpc.user.d/$p" && continue
             printf '%s\n' "$p"
         done) || t=""
         while IFS= read -r p; do
             [ -n "$p" ] || continue
-            ic_add udhcpc-user-changed "/etc/udhcpc.user.d/$(printf '%s' "$p" | tr -cd 'A-Za-z0-9._/-') differs from the firmware's copy or has none (named in an unconfirmed report)"
+            ic_add udhcpc-user-changed "/etc/udhcpc.user.d/$(printf '%s' "$p" | tr -cd 'A-Za-z0-9._/-') differs from the firmware's copy (named in an unconfirmed report)"
         done <<UDHCPC_EOF
 $t
 UDHCPC_EOF
