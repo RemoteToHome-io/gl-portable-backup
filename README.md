@@ -41,7 +41,7 @@ Same as Clone, but additionally excludes remote access configurations so you don
 
 ### Profile
 
-Uses the GL.iNet JSON-RPC API instead of raw UCI files. One JSON file is written per API call (`api/<module>.<method>.json`); a module the firmware doesn't ship is skipped, and a JSON-RPC error reply is logged as a warning rather than stored. On firmware 4.11+, where the `lan` RPC module was replaced by `vlan_subnet`, LAN subnets and DHCP static bindings are captured via `vlan_subnet.get_subnets` / `vlan_subnet.get_static_bind_list`; on earlier firmware, via `lan.get_config_list` / `lan.get_static_bind_list`. Also captured when the firmware ships the module: Wi-Fi, DNS (config + hosts), firewall (rules, port forwards, WAN access), timezone, system info, LED, IPv6, per-port MAC mode, Tailscale, ZeroTier, every VPN client tunnel with its keys and credentials plus the active tunnel name, saved repeater access points (with their passwords), timers, switch-button config, and network mode. Capture makes no model-specific assumptions — the same RPC calls run regardless of router model, gated only by whether the firmware ships each module.
+Uses the GL.iNet JSON-RPC API instead of raw UCI files. One JSON file is written per API call (`api/<module>.<method>.json`); a module the firmware doesn't ship is skipped, and a JSON-RPC error reply is logged as a warning rather than stored. On firmware 4.11+, where the `lan` RPC module was replaced by `vlan_subnet`, LAN subnets and DHCP static bindings are captured via `vlan_subnet.get_subnets` / `vlan_subnet.get_static_bind_list`; on earlier firmware, via `lan.get_config_list` / `lan.get_static_bind_list`. Also captured when the firmware ships the module: Wi-Fi, DNS (config + hosts), firewall (rules, port forwards, WAN access), timezone, LED, IPv6, per-port MAC mode, Tailscale, ZeroTier, every VPN client tunnel with its keys and credentials plus the active tunnel name, saved repeater access points (with their passwords), timers, switch-button config, and network mode. Capture makes no model-specific assumptions — the same RPC calls run regardless of router model, gated only by whether the firmware ships each module.
 
 **What a Profile archive contains, and what it does not.** A Profile archive is one user's
 complete portable setup, and that includes the secrets: the Wi-Fi password of every SSID,
@@ -49,9 +49,13 @@ every VPN client tunnel's private key, pre-shared key, and OpenVPN credentials, 
 passwords of access points this router has joined — all in cleartext. Handle it exactly like a
 Full backup: it is a secret, not a settings file. It leaves out the identity a different device
 must not inherit: no GoodCloud binding (`cloud.get_config` is deliberately not captured), no
-SSH host keys, no `authorized_keys`, and no root password. Two device-specific items are still
-present, for reference: `hardware.json` (the source's MAC addresses and DDNS identity) and the
-`system.get_info` reply (serial number and WAN MAC).
+SSH host keys, no `authorized_keys`, and no root password. It also carries no device identity
+of the source: no `hardware.json`, no `system.get_info` reply (serial number and WAN MAC), and
+the stored replies have the radios' own addresses (`bssid` in `wifi.get_config`) and each port's
+factory address (`defmacaddr` in `cable.get_ports_config`) removed. What remains are addresses
+the user configured: the MAC-mode settings (`macaddr` in `cable.get_ports_config` and
+`repeater.get_saved_ap_list`, such as a cloned or randomised WAN or repeater MAC) and the DHCP
+reservations, which name the MAC addresses of client devices.
 
 **Restore is currently limited** to timezone, DNS mode/force_dns, DNS hosts, LED on/off, and DHCP static bindings — and the static-binding restore only runs on firmware that still exposes the `lan` API (on 4.11+ it prints a skip notice, since the equivalent `vlan_subnet` write hasn't been implemented yet). Wi-Fi and LAN restore are placeholders that print a message and make no changes. Full cross-model restore (Profile restore v2) is planned, not yet shipped.
 
@@ -102,7 +106,7 @@ All contents are nested under a `gl-portable-backup/` prefix directory:
 gl-portable-backup/
 ├── manifest.json       Metadata: format_version (currently 4), mode, model, firmware, hostname, sections
 ├── backup-info.txt     Human-readable summary, compatibility warning, and the Skipped line
-├── hardware.json       Source device hardware IDs (reference only)
+├── hardware.json       Source device hardware IDs (reference only; not written in profile mode)
 ├── config/             UCI config files (clone, remote-safe, full modes)
 ├── extra/              Non-UCI persistent files (see below)
 │   └── etc/
@@ -244,9 +248,9 @@ What each mode carries, among the files that matter here:
 | SSH host keys | yes | no | no | no |
 | Files outside `/etc` | only with `--include-plugins` | only with `--include-plugins` | only with `--include-plugins` | no |
 
-Profile mode copies no files from the router at all: it stores the replies of the router's own API,
-plus the `hardware.json` reference that every mode writes (MAC addresses and the contents of
-`/etc/board.json`), which no restore writes back.
+Profile mode copies no files from the router at all: it stores the replies of the router's own API
+and writes no `hardware.json`. The other modes write that reference file (MAC addresses and the
+contents of `/etc/board.json`), which no restore writes back.
 Every file mode carries only what OpenWrt's sysupgrade would preserve (keep.d declarations,
 `/etc/sysupgrade.conf`, changed conffiles), and every one of them, `authorized_keys` and the host
 keys included, is skipped when it is identical to the firmware's `/rom` copy. The dot-name rule

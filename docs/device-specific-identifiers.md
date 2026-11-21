@@ -92,8 +92,8 @@ These are read-only API responses — the API does not set MACs.
 - It does NOT appear in `/etc/config/` — no UCI path to strip.
 - It is NOT captured in `sysupgrade -b` backups.
 - **Clone/Remote-Safe:** nothing to strip from `/etc/config/` — the serial number was never
-  there. **Profile:** captured — the stored `system.get_info` reply includes `sn`, `sn_bak`, and
-  the WAN `mac` (see §1.4).
+  there. **Profile:** not captured — `system.get_info` (`sn`, `sn_bak`, and the WAN `mac`, see
+  §1.4) is not among the getters, so the archive carries no serial number.
 
 ---
 
@@ -389,8 +389,8 @@ network.wan.macaddr  = "94:83:c4:6b:0d:80"
 **Notes:**
 - `board.json` is read-only — it is never modified by backups or config changes.
 - It is the source of truth for MAC re-injection during portable restore.
-- Our backup tool captures `board.json` in `hardware.json` for reference but
-  never overwrites the target's `board.json`.
+- Our backup tool captures `board.json` in `hardware.json` for reference (in Full, Clone and
+  Remote-Safe; Profile mode writes no `hardware.json`) but never overwrites the target's `board.json`.
 
 ---
 
@@ -446,7 +446,7 @@ network.wan.macaddr  = "94:83:c4:6b:0d:80"
 ### NOT in `/etc/config/` (not captured by any mode)
 
 These device-specific items live outside the UCI config directory. `board.json`'s values are
-captured for reference in `hardware.json` (see §13), but the file itself is never restored;
+captured for reference in `hardware.json` (Full, Clone and Remote-Safe; see §13), but the file itself is never restored;
 nothing else in this table is in our archives at all:
 
 | Item | Location | Regeneration |
@@ -454,9 +454,8 @@ nothing else in this table is in our archives at all:
 | `board.json` | `/etc/board.json` | N/A — factory-set |
 | ZeroTier node identity (files) | `/var/lib/zerotier-one/identity.*` | Auto-generated if missing |
 
-Serial number is not in `/etc/config/` either, but it is left out of this table because Profile
-mode does capture it, via the stored `system.get_info` reply (`sn`, `sn_bak`, plus the WAN
-`mac`) — see §2.
+Serial number is not in `/etc/config/` either, and no mode captures it: Profile does not store the
+`system.get_info` reply (`sn`, `sn_bak`, plus the WAN `mac`) — see §2.
 
 ### Captured, But Only in Some Modes
 
