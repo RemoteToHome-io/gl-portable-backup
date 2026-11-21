@@ -313,6 +313,22 @@ return view.extend({
 				return fs.remove('/tmp/gl-portable-restore.tar.gz').finally(ui.hideModal);
 			})
 		}, [ _('Cancel') ]);
+		var ic = (manifest && manifest.incident_check && typeof manifest.incident_check === 'object') ? manifest.incident_check : null;
+		if (manifest && manifest.restore_refused !== true && ic && ic.result === 'inconclusive') {
+			var ids = Array.isArray(ic.cannot_clear) ? ic.cannot_clear.map(function(x) { return '' + x; }) : [];
+			return [
+				E('div', { 'class': 'alert-message warning' }, [
+					_('WARNING: this archive was made on a router that could not be cleared (%s). Restore its keys and passwords only if you accept that.').format(ids.length ? ids.join(', ') : _('no reason recorded'))
+				]),
+				E('div', { 'class': 'right' }, [
+					cancel, ' ',
+					E('button', {
+						'class': 'btn cbi-button-action important',
+						'click': ui.createHandlerFn(this, 'handleRestoreConfirm', btn)
+					}, [ _('Restore') ])
+				])
+			];
+		}
 		if (manifest && manifest.restore_refused === true) {
 			return [
 				E('div', { 'class': 'alert-message danger' }, [ _(REFUSAL_TEXT) ]),
@@ -803,8 +819,16 @@ return view.extend({
 			]);
 		}
 		if (result === 'inconclusive') {
+			/* No strong indicator, but something stops the check from clearing the router: a restart
+			 * since the attack window, a trace that proves nothing either way, or something it could not
+			 * read. Each reason is backend text, so each is an array text child. */
+			var reasons = (Array.isArray(check.cannot_clear) ? check.cannot_clear : []).map(function(c) {
+				return E('li', {}, [ '' + ((c && c.detail) || (c && c.id) || '') ]);
+			});
 			return E('div', { 'class': 'alert-message warning' }, [
-				E('p', {}, [ _('No known indicator was found, but this router has restarted since the attack window (from about 20:48 UTC on 2026-11-20). The remote shell and its traces do not survive a restart, so this check cannot clear it.') ]),
+				E('p', {}, [ _('No strong indicator was found, but this router cannot be cleared:') ]),
+				E('ul', { 'style': 'margin: 0.25em 0 0.5em 1.2em; padding: 0' }, reasons),
+				E('p', {}, [ _('If you have any other reason to suspect it, treat it as compromised.') ]),
 				gc,
 				E('p', {}, [ link ])
 			]);

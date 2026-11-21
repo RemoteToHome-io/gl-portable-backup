@@ -83,12 +83,20 @@ check(linkOk(none), 'none: the link');
 var noneGc = view.renderIncidentBanner({ result: 'none', indicators: [], goodcloud_enabled: true });
 check(/GoodCloud is switched on on this router\./.test(text(noneGc)), 'none: GoodCloud line when it is on');
 
-/* 3. inconclusive: warning with the backend's sentence */
-var inc = view.renderIncidentBanner({ result: 'inconclusive', indicators: [], rebooted_since_incident: true });
+/* 3. inconclusive: a warning listing why the router cannot be cleared, each reason a text child */
+var MAP = '/etc/mp_ip_mapping_info was written on or after 2026-11-20 although multi-path tunnelling is off: the cloud client\'s handler that the attack used has run on this router. This is also the only trace of it that survives a restart.';
+var inc = view.renderIncidentBanner({ result: 'inconclusive', indicators: [], cannot_clear: [
+	{ id: 'mp-ip-mapping-file', detail: MAP },
+	{ id: 'restarted-since-incident', detail: 'the router has restarted since the attack window' },
+	{ id: 'x', detail: hostile } ] });
 check(inc.attrs['class'] === 'alert-message warning', 'inconclusive: warning alert');
-check(/^No known indicator was found, but this router has restarted since the attack window \(from about 20:48 UTC on 2026-11-20\)\. The remote shell and its traces do not survive a restart, so this check cannot clear it\./.test(text(inc)),
-	'inconclusive: text');
+check(/^No strong indicator was found, but this router cannot be cleared:/.test(text(inc)), 'inconclusive: heading');
+var incLi = find(inc, byTag('li'));
+check(incLi.length === 3 && incLi[0].children.length === 1 && incLi[0].children[0] === MAP
+	&& incLi[2].children[0] === hostile, 'inconclusive: each cannot-clear detail is an array text child');
+check(/If you have any other reason to suspect it, treat it as compromised\./.test(text(inc)), 'inconclusive: the closing sentence');
 check(linkOk(inc), 'inconclusive: the link');
+check(find(view.renderIncidentBanner({ result: 'inconclusive', indicators: [] }), byTag('li')).length === 0, 'inconclusive without reasons: an empty list, no crash');
 
 /* 4. unknown */
 var unk = view.renderIncidentBanner({ result: 'unknown' });
@@ -135,6 +143,13 @@ check(dz.length === 1 && /This archive was made on a router that showed indicato
 var allowed = view.renderRestoreActions({ restore_refused: false }, null);
 check(buttons(allowed).join('|') === 'Cancel|Restore', 'not refused: Cancel and Restore');
 check(buttons(view.renderRestoreActions({}, null)).join('|') === 'Cancel|Restore', 'older manifest without the key: Restore offered');
+var cc = view.renderRestoreActions({ restore_refused: false, incident_check: { result: 'inconclusive', cannot_clear: ['mp-ip-mapping-file', hostile] } }, null);
+check(buttons(cc).join('|') === 'Cancel|Restore', 'inconclusive archive: Restore offered');
+var ccw = find(cc, function(n) { return n.attrs && n.attrs['class'] === 'alert-message warning'; });
+check(ccw.length === 1 && ccw[0].children.length === 1 && ccw[0].children[0] === 'WARNING: this archive was made on a router that could not be cleared (mp-ip-mapping-file, ' + hostile + '). Restore its keys and passwords only if you accept that.',
+	'inconclusive archive: the warning, as one text child');
+check(find(view.renderRestoreActions({ restore_refused: false, incident_check: { result: 'none' } }, null), function(n) { return n.attrs && /alert-message/.test(n.attrs['class'] || ''); }).length === 0,
+	'none archive: no warning');
 
 console.log(failed === 0 ? 'incident-banner: all checks passed' : ('incident-banner: ' + failed + ' check(s) failed'));
 process.exit(failed === 0 ? 0 : 1);
