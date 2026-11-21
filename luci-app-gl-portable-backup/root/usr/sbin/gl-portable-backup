@@ -2091,12 +2091,14 @@ cmd_install_package() {
 UPD_REPO="RemoteToHome-io/gl-portable-backup"
 UPD_API_URL="${GPB_UPDATE_API_URL:-https://api.github.com/repos/$UPD_REPO/releases/latest}"
 UPD_BASE_URL="${GPB_UPDATE_BASE_URL:-https://github.com/$UPD_REPO/releases/download}"
-# Two fixed state paths — the status file update-status reads and the lock update-start probes. Both are
-# refused when anything but a regular file sits there, and the status file is replaced atomically, so a
-# path planted under /tmp by a local process is never followed by root.
-UPD_STATE="${GPB_UPDATE_STATE:-/tmp/gl-portable-backup-update}"
-UPD_STATUS="$UPD_STATE.status"
-UPD_LOCK="$UPD_STATE.lock"
+# The state directory holds the two fixed files — the status file update-status reads and the lock
+# update-start probes. The directory is created mode 700 and used only while it is a real directory of
+# mode 700 owned by this user (upd_state_dir_ok), so no other local process can plant or swap a path in
+# it between a check and an open. Inside it, both files are still refused when anything but a regular
+# file sits there, and the status file is replaced atomically.
+UPD_STATE="${GPB_UPDATE_STATE:-/tmp/gl-portable-backup-update.d}"
+UPD_STATUS="$UPD_STATE/status"
+UPD_LOCK="$UPD_STATE/lock"
 # The per-run working directory (staged worker copy, downloads, logs) is a fresh mktemp directory that
 # update-start hands to the worker; update-install creates its own when run directly.
 UPD_DIR="${GPB_UPDATE_DIR:-}"
@@ -2184,10 +2186,26 @@ upd_reply() {   # status message
     printf '{"status":"%s","message":"%s"}\n' "$1" "$(json_escape "$2")"
 }
 
-# The two fixed paths must be absent or regular files: a symlink planted there by a local process would
-# otherwise be followed by root.
+# The state directory: created with mode 700 when absent (pass "nocreate" to only check), then accepted
+# only as a directory that is not a symlink, whose mode is exactly drwx------ and whose numeric owner is
+# this user (`ls -ldn`: mode, link count, uid, gid — the form read on the router's BusyBox).
+upd_state_dir_ok() {   # [nocreate]
+    local line
+    if [ ! -e "$UPD_STATE" ] && [ ! -L "$UPD_STATE" ]; then
+        [ "${1:-}" = nocreate ] && return 1
+        mkdir -m 700 "$UPD_STATE" 2>/dev/null || true    # an existing path is judged by the checks below
+    fi
+    [ -d "$UPD_STATE" ] && [ ! -L "$UPD_STATE" ] || return 1
+    line=$(ls -ldn "$UPD_STATE" 2>/dev/null) || return 1
+    set -- $line
+    [ "$1" = "drwx------" ] && [ "$3" = "$(id -u)" ]
+}
+
+# The state directory must pass upd_state_dir_ok and the two fixed paths in it must be absent or
+# regular files: a symlink planted there would otherwise be followed by root.
 upd_state_paths_ok() {
     local p
+    upd_state_dir_ok || return 1
     for p in "$UPD_STATUS" "$UPD_LOCK"; do
         if [ -L "$p" ] || { [ -e "$p" ] && [ ! -f "$p" ]; }; then return 1; fi
     done
@@ -2198,19 +2216,22 @@ upd_state_paths_ok() {
 # symlink at the path is replaced rather than followed. Only printable ASCII reaches the JSON string.
 upd_set_status() {   # status message
     local tmp
+    upd_state_paths_ok || return 1
     tmp=$(mktemp "$UPD_STATUS.XXXXXX") || return 1
     printf '{"status":"%s","message":"%s"}\n' "$1" "$(json_escape "$(printf '%s' "$2" | tr -cd ' -~')")" > "$tmp" \
         && mv -f "$tmp" "$UPD_STATUS"
 }
 
 # Guaranteed terminal state: a worker that dies mid-step (set -e, a killed curl) would otherwise leave
-# "running" behind and the dialog would spin forever. The working directory goes; the status file stays
-# for the UI to read.
+# "running" behind and the dialog would spin forever. The working directory goes first, so a status
+# write that fails here (under set -e, inside the trap) can never leave it behind; the status file
+# stays for the UI to read.
 upd_cleanup() {
-    if grep -q '"status":"running"' "$UPD_STATUS" 2>/dev/null; then
-        upd_set_status error "Interrupted during: ${UPD_STEP:-start} - check the network and retry"
-    fi
     [ -n "$UPD_DIR" ] && rm -rf "$UPD_DIR"
+    if grep -q '"status":"running"' "$UPD_STATUS" 2>/dev/null; then
+        upd_set_status error "Interrupted during: ${UPD_STEP:-start} - check the network and retry" || true
+    fi
+    return 0
 }
 
 cmd_update_start() {
@@ -2220,7 +2241,7 @@ cmd_update_start() {
         --fetch-only) fetch_only="--fetch-only" ;;
         *) upd_reply error "Unknown option: $1"; return 0 ;;
     esac
-    upd_state_paths_ok || { upd_reply error "Unexpected file at $UPD_STATE.status or $UPD_STATE.lock - remove it and retry"; return 0; }
+    upd_state_paths_ok || { upd_reply error "Unexpected file at $UPD_STATE (a directory of mode 700 owned by this user, holding regular files status and lock, is required) - remove it and retry"; return 0; }
     # Probe the lock without keeping it: rc 1 means a worker holds it; anything else is a broken lock
     # mechanism and is reported as such rather than mistaken for a running update.
     rc=0; err=$( ( exec 9>>"$UPD_LOCK"; flock -n 9 ) 2>&1 ) || rc=$?
@@ -2243,7 +2264,7 @@ cmd_update_install() {
         --fetch-only) fetch_only=1 ;;
         *) die "update-install: unknown option: $1" ;;
     esac
-    upd_state_paths_ok || die "update-install: unexpected file at $UPD_STATE.status or $UPD_STATE.lock"
+    upd_state_paths_ok || die "update-install: unexpected file at $UPD_STATE (a directory of mode 700 owned by this user, holding regular files status and lock, is required)"
     if [ -z "$UPD_DIR" ]; then
         UPD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gl-portable-backup-update.XXXXXX") || die "update-install: cannot create a working directory"
     fi
@@ -2296,7 +2317,12 @@ cmd_update_install() {
 }
 
 cmd_update_status() {
-    if [ -L "$UPD_STATUS" ] || { [ -e "$UPD_STATUS" ] && [ ! -f "$UPD_STATUS" ]; }; then
+    # An absent state directory means no update has run: idle, and nothing is created.
+    if [ ! -e "$UPD_STATE" ] && [ ! -L "$UPD_STATE" ]; then
+        echo '{"status":"idle","message":""}'
+    elif ! upd_state_dir_ok nocreate; then
+        upd_reply error "Unexpected file at $UPD_STATE"
+    elif [ -L "$UPD_STATUS" ] || { [ -e "$UPD_STATUS" ] && [ ! -f "$UPD_STATUS" ]; }; then
         upd_reply error "Unexpected file at $UPD_STATUS"
     elif [ -f "$UPD_STATUS" ]; then
         cat "$UPD_STATUS"

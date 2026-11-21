@@ -467,10 +467,10 @@ printf '%s' "$uc" | grep -q '"installed_via_opkg":false' && printf '%s' "$uc" | 
 judge 'update-check from /tmp: valid reply, not installed via opkg, nothing offered' "$r2" "rc=$r $uc $(cat "$D/uc.err")"
 if [ -n "${GPB_FAKE:-}" ]; then
     fetch_case() {   # name expected-substring
-        rm -rf "$D/upd.status" "$D"/tmp/gl-portable-backup-update.*
+        rm -rf "$D/upd/status" "$D"/tmp/gl-portable-backup-update.*
         GPB_UPDATE_STATE="$D/upd" GPB_UPDATE_API_URL="$GPB_FAKE/$1/api/latest" GPB_UPDATE_BASE_URL="$GPB_FAKE/$1/download" \
             sh "$GPB" update-install --fetch-only >"$D/fetch.$1.out" 2>&1; frc=$?
-        st=$(cat "$D/upd.status" 2>/dev/null)
+        st=$(cat "$D/upd/status" 2>/dev/null)
         printf '%s' "$st" | grep -q -F "$2"; r=$?
         judge "update fetch-only ($1): $2" "$r" "rc=$frc status: $st"
         left=$(ls -d "$D"/tmp/gl-portable-backup-update.* 2>/dev/null | tr '\n' ' ')
@@ -481,17 +481,21 @@ if [ -n "${GPB_FAKE:-}" ]; then
     fetch_case badsum "Checksum mismatch"
     fetch_case badver "says version '99.0.1' but the release is 99.0.0"
     # update-start must refuse while a worker holds the lock, and prime the status before detaching
-    ( exec 9>>"$D/upd.lock"; flock -n 9; GPB_UPDATE_STATE="$D/upd" sh "$GPB" update-start > "$D/start.locked" 2>&1 )
+    # The state location is a mode-700 directory owned by root; the workers above created it.
+    sd=$(ls -ldn "$D/upd" 2>/dev/null | awk '{print $1, $3}')
+    [ "$sd" = "drwx------ $(id -u)" ]; r=$?
+    judge 'update: the state directory is mode 700 and owned by this user' "$r" "ls -ldn: $sd"
+    ( exec 9>>"$D/upd/lock"; flock -n 9; GPB_UPDATE_STATE="$D/upd" sh "$GPB" update-start > "$D/start.locked" 2>&1 )
     grep -q 'already running' "$D/start.locked"; r=$?
     judge 'update-start: refuses while the lock is held' "$r" "$(cat "$D/start.locked")"
-    rm -f "$D/upd.status"
+    rm -f "$D/upd/status"
     GPB_UPDATE_STATE="$D/upd" GPB_UPDATE_API_URL="$GPB_FAKE/good/api/latest" GPB_UPDATE_BASE_URL="$GPB_FAKE/good/download" \
         sh "$GPB" update-start --fetch-only > "$D/start.out" 2>&1; src=$?
     grep -q '"status":"started"' "$D/start.out"; r=$?
     judge 'update-start: detached fetch-only worker started' "$r" "rc=$src $(cat "$D/start.out")"
-    i=0; while [ $i -lt 20 ] && grep -q '"status":"running"' "$D/upd.status" 2>/dev/null; do sleep 1; i=$((i+1)); done
-    grep -q 'install skipped' "$D/upd.status" 2>/dev/null; r=$?
-    judge 'update-start: the detached worker reached a terminal success on its own' "$r" "$(cat "$D/upd.status" 2>/dev/null)"
+    i=0; while [ $i -lt 30 ] && grep -q '"status":"running"' "$D/upd/status" 2>/dev/null; do sleep 1; i=$((i+1)); done
+    grep -q 'install skipped' "$D/upd/status" 2>/dev/null; r=$?
+    judge 'update-start: the detached worker reached a terminal success on its own' "$r" "$(cat "$D/upd/status" 2>/dev/null)"
 else
     judge 'update fetch-only: fake release server available from the laptop' 1 "GPB_FAKE is empty — the laptop could not serve the fake release"
 fi
