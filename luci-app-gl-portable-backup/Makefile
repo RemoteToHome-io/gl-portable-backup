@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=GL Portable Backup
 LUCI_DESCRIPTION:=Portable configuration backup and restore for GL.iNet routers
-PKG_VERSION:=1.1.0
+PKG_VERSION:=1.1.1
 LUCI_PKGARCH:=all
 PKGARCH:=all
 

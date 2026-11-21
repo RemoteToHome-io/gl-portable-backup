@@ -14,7 +14,7 @@
 
 set -e
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 FORMAT_VERSION=4
 TOOL_NAME="gl-portable-backup"
 ARCHIVE_PREFIX="gl-portable-backup"
