@@ -21,6 +21,14 @@ ps_lines() {   # LINE... — the process list the ps mock prints, after a BusyBo
     export MOCK_PS_FILE="$PSF"
 }
 ps_default() { unset MOCK_PS_FILE MOCK_PS_RC; }
+cc_ids() {   # the cannot_clear ids of $out, space-separated, in order
+    local i=0 id acc=""
+    while id=$(printf '%s' "$out" | jsonfilter -e "@.cannot_clear[$i].id" 2>/dev/null); do
+        acc="${acc:+$acc }$id"; i=$((i + 1))
+    done
+    printf '%s' "$acc"
+}
+cc_detail_of() { printf '%s' "$out" | jsonfilter -e "@.cannot_clear[$1].detail"; }
 ids() {   # the indicator ids of $out, space-separated, in order
     local i=0 id acc=""
     while id=$(printf '%s' "$out" | jsonfilter -e "@.indicators[$i].id" 2>/dev/null); do
@@ -110,40 +118,73 @@ for line in '/usr/sbin/crond -f -c /etc/crontabs -l 5' \
     expect_none "near miss [$line]"
 done
 
-# This tool's own process, its parent (a person's `ash -c ...` over SSH, which can quote the patterns)
-# and any process running this tool are left out; any other line still counts.
+# Only this tool's own process and its ancestors are left out. A process that merely names this tool
+# is matched like any other: otherwise an attacker's process could hide by carrying the name.
 procs 'ash -c gl-portable-backup check; ps w | grep -E "crond -i|mkfifo|nc [0-9]|sh -i"'
-expect_none "a process running this tool"
+expect_ids "a process naming this tool, not an ancestor" "proc-crond-log proc-remote-shell"
+procs 'sh -c echo gl-portable-backup >/dev/null; mkfifo /tmp/f; cat /tmp/f | /bin/sh -i 2>&1'
+expect_ids "an attacker's process carrying this tool's name" "proc-remote-shell"
+
+# A synthetic chain of three ancestors above this shell: its parent, a grandparent and a
+# great-grandparent, each with a matching command line and a stat whose command name holds spaces
+# and parentheses. None of them is matched; a sibling with the same command line is.
 procs
 QUOTE='ash -c ps w | grep -E "crond -i|mkfifo|sh -i"; true'
-rc=0; out=$(Q="$QUOTE" sh -c 'mkdir -p "$GPB_ROOT/proc/$$" "$GPB_ROOT/proc/$PPID"
-    printf "/bin/sh -i\000" > "$GPB_ROOT/proc/$$/cmdline"
-    printf "%s\000" "$Q" > "$GPB_ROOT/proc/$PPID/cmdline"
+rc=0; out=$(Q="$QUOTE" sh -c 'P=$GPB_ROOT/proc
+    mkdir -p "$P/$$" "$P/$PPID" "$P/7001" "$P/7002"
+    printf "/bin/sh -i\000" > "$P/$$/cmdline"
+    printf "%s\000" "$Q" > "$P/$PPID/cmdline"
+    printf "%s (ash -c (x) y) S 7001 1 1 0 -1\n" "$PPID" > "$P/$PPID/stat"
+    printf "crond\000-i\000/tmp/.log\000" > "$P/7001/cmdline"
+    printf "7001 (a) b (c) S 7002 1 1 0 -1\n" > "$P/7001/stat"
+    printf "mkfifo\000/tmp/f\000" > "$P/7002/cmdline"
+    printf "7002 (dropbear) S 0 1 1 0 -1\n" > "$P/7002/stat"
     . "$0"; cmd_check' "$BACKEND" 2>/dev/null) || rc=$?
-assert_eq "$rc" 0 "own and parent processes left out"
+assert_eq "$rc" 0 "own process and three ancestors left out (exit code)"
+assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.result')" "none" "own process and three ancestors left out"
 rm -rf "$R"/proc/[0-9]*; procs "$QUOTE"
-expect_ids "a quoting shell that is not the parent" "proc-crond-log proc-remote-shell"
+expect_ids "a quoting shell that is not an ancestor" "proc-crond-log proc-remote-shell"
+# The walk itself: the chain read through command names with spaces and parentheses.
+procs
+anc=$(sh -c 'P=$GPB_ROOT/proc; mkdir -p "$P/$PPID" "$P/7001" "$P/7002"
+    printf "%s ((x)) y) S 7001 1\n" "$PPID" > "$P/$PPID/stat"
+    printf "7001 (a b) S 7002 1\n" > "$P/7001/stat"
+    printf "7002 (c) R 0 1\n" > "$P/7002/stat"
+    . "$0"; printf "%s|%s|%s" "$(ic_ancestors)" "$$" "$PPID"' "$BACKEND")
+self=$(printf '%s' "$anc" | cut -d'|' -f2); par=$(printf '%s' "$anc" | cut -d'|' -f3)
+assert_eq "$(printf '%s' "$anc" | cut -d'|' -f1)" " $self $par 7001 7002 " "ancestor walk through odd command names"
+procs
 
-# ─── 3. the ps fallback, and a check that cannot read processes ───────────────
+# ─── 3. what the check cannot read makes it inconclusive, never none ──────────
+expect_inconclusive() {   # WHAT CANNOT-CLEAR-IDS
+    run_check
+    assert_eq "$rc" 0 "$1: exit code"
+    assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.result')" "inconclusive" "$1: result"
+    assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.indicators')" "[]" "$1: no strong indicator"
+    assert_eq "$(cc_ids)" "$2" "$1: cannot_clear ids"
+}
 rm -rf "$R"/proc/[0-9]*
 ps_default
-expect_ids "no cmdline under /proc: ps fallback" "check-incomplete"
-assert_contains "$(detail_of 0)" "the process list from ps was used" "fallback detail"
+expect_inconclusive "no cmdline under /proc: ps fallback" "check-incomplete"
+assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.note')" "No strong indicator was found, but this router cannot be cleared: the check could not read the process command lines under /proc, and ps w, read instead, can hide the end of a long command line. If you have any other reason to suspect it, treat it as compromised." "inconclusive note (incomplete)"
 ps_lines ' 2001 root      1072 S    crond -i /tmp/.log' '@PARENT@ root      1072 S    ash -c sh -i'
 rc=0; out=$(sh -c 'export MOCK_PS_PARENT=$PPID; . "$0"; cmd_check' "$BACKEND" 2>/dev/null) || rc=$?
-assert_eq "$rc" 3 "fallback exit code"
-assert_eq "$(ids)" "check-incomplete proc-crond-log" "the fallback still matches, parent left out"
+assert_eq "$rc" 3 "fallback exit code: a real indicator wins"
+assert_eq "$(ids)" "proc-crond-log" "the fallback still matches, parent left out"
+assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.result')" "indicators" "indicators win over incomplete"
 ps_default; export MOCK_PS_RC=1
-expect_ids "ps fails too" "check-incomplete check-incomplete"
+expect_inconclusive "ps fails too" "check-incomplete check-incomplete"
+assert_contains "$(printf '%s' "$out" | jsonfilter -e '@.note')" "can hide the end of a long command line; the check could not read the process list from ps either." "both details, joined with a semicolon"
 unset MOCK_PS_RC
 GPB_TEST_PS="$T/no-such-ps"; export GPB_TEST_PS
-expect_ids "ps absent" "check-incomplete check-incomplete"
+expect_inconclusive "ps absent" "check-incomplete check-incomplete"
 GPB_TEST_PS="$HERE/tests/mocks/ps"; export GPB_TEST_PS
 procs
 mv "$R/proc/net/tcp" "$R/proc/net/tcp.off"
-expect_ids "no TCP table" "check-incomplete"
+expect_inconclusive "no TCP table" "check-incomplete"
 mv "$R/proc/net/tcp.off" "$R/proc/net/tcp"
 expect_none "processes and TCP table back"
+printf '%s' "$out" | command grep -q -F '"cannot_clear":[]' || { echo "  cannot_clear not an empty list: $out"; exit 1; }
 
 # ─── 4. /tmp ──────────────────────────────────────────────────────────────────
 mkdir -p "$R/tmp"
@@ -251,10 +292,16 @@ unset MOCK_IPTABLES_FILE MOCK_NFT_FILE
 # ─── 7c. /etc/mp_ip_mapping_info ──────────────────────────────────────────────
 F="$R/etc/mp_ip_mapping_info"
 : > "$F"; TZ=UTC0 touch -d '2026-11-20 22:15:18' "$F"
-expect_ids "mapping file written in the window" "mp-ip-mapping-file"
-assert_eq "$(detail_of 0)" "/etc/mp_ip_mapping_info was written on or after 2026-11-20 although multi-path tunnelling is off (the only trace that survives a reboot)" "mapping detail"
+# Cannot clear, not strong: the file shows the abused handler ran, not that the router was compromised.
+expect_inconclusive "mapping file written in the window" "mp-ip-mapping-file"
+assert_eq "$(cc_detail_of 0)" "/etc/mp_ip_mapping_info was written on or after 2026-11-20 although multi-path tunnelling is off: the cloud client's handler that the attack used has run on this router. This is also the only trace of it that survives a restart." "mapping detail"
+assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.note')" "No strong indicator was found, but this router cannot be cleared: $(cc_detail_of 0). If you have any other reason to suspect it, treat it as compromised." "inconclusive note (mapping file)"
 TZ=UTC0 touch -d '2026-11-20 00:00:00' "$F"
-expect_ids "mapping file at the window's first second" "mp-ip-mapping-file"
+expect_inconclusive "mapping file at the window's first second" "mp-ip-mapping-file"
+procs 'crond -i /tmp/.log'
+expect_ids "mapping file and a strong indicator: indicators" "proc-crond-log"
+assert_eq "$(cc_ids)" "mp-ip-mapping-file" "the mapping file still listed under cannot_clear"
+procs
 TZ=UTC0 touch -d '2026-11-19 23:59:00' "$F"
 expect_none "mapping file written before 2026-11-20"
 TZ=UTC0 touch -d '2026-11-21 08:00:00' "$F"
@@ -291,7 +338,7 @@ rm -rf "$R/etc/udhcpc.user.d" "$R/rom/etc/udhcpc.user.d"
 
 # ─── 7f. restarted since the attack window: inconclusive, never none ──────────
 NOW=$(date -u +%s)
-WINDOW=1795207680
+WINDOW=1795207620   # 2026-11-20 20:47:00 UTC
 echo "$(( NOW - WINDOW + 3600 )).52 1.00" > "$R/proc/uptime"
 run_check
 assert_eq "$rc" 0 "not restarted: exit code"
@@ -304,7 +351,8 @@ run_check
 assert_eq "$rc" 0 "restarted: exit code 0"
 assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.result')" "inconclusive" "restarted, nothing found: inconclusive"
 printf '%s' "$out" | command grep -q -F '"rebooted_since_incident":true' || { echo "  rebooted not true: $out"; exit 1; }
-assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.note')" "No known indicator was found, but this router has restarted since the attack window (from about 20:48 UTC on 2026-11-20). The remote shell and its traces do not survive a restart, so this check cannot clear it." "inconclusive note"
+assert_eq "$(cc_ids)" "restarted-since-incident" "restarted: cannot_clear id"
+assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.note')" "No strong indicator was found, but this router cannot be cleared: the router has restarted since the attack window (from about 20:47 UTC on 2026-11-20), and the remote shell and its traces do not survive a restart. If you have any other reason to suspect it, treat it as compromised." "inconclusive note (restart)"
 procs 'crond -i /tmp/.log'
 expect_ids "restarted with an indicator" "proc-crond-log"
 procs
@@ -312,6 +360,38 @@ rm -f "$R/proc/uptime"
 run_check
 printf '%s' "$out" | command grep -q -F '"uptime_since":null,"rebooted_since_incident":null' || { echo "  unknown uptime not null: $out"; exit 1; }
 assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.result')" "none" "unknown uptime stays none"
+
+# ─── 7g. every time is UTC, whatever the router's time zone ──────────────────
+# TZ=MST7 is seven hours behind UTC, as on the test unit. 2026-11-20T00:30:00Z is 2026-11-19 17:30
+# local time and must count; 2026-11-19T23:30:00Z must not.
+F="$R/etc/mp_ip_mapping_info"; : > "$F"
+TZ=UTC0 touch -d '2026-11-20 00:30:00' "$F"
+rc=0; out=$(TZ=MST7 sh -c '. "$0"; cmd_check' "$BACKEND" 2>/dev/null) || rc=$?
+assert_eq "$(cc_ids)" "mp-ip-mapping-file" "00:30Z counts under TZ=MST7"
+TZ=UTC0 touch -d '2026-11-19 23:30:00' "$F"
+rc=0; out=$(TZ=MST7 sh -c '. "$0"; cmd_check' "$BACKEND" 2>/dev/null) || rc=$?
+assert_eq "$rc" 0 "23:30Z the day before does not count under TZ=MST7"
+rm -f "$F"
+NOW=$(date -u +%s)
+echo "$(( NOW - 1795207620 + 3600 )).00 1.00" > "$R/proc/uptime"
+want=$(date -u -d "@1795204020" +%Y-%m-%dT%H:%M 2>/dev/null)
+h1=$(date -u +%Y-%m-%dT%H)
+rc=0; out=$(TZ=MST7 sh -c '. "$0"; cmd_check' "$BACKEND" 2>/dev/null) || rc=$?
+h2=$(date -u +%Y-%m-%dT%H)
+assert_contains "$(printf '%s' "$out" | jsonfilter -e '@.uptime_since')" "$want" "uptime_since is UTC under TZ=MST7"
+ca=$(printf '%s' "$out" | jsonfilter -e '@.checked_at')
+case "$ca" in "$h1":*Z|"$h2":*Z) ;; *) echo "  checked_at is not UTC under TZ=MST7: $ca (UTC hour $h1)"; exit 1;; esac
+printf '%s' "$out" | command grep -q -F '"rebooted_since_incident":false' || { echo "  window boundary read in local time: $out"; exit 1; }
+echo "$(( NOW - 1795207620 - 600 )).00 1.00" > "$R/proc/uptime"
+rc=0; out=$(TZ=MST7 sh -c '. "$0"; cmd_check' "$BACKEND" 2>/dev/null) || rc=$?
+printf '%s' "$out" | command grep -q -F '"rebooted_since_incident":true' || { echo "  boot ten minutes after the boundary not seen under TZ=MST7: $out"; exit 1; }
+# The window opens at 20:47 UTC: a boot at 20:47:30 is after it, a boot at 20:46:30 is not.
+NOW=$(date -u +%s)
+echo "$(( NOW - 1795207650 )).00 1.00" > "$R/proc/uptime"
+run_check; assert_eq "$(cc_ids)" "restarted-since-incident" "boot at 20:47:30 UTC is after the window opened"
+echo "$(( NOW - 1795207590 )).00 1.00" > "$R/proc/uptime"
+run_check; assert_eq "$(printf '%s' "$out" | jsonfilter -e '@.result')" "none" "boot at 20:46:30 UTC is before it"
+rm -f "$R/proc/uptime"
 
 # ─── 8. GoodCloud switch ──────────────────────────────────────────────────────
 echo 'gl-cloud.@cloud[0].enable=1' > "$MOCK_UCI_FILE"
@@ -329,7 +409,8 @@ printf '%s\n' '-A SDWAN_IP_MAPPING -d 127.0.0.1/32 -j DNAT --to-destination 127.
 : > "$R/etc/mp_ip_mapping_info"; mkdir -p "$R/etc/udhcpc.user.d"; echo x > "$R/etc/udhcpc.user.d/x"
 mkfifo "$R/tmp/f"; : > "$R/tmp/.log"; echo x > "$R/bin/netstat"; mkdir -p "$R/etc/config/.gl"
 echo a > "$R/etc/init.d/urandom_seed"; echo b > "$R/rom/etc/init.d/urandom_seed"
-expect_ids "all indicators" "proc-crond-log proc-remote-shell tmp-fifo tmp-log netstat-replaced marker-dir boot-script-changed nat-loopback-rule mp-ip-mapping-file conn-attacker-range udhcpc-user-changed"
+expect_ids "all indicators" "proc-crond-log proc-remote-shell tmp-fifo tmp-log netstat-replaced marker-dir boot-script-changed nat-loopback-rule conn-attacker-range udhcpc-user-changed"
+assert_eq "$(cc_ids)" "mp-ip-mapping-file" "all indicators: the mapping file under cannot_clear"
 assert_eq "$(printf '%s\n' "$out" | wc -l)" 1 "one line of output (all indicators)"
 assert_no_file "$MOCK_NETSTAT_MARK"
 echo "ok 47-incident-check"

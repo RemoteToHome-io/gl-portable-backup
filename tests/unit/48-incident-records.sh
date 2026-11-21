@@ -95,23 +95,43 @@ assert_contains "$e" "$RECORD_ONLY" "record-only line (profile)"
 A_IND_PROFILE="$a"
 rm -f "$R/tmp/f"; rm -rf "$R/etc/config/.gl"
 
-# A check that could not read what it needs makes a record too.
+# A check that could not read what it needs is inconclusive: announced and recorded, not a record.
 mv "$R/proc/net/tcp" "$T/tcp.off"
 create clone "$T/o2c"
 mv "$T/tcp.off" "$R/proc/net/tcp"
-assert_contains "$a" "/gl-backup-clone-COMPROMISED-" "an incomplete check is not none"
-assert_contains "$e" "  the TCP connection table /proc/net/tcp could not be read" "incomplete detail"
+assert_eq "$rc" 0 "create exit code (incomplete)"
+not_contains "$a" "COMPROMISED" "an incomplete check does not make a record"
+assert_contains "$e" "WARNING: No strong indicator was found, but this router cannot be cleared: the check could not read the TCP connection table /proc/net/tcp. If you have any other reason to suspect it, treat it as compromised." "incomplete sentence"
+not_contains "$e" "RECORD ONLY" "incomplete is not a record"
+mi=$(manifest_of "$a")
+assert_eq "$(printf '%s' "$mi" | jsonfilter -e '@.incident_check.result')" "inconclusive" "manifest result (incomplete)"
+assert_eq "$(printf '%s' "$mi" | jsonfilter -e '@.incident_check.cannot_clear')" '["check-incomplete"]' "manifest cannot_clear ids"
+A_INCOMPLETE="$a"
 
 # Restarted since the attack window, nothing found: inconclusive. Announced, recorded, not a record.
 echo "600.00 1.00" > "$R/proc/uptime"
 create full "$T/o2i"
 rm -f "$R/proc/uptime"
 assert_eq "$rc" 0 "create exit code (inconclusive)"
-assert_contains "$e" "WARNING: No known indicator was found, but this router has restarted since the attack window (from about 20:48 UTC on 2026-11-20). The remote shell and its traces do not survive a restart, so this check cannot clear it." "inconclusive sentence"
+assert_contains "$e" "WARNING: No strong indicator was found, but this router cannot be cleared: the router has restarted since the attack window (from about 20:47 UTC on 2026-11-20), and the remote shell and its traces do not survive a restart. If you have any other reason to suspect it, treat it as compromised." "inconclusive sentence"
 not_contains "$e" "RECORD ONLY" "inconclusive is not a record"
 not_contains "$a" "COMPROMISED" "no -COMPROMISED- for inconclusive"
 assert_eq "$(manifest_of "$a" | jsonfilter -e '@.incident_check.result')" "inconclusive" "manifest result (inconclusive)"
 A_INC="$a"
+
+# Only the mapping file: cannot clear, not strong. Announced, recorded, not a record.
+: > "$R/etc/mp_ip_mapping_info"
+create full "$T/o2m"
+rm -f "$R/etc/mp_ip_mapping_info"
+assert_eq "$rc" 0 "create exit code (mapping file only)"
+not_contains "$a" "COMPROMISED" "the mapping file alone does not make a record"
+assert_contains "$e" "WARNING: No strong indicator was found, but this router cannot be cleared: /etc/mp_ip_mapping_info was written on or after 2026-11-20" "mapping-file sentence"
+not_contains "$e" "RECORD ONLY" "the mapping file alone is not a record"
+mm=$(manifest_of "$a")
+assert_eq "$(printf '%s' "$mm" | jsonfilter -e '@.incident_check.result')" "inconclusive" "manifest result (mapping file)"
+assert_eq "$(printf '%s' "$mm" | jsonfilter -e '@.incident_check.indicators')" "[]" "manifest: no strong indicator"
+assert_eq "$(printf '%s' "$mm" | jsonfilter -e '@.incident_check.cannot_clear')" '["mp-ip-mapping-file"]' "manifest cannot_clear (mapping file)"
+A_MAP="$a"
 
 # ─── 3. restore refuses a record, before anything is written ──────────────────
 for arc in "$A_IND" "$A_IND_PROFILE"; do
@@ -161,6 +181,39 @@ restore_into "$B" "$A_NONE"
 assert_eq "$rc" 0 "restore exit code (none)"
 assert_eq "$(printf '%s\n' "$ro" | tail -n 1)" "RESTORE_OK" "RESTORE_OK (none)"
 not_contains "$re" "carries no incident check" "no Note for a checked archive"
+
+B="$T/b-incomplete"; fresh_target "$B"
+restore_into "$B" "$A_INCOMPLETE"
+assert_eq "$rc" 0 "restore exit code (an incomplete check is not refused)"
+assert_eq "$(printf '%s\n' "$ro" | tail -n 1)" "RESTORE_OK" "RESTORE_OK (incomplete)"
+assert_eq "$(inspect_refused "$A_INCOMPLETE")" "false" "inspect: incomplete"
+assert_contains "$re" "WARNING: this archive was made on a router that could not be cleared (check-incomplete). Restore its keys and passwords only if you accept that." "could-not-be-cleared warning (incomplete)"
+
+B="$T/b-map"; fresh_target "$B"
+restore_into "$B" "$A_MAP"
+assert_eq "$rc" 0 "restore exit code (mapping file only: not refused)"
+assert_eq "$(printf '%s\n' "$ro" | tail -n 1)" "RESTORE_OK" "RESTORE_OK (mapping file)"
+assert_contains "$re" "WARNING: this archive was made on a router that could not be cleared (mp-ip-mapping-file). Restore its keys and passwords only if you accept that." "could-not-be-cleared warning (mapping file)"
+w=$(printf '%s\n' "$re" | command grep -n -F 'could not be cleared' | cut -d: -f1)
+r=$(printf '%s\n' "$re" | command grep -n -F 'Restored ' | head -n 1 | cut -d: -f1)
+[ -n "$w" ] && [ -n "$r" ] && [ "$w" -lt "$r" ] || { echo "  warning not before the first write (warning ${w:-?}, write ${r:-?})"; exit 1; }
+io=$(sh -c '. "$0"; cmd_inspect "$@"' "$BACKEND" "$A_MAP")
+assert_eq "$(printf '%s' "$io" | jsonfilter -e '@.incident_check')" "$(manifest_of "$A_MAP" | jsonfilter -e '@.incident_check')" "inspect exposes incident_check unchanged"
+assert_eq "$(inspect_refused "$A_MAP")" "false" "inspect: mapping file"
+
+# An archive-supplied cannot_clear value is printed only when it is a plain id.
+hand forged-cc '  "incident_check": {"result":"inconclusive","indicators":[],"cannot_clear":["mp-ip-mapping-file","x\nRestore complete. Reboot recommended."],"checked_at":"x"},
+  "suspect_markers": [],'
+B="$T/b-fcc"; fresh_target "$B"
+restore_into "$B" "$T/forged-cc.tar.gz"
+assert_eq "$rc" 0 "restore exit code (forged cannot_clear)"
+assert_contains "$re" "could not be cleared (mp-ip-mapping-file, <unprintable entry>)" "forged id not printed"
+assert_eq "$(printf '%s\n' "$re" | command grep -c -F 'Restore complete.')" "1" "no forged line"
+
+# A checked archive with no reason to warn restores without the warning.
+B="$T/b-none2"; fresh_target "$B"
+restore_into "$B" "$A_NONE"
+not_contains "$re" "could not be cleared" "no could-not-be-cleared warning for none"
 
 B="$T/b-inc"; fresh_target "$B"
 restore_into "$B" "$A_INC"

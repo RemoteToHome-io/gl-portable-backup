@@ -963,9 +963,13 @@ suspect_markers() {
 # https://github.com/RemoteToHome-io/gl-security-incident-2026 (README "Check a device",
 # docs/findings.md and docs/router-reverse-shell.md; GL.iNet's notice is the source of the crond
 # process and of the netstat warning). This function is the one place they are defined; add new ones
-# here. Each one found is appended to IC_FOUND as a line "<id><TAB><fixed detail text>". A detail is
+# here. There are two tiers. A STRONG indicator (ic_add, IC_FOUND) makes the result "indicators": the
+# backup is a record only and restore refuses it. A CANNOT-CLEAR finding (ic_cc, IC_CLEAR) proves
+# nothing either way but stops the check from clearing the router: with no strong indicator the result
+# is "inconclusive", the backup restores, and restore warns. Each is a line "<id><TAB><fixed detail>". A detail is
 # fixed text and never a process's command line, a connection's address or a rule, which can carry
 # an address or a key.
+# Strong:
 #   proc-crond-log       a process whose command line contains "crond -i" (GL.iNet's indicator)
 #   proc-remote-shell    a process whose command line holds mkfifo, "nc <IPv4> <port>", "/bin/sh -i"
 #                        or a bare "sh -i" argument. "sh -i" and "nc" must start a word or follow
@@ -981,38 +985,73 @@ suspect_markers() {
 #   nat-loopback-rule    the nat chain SDWAN_IP_MAPPING holds a DNAT of 127.0.0.1 to 127.0.0.1, the
 #                        rule the attack leaves (iptables -S and nft list ruleset; a missing tool is
 #                        neither an indicator nor an incomplete check)
-#   mp-ip-mapping-file   /etc/mp_ip_mapping_info was modified on or after 2026-11-20 00:00 UTC while
-#                        mptun.global.enable is not 1
 #   conn-attacker-range  a TCP connection to 170.39.226.0/24 in /proc/net/tcp (netstat is not used)
 #   udhcpc-user-changed  a file under /etc/udhcpc.user.d/ that differs from its /rom copy or has none
 #                        (an unconfirmed report)
-#   check-incomplete     something the check needs could not be read; an incomplete check is reported
-#                        as an indicator, never as none
+# Cannot clear:
+#   mp-ip-mapping-file   /etc/mp_ip_mapping_info was modified on or after 2026-11-20 00:00 UTC while
+#                        mptun.global.enable is not 1. The cloud client's handler the attack abused
+#                        writes it; it was found on a compromised router and on routers with no other
+#                        trace, so it shows that handler ran, not that the router was compromised.
+#   restarted-since-incident  the router started after the attack window opened (IC_WINDOW_UTC)
+#   check-incomplete     something the check needs could not be read
 # Processes are read from /proc/<pid>/cmdline, whose command line is complete. Only when no cmdline
-# under /proc is readable does the check fall back to `ps w` and report check-incomplete: BusyBox
-# cuts `ps w` lines at the terminal width (132 columns read on a router), so a pattern in the tail of
-# a long command line is not seen there. This tool's own process, its parent (the shell of a person
-# running the check over SSH, whose command line can quote the patterns) and any process whose
-# command line contains this tool's name are left out. GPB_TEST_PS names a stand-in for ps in the
-# unit tests, where BusyBox sh would otherwise run its own applet ahead of the mock on PATH.
-# Also sets IC_UPTIME_SINCE (boot time, UTC ISO, or empty) and IC_REBOOTED (true|false|null): when
-# nothing is found but the router started after the attack window opened, the result is
-# "inconclusive", because the remote shell and its traces do not survive a restart.
-# Sets IC_RESULT (none|inconclusive|indicators), IC_FOUND and IC_AT (UTC ISO time).
+# under /proc is readable does the check fall back to `ps w` (and adds check-incomplete): BusyBox cuts
+# `ps w` lines at the terminal width (132 columns read on a router), so a pattern in the tail of a
+# long command line is not seen there. Only this tool's own process and its ancestors (walked up from
+# $$ through /proc/<pid>/stat: the shell of a person running the check over SSH, whose command line
+# can quote the patterns, is one) are left out; any other process is matched, whatever its command
+# line names. GPB_TEST_PS names a stand-in for ps in the unit tests, where BusyBox sh would otherwise
+# run its own applet ahead of the mock on PATH.
+# Also sets IC_UPTIME_SINCE (boot time, UTC ISO, or empty) and IC_REBOOTED (true|false|null).
+# Every time here is UTC: `date -u` for the clock and the boot time, TZ=UTC0 for touch -d. File
+# times are compared by find -newer, which does not depend on the time zone.
+# Sets IC_RESULT (none|inconclusive|indicators), IC_FOUND, IC_CLEAR and IC_AT (UTC ISO time).
 
-# Start of the attack window, 2026-11-20 20:48:00 UTC, in seconds since the epoch.
-IC_WINDOW_EPOCH=1795207680
+# The start of the attack window, in UTC: the earliest activity in the incident record
+# (gl-security-incident-2026, docs/router-reverse-shell.md, "20:47:14 ... in /etc" on 2026-11-20). It
+# may be revised as findings come in; this is the one place it is set.
+IC_WINDOW_UTC="2026-11-20 20:47"
 
 ic_add() {   # id detail — appends one line to IC_FOUND
     IC_FOUND="${IC_FOUND}${1}$(printf '\t')${2}
 "
 }
 
+ic_cc() {   # id detail — appends one line to IC_CLEAR (a finding that cannot clear the router)
+    IC_CLEAR="${IC_CLEAR}${1}$(printf '\t')${2}
+"
+}
+
+# This tool's own PID and its ancestors as " pid pid … ": $$, $PPID, then each parent read from
+# $ROOT/proc/<pid>/stat. Field 2 of stat is the command name in parentheses and may itself hold spaces
+# and parentheses, so everything through the LAST ")" is dropped before the fields are split; the
+# parent PID is then the second remaining field. The walk stops at PID 0, an unreadable stat or 64
+# steps.
+ic_ancestors() {
+    local pid="${PPID:-}" line rest n=0
+    printf ' %s ' "$$"
+    while [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$n" -lt 64 ]; do
+        case "$pid" in *[!0-9]*) break ;; esac
+        printf '%s ' "$pid"
+        [ -r "$ROOT/proc/$pid/stat" ] || break
+        line=""
+        IFS= read -r line < "$ROOT/proc/$pid/stat" || [ -n "$line" ] || break
+        case "$line" in *")"*) ;; *) break ;; esac
+        rest=${line##*)}
+        set -- $rest
+        pid=${2:-}
+        n=$((n + 1))
+    done
+    return 0
+}
+
 # Prints the command lines of the router's processes, NULs turned into spaces, one per line, leaving
-# out this tool's own process, its parent and any process running this tool. Returns 1 when no
-# cmdline under $ROOT/proc could be read.
+# out this tool's own process and its ancestors. Returns 1 when no cmdline under $ROOT/proc could be
+# read.
 ic_proc_cmdlines() {
-    local d pid c n=0
+    local d pid c n=0 skip
+    skip=$(ic_ancestors)
     for d in "$ROOT"/proc/[0-9]*; do
         [ -r "$d/cmdline" ] || continue
         pid=${d##*/}
@@ -1020,34 +1059,31 @@ ic_proc_cmdlines() {
         c=$(tr '\000' ' ' < "$d/cmdline" 2>/dev/null) || continue
         [ -n "$c" ] || continue
         n=$((n + 1))
-        [ "$pid" = "$$" ] && continue
-        [ "$pid" = "${PPID:-}" ] && continue
-        case "$c" in *"$TOOL_NAME"*) continue ;; esac
+        case "$skip" in *" $pid "*) continue ;; esac
         printf '%s\n' "$c"
     done
     [ "$n" -gt 0 ]
 }
 
-# The same from `ps w` (the fallback): header, own process, parent and this tool's lines left out.
+# The same from `ps w` (the fallback): the header, this tool's own process and its ancestors left out.
 ic_ps_cmdlines() {
     local procs rc=0
     procs=$("${GPB_TEST_PS:-ps}" w 2>/dev/null) || rc=$?
     [ "$rc" -eq 0 ] && [ -n "$procs" ] || return 1
-    printf '%s\n' "$procs" | awk -v me="$$" -v parent="${PPID:-}" -v tool="$TOOL_NAME" \
-        '$1 != "PID" && $1 != me && $1 != parent && index($0, tool) == 0'
+    printf '%s\n' "$procs" | awk -v skip="$(ic_ancestors)" '$1 != "PID" && index(skip, " " $1 " ") == 0'
     return 0
 }
 
 incident_check() {
-    local procs rc p t f ref now up boot
-    IC_FOUND=""
-    IC_AT=$(get_timestamp)
+    local procs rc p t f ref now up boot win
+    IC_FOUND=""; IC_CLEAR=""
+    IC_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || IC_AT=""
 
     rc=0; procs=$(ic_proc_cmdlines) || rc=$?
     if [ "$rc" -ne 0 ]; then
-        ic_add check-incomplete "no process command line could be read under /proc; the process list from ps was used, which can hide the end of a long command line"
+        ic_cc check-incomplete "the check could not read the process command lines under /proc, and ps w, read instead, can hide the end of a long command line"
         rc=0; procs=$(ic_ps_cmdlines) || rc=$?
-        [ "$rc" -eq 0 ] || ic_add check-incomplete "the process list could not be read, so running processes were not checked"
+        [ "$rc" -eq 0 ] || ic_cc check-incomplete "the check could not read the process list from ps either"
     fi
     if [ -n "$procs" ]; then
         if printf '%s\n' "$procs" | grep -q -F 'crond -i'; then
@@ -1105,10 +1141,10 @@ incident_check() {
         ref=$(mktemp) || ref=""
         if [ -n "$ref" ] && TZ=UTC0 touch -d '2026-11-19 23:59:59' "$ref" 2>/dev/null; then
             if [ -n "$(find "$f" -newer "$ref" 2>/dev/null)" ]; then
-                ic_add mp-ip-mapping-file "/etc/mp_ip_mapping_info was written on or after 2026-11-20 although multi-path tunnelling is off (the only trace that survives a reboot)"
+                ic_cc mp-ip-mapping-file "/etc/mp_ip_mapping_info was written on or after 2026-11-20 although multi-path tunnelling is off: the cloud client's handler that the attack used has run on this router. This is also the only trace of it that survives a restart."
             fi
         else
-            ic_add mp-ip-mapping-file "/etc/mp_ip_mapping_info exists although multi-path tunnelling is off (date not checked)"
+            ic_cc mp-ip-mapping-file "/etc/mp_ip_mapping_info exists although multi-path tunnelling is off (date not checked): the cloud client's handler that the attack used may have run on this router"
         fi
         [ -z "$ref" ] || rm -f "$ref"
     fi
@@ -1122,7 +1158,7 @@ incident_check() {
             ic_add conn-attacker-range "an open connection to the address range used in the remote-shell attack (170.39.226.0/24)"
         fi
     else
-        ic_add check-incomplete "the TCP connection table /proc/net/tcp could not be read"
+        ic_cc check-incomplete "the check could not read the TCP connection table /proc/net/tcp"
     fi
 
     if [ -d "$ROOT/etc/udhcpc.user.d" ]; then
@@ -1148,61 +1184,74 @@ UDHCPC_EOF
         if [ -n "$up" ] && [ -n "$now" ]; then
             boot=$((now - up))
             IC_UPTIME_SINCE=$(date -u -d "@$boot" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || IC_UPTIME_SINCE=""
-            if [ "$boot" -gt "$IC_WINDOW_EPOCH" ]; then IC_REBOOTED=true; else IC_REBOOTED=false; fi
+            win=$(date -u -d "$IC_WINDOW_UTC:00" +%s 2>/dev/null) || win=""
+            case "$win" in
+                ''|*[!0-9]*) ;;
+                *) if [ "$boot" -gt "$win" ]; then IC_REBOOTED=true; else IC_REBOOTED=false; fi ;;
+            esac
         fi ;;
     esac
 
+    if [ "$IC_REBOOTED" = true ]; then
+        ic_cc restarted-since-incident "the router has restarted since the attack window (from about ${IC_WINDOW_UTC#* } UTC on ${IC_WINDOW_UTC% *}), and the remote shell and its traces do not survive a restart"
+    fi
+
     if [ -n "$IC_FOUND" ]; then IC_RESULT=indicators
-    elif [ "$IC_REBOOTED" = true ]; then IC_RESULT=inconclusive
+    elif [ -n "$IC_CLEAR" ]; then IC_RESULT=inconclusive
     else IC_RESULT=none; fi
     return 0
 }
 
 IC_NOTE_NONE="No known indicator was found. This does not show the router was never compromised: the known remote shell leaves no file and is gone after a reboot."
-IC_NOTE_INCONCLUSIVE="No known indicator was found, but this router has restarted since the attack window (from about 20:48 UTC on 2026-11-20). The remote shell and its traces do not survive a restart, so this check cannot clear it."
 IC_NOTE_FOUND="Indicators of the November 2026 GL.iNet cloud incident were found. Treat every key and password on this router as exposed."
 
 ic_note() {
     case "$IC_RESULT" in
         none) printf '%s' "$IC_NOTE_NONE" ;;
-        inconclusive) printf '%s' "$IC_NOTE_INCONCLUSIVE" ;;
+        inconclusive)
+            printf 'No strong indicator was found, but this router cannot be cleared: %s. If you have any other reason to suspect it, treat it as compromised.' \
+                "$(ic_details "$IC_CLEAR" | awk 'NF { printf "%s%s", (n++ ? "; " : ""), $0 }')" ;;
         *) printf '%s' "$IC_NOTE_FOUND" ;;
     esac
 }
 
-# The ids of IC_FOUND as JSON strings separated by ", "; empty when there are none.
+# The ids of a list (IC_FOUND or IC_CLEAR) as JSON strings separated by ", "; empty for an empty list.
 ic_ids_json() {
-    printf '%s' "$IC_FOUND" | while IFS="$(printf '\t')" read -r id detail; do
+    printf '%s' "$1" | while IFS="$(printf '\t')" read -r id detail; do
         [ -n "$id" ] && printf '"%s", ' "$(json_escape "$(printf '%s' "$id" | tr -cd ' -~')")"
     done | sed 's/, $//'
 }
 
-# The fixed detail texts of IC_FOUND, one per line.
+# The fixed detail texts of a list, one per line.
 ic_details() {
-    printf '%s' "$IC_FOUND" | while IFS="$(printf '\t')" read -r id detail; do
+    printf '%s' "$1" | while IFS="$(printf '\t')" read -r id detail; do
         [ -n "$id" ] && printf '%s\n' "$detail"
     done
     return 0
 }
 
-# One line of JSON; exit 0 for none and inconclusive, 3 when an indicator was found (check-incomplete
-# included).
-cmd_check() {
-    local list gc since
-    incident_check
-    list=$(printf '%s' "$IC_FOUND" | while IFS="$(printf '\t')" read -r id detail; do
+# A list as JSON objects {"id":…,"detail":…} separated by ","; empty for an empty list.
+ic_objects_json() {
+    printf '%s' "$1" | while IFS="$(printf '\t')" read -r id detail; do
         [ -n "$id" ] || continue
         printf '{"id":"%s","detail":"%s"},' "$(json_escape "$(printf '%s' "$id" | tr -cd ' -~')")" \
             "$(json_escape "$(printf '%s' "$detail" | tr -cd ' -~')")"
-    done | sed 's/,$//')
+    done | sed 's/,$//'
+}
+
+# One line of JSON; exit 0 for none and inconclusive, 3 when a strong indicator was found.
+cmd_check() {
+    local gc since
+    incident_check
     case "$(uci -q get gl-cloud.@cloud[0].enable 2>/dev/null)" in
         1) gc=true ;;
         0) gc=false ;;
         *) gc=null ;;
     esac
     if [ -n "$IC_UPTIME_SINCE" ]; then since="\"$(json_escape "$IC_UPTIME_SINCE")\""; else since=null; fi
-    printf '{"result":"%s","indicators":[%s],"goodcloud_enabled":%s,"uptime_since":%s,"rebooted_since_incident":%s,"checked_at":"%s","note":"%s"}\n' \
-        "$IC_RESULT" "$list" "$gc" "$since" "$IC_REBOOTED" "$(json_escape "$IC_AT")" "$(json_escape "$(ic_note)")"
+    printf '{"result":"%s","indicators":[%s],"cannot_clear":[%s],"goodcloud_enabled":%s,"uptime_since":%s,"rebooted_since_incident":%s,"checked_at":"%s","note":"%s"}\n' \
+        "$IC_RESULT" "$(ic_objects_json "$IC_FOUND")" "$(ic_objects_json "$IC_CLEAR")" "$gc" "$since" "$IC_REBOOTED" \
+        "$(json_escape "$IC_AT")" "$(json_escape "$(ic_note)")"
     [ "$IC_RESULT" = indicators ] || return 0
     exit 3
 }
@@ -1360,15 +1409,15 @@ cmd_create() {
     if [ "$IC_RESULT" = none ]; then
         echo "  Incident check: no known indicator found (this does not show the router was never compromised)" >&2
     elif [ "$IC_RESULT" = inconclusive ]; then
-        echo "WARNING: $IC_NOTE_INCONCLUSIVE" >&2
+        echo "WARNING: $(ic_note)" >&2
     else
         compromised="-COMPROMISED"
         echo "WARNING: $IC_NOTE_FOUND" >&2
-        ic_details | while IFS= read -r m; do echo "  $m" >&2; done
+        ic_details "$IC_FOUND" | while IFS= read -r m; do echo "  $m" >&2; done
         echo "  This backup is a RECORD ONLY. gl-portable-backup will refuse to restore it: VPN keys and configurations, Wi-Fi keys, passwords and SSH keys from this router must be replaced, not restored." >&2
         echo "  VPN client profiles and SSH client keys that this router held must also be revoked on the server they connect to." >&2
     fi
-    incident_json="  \"incident_check\": {\"result\": \"${IC_RESULT}\", \"indicators\": [$(ic_ids_json)], \"checked_at\": \"$(json_escape "$IC_AT")\"},"
+    incident_json="  \"incident_check\": {\"result\": \"${IC_RESULT}\", \"indicators\": [$(ic_ids_json "$IC_FOUND")], \"cannot_clear\": [$(ic_ids_json "$IC_CLEAR")], \"checked_at\": \"$(json_escape "$IC_AT")\"},"
     # suspect_markers stays in the manifest for archives read by 1.1.0.
     markers=$(suspect_markers)
     if [ -n "$markers" ]; then
@@ -1696,6 +1745,18 @@ cmd_restore() {
     esac
     archive_has_incident_check "$tmpdir/manifest.json" \
         || echo "  Note: this archive carries no incident check (made by an older version)." >&2
+    # A router that could not be cleared is restored, after a warning naming why. The ids come from
+    # the archive, so only a plain id is printed.
+    if [ "$(jsonfilter -i "$tmpdir/manifest.json" -e '@.incident_check.result' 2>/dev/null)" = inconclusive ]; then
+        local ccids="" ccid ccidx=0
+        while [ "$ccidx" -lt 16 ]; do
+            ccid=$(jsonfilter -i "$tmpdir/manifest.json" -e "@.incident_check.cannot_clear[$ccidx]" 2>/dev/null) || break
+            case "$ccid" in ''|*[!a-z-]*) ccid="<unprintable entry>" ;; esac
+            ccids="${ccids:+$ccids, }$ccid"
+            ccidx=$((ccidx + 1))
+        done
+        echo "WARNING: this archive was made on a router that could not be cleared (${ccids:-no reason recorded}). Restore its keys and passwords only if you accept that." >&2
+    fi
 
     local mode=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.mode')
     local backup_model=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.source.model_id')
