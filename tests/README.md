@@ -21,3 +21,7 @@ SKIP where node is absent.
 
 `tests/js/update-section.js` (wrapper `tests/unit/43-update-section.sh`) checks the Plugin section's
 rendering the same way.
+
+The smoke test's section i serves a fake 99.0.0 release from the laptop with python3's
+`http.server`, bound to the address the router reaches the laptop at, so the router's fetch-and-verify path runs
+without GitHub and without installing anything.

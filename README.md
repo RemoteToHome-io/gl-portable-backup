@@ -265,7 +265,7 @@ Output: `build/out/luci-app-gl-portable-backup_<version>_all.ipk`. This is also 
 ./tests/run.sh
 ```
 
-`tests/on-router-smoke.sh <router-ip>` (shipped with 1.1.0) re-runs the target-sensitive checks against a real GL router from `/tmp`, without installing anything.
+`tests/on-router-smoke.sh <router-ip>` (shipped with 1.1.0) re-runs the target-sensitive checks against a real GL router from `/tmp`, without installing anything. Its self-update checks fetch a fake release served from the laptop running the test, so they need no GitHub release and install nothing.
 
 ## Compatibility
 

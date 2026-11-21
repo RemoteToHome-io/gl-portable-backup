@@ -407,7 +407,68 @@ tgt2_md5=$(md5sum "$G2/etc/dropbear/dropbear_ed25519_host_key" | awk '{print $1}
 [ "$tgt2_md5" = "$srckey_md5" ]; r=$?
 judge 'synthetic: plain restore installed the archive host key' "$r" "target2 md5=$tgt2_md5 source md5=$srckey_md5"
 
-echo "== i. the live configuration is untouched =="
+echo "== i. self-update mechanisms (nothing installed) =="
+# Every primitive the updater relies on, against a known answer in both directions where one exists.
+printf 'abc' > "$D/sum.bin"; sha256sum "$D/sum.bin" > "$D/sum.txt"
+( cd "$D" && sha256sum -c sum.txt >/dev/null 2>&1 ); r1=$?
+printf 'abd' > "$D/sum.bin"; ( cd "$D" && sha256sum -c sum.txt >/dev/null 2>&1 ); r2=$?
+[ "$r1" = 0 ] && [ "$r2" != 0 ]; r=$?
+judge 'update: sha256sum -c passes a good file and fails a tampered one' "$r" "good rc=$r1 tampered rc=$r2"
+( exec 9>>"$D/lock"; flock -n 9 && ( exec 8>>"$D/lock"; flock -n 8 ) ); r=$?
+[ "$r" != 0 ]; r=$?
+judge 'update: flock -n refuses a lock that is already held' "$r" "inner rc=$r"
+rm -f "$D/detached"; S=$(date +%s); sh -c "( sleep 2; date +%s > $D/detached ) </dev/null >/dev/null 2>&1 &"; E=$(( $(date +%s) - S )); sleep 3
+[ "$E" -le 1 ] && [ -s "$D/detached" ]; r=$?
+judge 'update: the orphaned-subshell detach returns at once and the child finishes' "$r" "parent took ${E}s; child wrote: $(cat "$D/detached" 2>/dev/null || echo nothing)"
+for a in nohup setsid; do command -v $a >/dev/null 2>&1 && echo "    | note: $a present on this firmware (the detach pattern does not need it)"; done
+code=$(curl -fsS --connect-timeout 15 --max-time 40 -o /dev/null -w '%{http_code}' https://api.github.com/repos/RemoteToHome-io/gl-portable-backup/releases/latest 2>/dev/null); rc=$?
+case "$code" in 200|404) r=0 ;; *) r=1 ;; esac
+judge 'update: curl reaches the GitHub API over TLS (200 or 404 both prove the path)' "$r" "http=$code curl rc=$rc"
+printf 'Package: x\nVersion: 9.8.7\n' > "$D/ctl"; mkdir -p "$D/ipk/c"; cp "$D/ctl" "$D/ipk/c/control"; echo 2.0 > "$D/ipk/debian-binary"
+(cd "$D/ipk/c" && tar czf ../control.tar.gz .) && (cd "$D/ipk" && tar czf data.tar.gz -T /dev/null 2>/dev/null || (cd "$D/ipk" && tar czf data.tar.gz debian-binary)) && (cd "$D/ipk" && tar czf ../probe.ipk ./debian-binary ./control.tar.gz ./data.tar.gz)
+pv=$(tar -xzOf "$D/probe.ipk" ./control.tar.gz 2>/dev/null | tar -xzOf - 2>/dev/null | sed -n 's/^Version: //p' | head -n 1)
+[ "$pv" = 9.8.7 ]; r=$?
+judge 'update: tar -O extracts the control Version from a BusyBox-built ipk' "$r" "got=[$pv]"
+cl=$(printf 'a\tb\033[0mc' | tr -cd ' -~')
+[ "$cl" = "ab[0mc" ]; r=$?
+judge 'update: tr -cd keeps printable ASCII only' "$r" "got=[$cl]"
+md=$(mktemp -d "$D/tmp/gl-portable-backup-update.XXXXXX" 2>/dev/null); [ -d "$md" ]; r=$?
+judge 'update: mktemp -d with a template' "$r" "dir=$md"; rm -rf "$md"
+uc=$(sh "$GPB" update-check 2>"$D/uc.err"); r=$?
+printf '%s' "$uc" | grep -q '"installed_via_opkg":false' && printf '%s' "$uc" | grep -q '"update_available":false'; r2=$?
+judge 'update-check from /tmp: valid reply, not installed via opkg, nothing offered' "$r2" "rc=$r $uc $(cat "$D/uc.err")"
+if [ -n "${GPB_FAKE:-}" ]; then
+    fetch_case() {   # name expected-substring
+        rm -rf "$D/upd.status" "$D"/tmp/gl-portable-backup-update.*
+        GPB_UPDATE_STATE="$D/upd" GPB_UPDATE_API_URL="$GPB_FAKE/$1/api/latest" GPB_UPDATE_BASE_URL="$GPB_FAKE/$1/download" \
+            sh "$GPB" update-install --fetch-only >"$D/fetch.$1.out" 2>&1; frc=$?
+        st=$(cat "$D/upd.status" 2>/dev/null)
+        printf '%s' "$st" | grep -q -F "$2"; r=$?
+        judge "update fetch-only ($1): $2" "$r" "rc=$frc status: $st"
+        left=$(ls -d "$D"/tmp/gl-portable-backup-update.* 2>/dev/null | tr '\n' ' ')
+        [ -z "$left" ]; r=$?
+        judge "update fetch-only ($1): working directory removed" "$r" "leftovers: ${left:-<none>}"
+    }
+    fetch_case good "Verified luci-app-gl-portable-backup_99.0.0_all.ipk (version 99.0.0); install skipped"
+    fetch_case badsum "Checksum mismatch"
+    fetch_case badver "says version '99.0.1' but the release is 99.0.0"
+    # update-start must refuse while a worker holds the lock, and prime the status before detaching
+    ( exec 9>>"$D/upd.lock"; flock -n 9; GPB_UPDATE_STATE="$D/upd" sh "$GPB" update-start > "$D/start.locked" 2>&1 )
+    grep -q 'already running' "$D/start.locked"; r=$?
+    judge 'update-start: refuses while the lock is held' "$r" "$(cat "$D/start.locked")"
+    rm -f "$D/upd.status"
+    GPB_UPDATE_STATE="$D/upd" GPB_UPDATE_API_URL="$GPB_FAKE/good/api/latest" GPB_UPDATE_BASE_URL="$GPB_FAKE/good/download" \
+        sh "$GPB" update-start --fetch-only > "$D/start.out" 2>&1; src=$?
+    grep -q '"status":"started"' "$D/start.out"; r=$?
+    judge 'update-start: detached fetch-only worker started' "$r" "rc=$src $(cat "$D/start.out")"
+    i=0; while [ $i -lt 20 ] && grep -q '"status":"running"' "$D/upd.status" 2>/dev/null; do sleep 1; i=$((i+1)); done
+    grep -q 'install skipped' "$D/upd.status" 2>/dev/null; r=$?
+    judge 'update-start: the detached worker reached a terminal success on its own' "$r" "$(cat "$D/upd.status" 2>/dev/null)"
+else
+    judge 'update fetch-only: fake release server available from the laptop' 1 "GPB_FAKE is empty — the laptop could not serve the fake release"
+fi
+
+echo "== j. the live configuration is untouched =="
 snapshot > "$D/md5.after"
 cmp -s "$D/md5.before" "$D/md5.after"; r=$?
 if [ "$r" = 0 ]; then
@@ -432,6 +493,48 @@ while ! reach; do
     sleep 60
 done
 
+# ── Fake release server (laptop) ───────────────────────────────────────────────────────────────────
+# The driver's fetch-and-verify checks pull a fake 99.0.0 release from this laptop over the same path the
+# router used for SSH, so no GitHub release and no install are needed. Three variants: a good one, one
+# with a wrong checksum, one whose package claims a different version. Served with python3's http.server
+# bound to the address the router sees this laptop at; if that fails the checks are judged FAIL, not skipped.
+FAKE_URL=""
+SRC_IP=$(ip -4 route get "$IP" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)
+mk_fake_ipk() {   # version outfile
+    local d; d=$(mktemp -d) || return 1
+    mkdir -p "$d/c" "$d/dd"
+    printf 'Package: luci-app-gl-portable-backup\nVersion: %s\nArchitecture: all\n' "$1" > "$d/c/control"
+    echo "2.0" > "$d/debian-binary"
+    (cd "$d/c" && tar czf ../control.tar.gz .) && (cd "$d/dd" && tar czf ../data.tar.gz .) \
+        && (cd "$d" && tar czf "$2" ./debian-binary ./control.tar.gz ./data.tar.gz)
+    rm -rf "$d"
+}
+if [ -n "$SRC_IP" ] && command -v python3 >/dev/null 2>&1; then
+    FAKE="$TMP/fake"; IPK99=luci-app-gl-portable-backup_99.0.0_all.ipk
+    for v in good badsum badver; do
+        mkdir -p "$FAKE/$v/api" "$FAKE/$v/download/v99.0.0"
+        printf '{"tag_name":"v99.0.0","html_url":"https://github.com/RemoteToHome-io/gl-portable-backup/releases/tag/v99.0.0"}' > "$FAKE/$v/api/latest"
+    done
+    mk_fake_ipk 99.0.0 "$FAKE/good/download/v99.0.0/$IPK99"
+    cp "$FAKE/good/download/v99.0.0/$IPK99" "$FAKE/badsum/download/v99.0.0/$IPK99"
+    mk_fake_ipk 99.0.1 "$FAKE/badver/download/v99.0.0/$IPK99"
+    for v in good badsum badver; do (cd "$FAKE/$v/download/v99.0.0" && sha256sum "$IPK99" > SHA256SUMS); done
+    sed -i 's/^..../0000/' "$FAKE/badsum/download/v99.0.0/SHA256SUMS"
+    FAKE_PORT=18923
+    while [ "$FAKE_PORT" -lt 18933 ]; do
+        python3 -m http.server "$FAKE_PORT" --bind "$SRC_IP" --directory "$FAKE" >/dev/null 2>&1 &
+        FAKE_PID=$!
+        sleep 1
+        if kill -0 "$FAKE_PID" 2>/dev/null && curl -fsS -o /dev/null "http://$SRC_IP:$FAKE_PORT/good/api/latest" 2>/dev/null; then
+            FAKE_URL="http://$SRC_IP:$FAKE_PORT"; break
+        fi
+        kill "$FAKE_PID" 2>/dev/null; wait "$FAKE_PID" 2>/dev/null
+        FAKE_PORT=$((FAKE_PORT + 1))
+    done
+    [ -n "$FAKE_URL" ] || echo "warning: could not start the fake release server on $SRC_IP; fetch checks will FAIL" >&2
+fi
+trap 'rm -rf "$TMP"; [ -n "${FAKE_PID:-}" ] && kill "$FAKE_PID" 2>/dev/null' EXIT INT TERM
+
 scp -O $SSH_OPTS "$BACKEND" "$REMOTE:$D/gl-portable-backup" >/dev/null || { echo "scp of the backend failed" >&2; exit 3; }
 scp -O $SSH_OPTS "$TMP/driver.sh" "$REMOTE:$D/driver.sh" >/dev/null || { echo "scp of the driver failed" >&2; exit 3; }
 
@@ -442,7 +545,7 @@ scp -O $SSH_OPTS "$TMP/driver.sh" "$REMOTE:$D/driver.sh" >/dev/null || { echo "s
     echo
 } > "$LOG"
 
-ssh $SSH_OPTS "$REMOTE" "sh $D/driver.sh" 2>&1 | tee -a "$LOG"
+ssh $SSH_OPTS "$REMOTE" "GPB_FAKE='$FAKE_URL' sh $D/driver.sh" 2>&1 | tee -a "$LOG"
 
 summary=$(tail -n 1 "$LOG")
 echo "log: $LOG"
