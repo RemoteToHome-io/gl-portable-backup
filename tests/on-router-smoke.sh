@@ -494,12 +494,12 @@ while ! reach; do
 done
 
 # ── Fake release server (laptop) ───────────────────────────────────────────────────────────────────
-# The driver's fetch-and-verify checks pull a fake 99.0.0 release from this laptop over the same path the
-# router used for SSH, so no GitHub release and no install are needed. Three variants: a good one, one
-# with a wrong checksum, one whose package claims a different version. Served with python3's http.server
-# bound to the address the router sees this laptop at; if that fails the checks are judged FAIL, not skipped.
+# The driver's fetch-and-verify checks pull a fake 99.0.0 release from this laptop, so no GitHub release
+# and no install are needed. Three variants: a good one, one with a wrong checksum, one whose package
+# claims a different version. Served with python3's http.server on the laptop's loopback and reached by the
+# router through an SSH reverse tunnel on the test's own connection, so no firewall opening is needed; if
+# the server does not start the checks are judged FAIL, not skipped.
 FAKE_URL=""
-SRC_IP=$(ip -4 route get "$IP" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)
 mk_fake_ipk() {   # version outfile
     local d; d=$(mktemp -d) || return 1
     mkdir -p "$d/c" "$d/dd"
@@ -509,7 +509,7 @@ mk_fake_ipk() {   # version outfile
         && (cd "$d" && tar czf "$2" ./debian-binary ./control.tar.gz ./data.tar.gz)
     rm -rf "$d"
 }
-if [ -n "$SRC_IP" ] && command -v python3 >/dev/null 2>&1; then
+if command -v python3 >/dev/null 2>&1; then
     FAKE="$TMP/fake"; IPK99=luci-app-gl-portable-backup_99.0.0_all.ipk
     for v in good badsum badver; do
         mkdir -p "$FAKE/$v/api" "$FAKE/$v/download/v99.0.0"
@@ -522,16 +522,16 @@ if [ -n "$SRC_IP" ] && command -v python3 >/dev/null 2>&1; then
     sed -i 's/^..../0000/' "$FAKE/badsum/download/v99.0.0/SHA256SUMS"
     FAKE_PORT=18923
     while [ "$FAKE_PORT" -lt 18933 ]; do
-        python3 -m http.server "$FAKE_PORT" --bind "$SRC_IP" --directory "$FAKE" >/dev/null 2>&1 &
+        python3 -m http.server "$FAKE_PORT" --bind 127.0.0.1 --directory "$FAKE" >/dev/null 2>&1 &
         FAKE_PID=$!
         sleep 1
-        if kill -0 "$FAKE_PID" 2>/dev/null && curl -fsS -o /dev/null "http://$SRC_IP:$FAKE_PORT/good/api/latest" 2>/dev/null; then
-            FAKE_URL="http://$SRC_IP:$FAKE_PORT"; break
+        if kill -0 "$FAKE_PID" 2>/dev/null && curl -fsS -o /dev/null "http://127.0.0.1:$FAKE_PORT/good/api/latest" 2>/dev/null; then
+            FAKE_URL="http://127.0.0.1:$FAKE_PORT"; break
         fi
         kill "$FAKE_PID" 2>/dev/null; wait "$FAKE_PID" 2>/dev/null
         FAKE_PORT=$((FAKE_PORT + 1))
     done
-    [ -n "$FAKE_URL" ] || echo "warning: could not start the fake release server on $SRC_IP; fetch checks will FAIL" >&2
+    [ -n "$FAKE_URL" ] || echo "warning: could not start the fake release server on 127.0.0.1; fetch checks will FAIL" >&2
 fi
 trap 'rm -rf "$TMP"; [ -n "${FAKE_PID:-}" ] && kill "$FAKE_PID" 2>/dev/null' EXIT INT TERM
 
@@ -545,7 +545,7 @@ scp -O $SSH_OPTS "$TMP/driver.sh" "$REMOTE:$D/driver.sh" >/dev/null || { echo "s
     echo
 } > "$LOG"
 
-ssh $SSH_OPTS "$REMOTE" "GPB_FAKE='$FAKE_URL' sh $D/driver.sh" 2>&1 | tee -a "$LOG"
+ssh $SSH_OPTS -o ControlMaster=no -o ControlPath=none ${FAKE_URL:+-o ExitOnForwardFailure=yes -R 127.0.0.1:$FAKE_PORT:127.0.0.1:$FAKE_PORT} "$REMOTE" "GPB_FAKE='$FAKE_URL' sh $D/driver.sh" 2>&1 | tee -a "$LOG"
 
 summary=$(tail -n 1 "$LOG")
 echo "log: $LOG"
