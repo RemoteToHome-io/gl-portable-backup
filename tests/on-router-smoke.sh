@@ -291,12 +291,23 @@ fv=$(jsonfilter -e '@.format_version' < "$D/profile.insp" 2>/dev/null)
 [ "$fv" = 4 ]; r=$?
 judge 'inspect profile: format_version=4' "$r" "format_version=[$fv]"
 apis=$(sed -n 's|^gl-portable-backup/api/||p' "$D/profile.list" | sort | tr '\n' ' ')
+# Which LAN module this firmware ships decides which capture to expect: vlan_subnet from 4.11 on, lan
+# before it (4.9.0 ships lan). A bare file is a Lua module, NAME.so a compiled one.
+RPCD=/usr/lib/oui-httpd/rpc
+if [ -e "$RPCD/vlan_subnet" ] || [ -e "$RPCD/vlan_subnet.so" ]; then
+    lan_case=vlan_subnet; lan_want=vlan_subnet.get_subnets.json; lan_not='lan\.'
+elif [ -e "$RPCD/lan" ] || [ -e "$RPCD/lan.so" ]; then
+    lan_case=lan; lan_want=lan.get_config_list.json; lan_not='vlan_subnet\.'
+else
+    lan_case=neither; lan_want=""; lan_not=""
+fi
 missing=""
-for want in vlan_subnet.get_subnets.json wifi.get_config.json dns.get_config.json; do
+[ -n "$lan_want" ] || missing=" (this firmware ships neither vlan_subnet nor lan under $RPCD)"
+for want in $lan_want wifi.get_config.json dns.get_config.json; do
     case " $apis " in *" $want "*) ;; *) missing="$missing $want" ;; esac
 done
 [ -z "$missing" ]; r=$?
-judge 'create profile: the three required API captures are present' "$r" \
+judge "create profile: the three required API captures are present (LAN module: $lan_case)" "$r" \
     "missing:${missing:- <none>}   captured: $apis"
 # Profile carries no device identity: no system.get_info reply, no hardware.json, and no radio
 # BSSID in the stored Wi-Fi reply (the member is read straight from the archive, never printed).
@@ -326,9 +337,14 @@ idr=$(jsonfilter -e '@.identity_residue' < "$D/profile.insp" 2>/dev/null)
 [ "$idc" = true ] && [ "$(printf '%s' "$idr" | tr -d ' []')" = "" ]; r=$?
 judge 'inspect profile: identity_checked=true and identity_residue empty' "$r" "identity_checked=[$idc] residue entries=$(printf '%s' "$idr" | tr -cd ',' | wc -c)+"
 rm -rf "$D/prx"
-lanmem=$(grep -E '^gl-portable-backup/api/lan\.' "$D/profile.list" | tr '\n' ' ')
-[ "$profile_n" -gt 0 ] && [ -z "$lanmem" ]; r=$?
-judge 'create profile: no lan.* capture on this firmware (4.11 replaced lan with vlan_subnet)' "$r" \
+if [ -n "$lan_not" ]; then
+    lanmem=$(grep -E "^gl-portable-backup/api/$lan_not" "$D/profile.list" | tr '\n' ' ')
+    [ "$profile_n" -gt 0 ] && [ -z "$lanmem" ]; r=$?
+else
+    lanmem="(no LAN module found: vlan_subnet or lan)"; r=1
+fi
+case "$lan_case" in vlan_subnet) other=lan ;; lan) other=vlan_subnet ;; *) other="lan or vlan_subnet" ;; esac
+judge "create profile: no $other.* capture (this firmware ships $lan_case)" "$r" \
     "listing lines=$profile_n   members: ${lanmem:-<none>}"
 # The argument shape issue #1's B1 broke: gl_api WITH a params object. No capture call passes one,
 # so nothing above exercises it. system.get_info is a getter (not captured into the archive, see above), so this stays read-only. The reply
@@ -447,9 +463,9 @@ judge 'synthetic: plain restore installed the archive host key' "$r" "target2 md
 echo "== j. incident check =="
 # ids_of FILE: the indicator ids of a check reply, space-separated (index by index, so no jsonfilter
 # wildcard support is assumed). The details are never printed: only the result and the ids.
-ids_of() {
-    local i=0 id acc=""
-    while id=$(jsonfilter -i "$1" -e "@.indicators[$i].id" 2>/dev/null); do acc="${acc:+$acc }$id"; i=$((i + 1)); done
+ids_of() {   # FILE [ARRAY] — ARRAY defaults to indicators; cannot_clear for the other tier
+    local i=0 id acc="" arr="${2:-indicators}"
+    while id=$(jsonfilter -i "$1" -e "@.$arr[$i].id" 2>/dev/null); do acc="${acc:+$acc }$id"; i=$((i + 1)); done
     printf '%s' "$acc"
 }
 sh "$GPB" check > "$D/chk.json" 2>"$D/chk.err"; r=$?
@@ -457,7 +473,7 @@ res=$(jsonfilter -i "$D/chk.json" -e '@.result' 2>/dev/null)
 reb=$(jsonfilter -i "$D/chk.json" -e '@.rebooted_since_incident' 2>/dev/null)
 { [ "$r" = 0 ] && { [ "$res" = none ] || [ "$res" = inconclusive ]; }; } || { [ "$r" = 3 ] && [ "$res" = indicators ]; }; r2=$?
 judge 'check on the live router: parseable JSON, none or inconclusive (exit 0) or indicators (exit 3)' "$r2" \
-    "rc=$r result=[${res:-<unreadable>}] ids=[$(ids_of "$D/chk.json")] rebooted_since_incident=[${reb:-<unreadable>}]"
+    "rc=$r result=[${res:-<unreadable>}] ids=[$(ids_of "$D/chk.json")] rebooted_since_incident=[${reb:-<unreadable>}] cannot_clear=[$(ids_of "$D/chk.json" cannot_clear)]"
 
 P="$D/planted"
 mkdir -p "$P/etc/config" "$P/tmp" "$P/usr/lib/opkg"
@@ -480,14 +496,13 @@ judge 'check on a synthetic root without plants: exit 0, result none' "$r2" "rc=
 mkfifo "$P/tmp/f"; mkdir -p "$P/etc/config/.gl" "$P/proc/4242"
 printf 'crond\000-i\000/tmp/.log\000' > "$P/proc/4242/cmdline"
 : > "$P/etc/mp_ip_mapping_info"
-# The mapping file counts only while multi-path tunnelling is off, read from the live uci.
+# The mapping file is a cannot-clear finding, never a strong one, so it is not among these ids.
 want="proc-crond-log tmp-fifo marker-dir"
-[ "$(uci -q get mptun.global.enable 2>/dev/null)" = 1 ] || want="$want mp-ip-mapping-file"
 PATH="$D/fakebin:$PATH" GPB_TEST_PS="$D/fakebin/ps" GPB_ROOT="$P" sh "$GPB" check > "$D/chk3.json" 2>&1; r=$?
 pids=$(ids_of "$D/chk3.json")
 [ "$r" = 3 ] && [ "$pids" = "$want" ]; r2=$?
 judge 'check on the planted synthetic root (/proc cmdline, fifo, marker, mapping file): exit 3 with the expected ids' "$r2" \
-    "rc=$r ids=[$pids] expected=[$want]"
+    "rc=$r ids=[$pids] expected=[$want] cannot_clear=[$(ids_of "$D/chk3.json" cannot_clear)]"
 
 mkdir -p "$D/out-planted"
 parch=$(PATH="$D/fakebin:$PATH" GPB_TEST_PS="$D/fakebin/ps" GPB_ROOT="$P" sh "$GPB" create --mode full --output "$D/out-planted" 2>"$D/pl.err"); r=$?
@@ -508,6 +523,30 @@ rr0=$(sh "$GPB" inspect "$sarch" 2>/dev/null | jsonfilter -e '@.restore_refused'
 [ "$rr1" = true ] && [ "$rr0" = false ]; r=$?
 judge 'inspect restore_refused: true for the record, false for the synthetic archive of section h' "$r" \
     "record=[${rr1:-<absent>}] synthetic=[${rr0:-<absent>}]"
+
+# Only the mapping file, written now, with multi-path tunnelling off (read from the live uci): the
+# result is inconclusive, never indicators, and a backup is not a record.
+M="$D/maponly"
+mkdir -p "$M/etc/config" "$M/usr/lib/opkg" "$M/proc/4243" "$M/proc/net"
+cp /etc/board.json "$M/etc/board.json"; cp /etc/glversion "$M/etc/glversion"; cp /etc/openwrt_release "$M/etc/openwrt_release"
+printf 'Package: gpb-smoke-pkg\nStatus: install user installed\n' > "$M/usr/lib/opkg/status"
+echo "config interface 'smoke'" > "$M/etc/config/network"
+printf '%s\000' /usr/sbin/crond -f -c /etc/crontabs -l 5 > "$M/proc/4243/cmdline"
+head -n 1 /proc/net/tcp > "$M/proc/net/tcp"
+: > "$M/etc/mp_ip_mapping_info"
+mpt=$(uci -q get mptun.global.enable 2>/dev/null)
+GPB_ROOT="$M" sh "$GPB" check > "$D/chkm.json" 2>&1; r=$?
+mres=$(jsonfilter -i "$D/chkm.json" -e '@.result' 2>/dev/null); mcc=$(ids_of "$D/chkm.json" cannot_clear)
+case " $mcc " in *" mp-ip-mapping-file "*) mc=0 ;; *) mc=1 ;; esac
+[ "$mpt" != 1 ] && [ "$r" = 0 ] && [ "$mres" = inconclusive ] && [ "$mc" = 0 ] && [ -z "$(ids_of "$D/chkm.json")" ]; r2=$?
+judge 'check with only the mapping file planted: exit 0, inconclusive, cannot_clear holds mp-ip-mapping-file' "$r2" \
+    "rc=$r result=[$mres] cannot_clear=[$mcc] indicators=[$(ids_of "$D/chkm.json")] mptun.global.enable=[${mpt:-<unset>}]"
+mkdir -p "$D/out-maponly"
+march=$(GPB_ROOT="$M" sh "$GPB" create --mode full --output "$D/out-maponly" 2>"$D/ml.err"); r=$?
+case "$march" in *COMPROMISED*) mc=1 ;; *) mc=0 ;; esac
+[ "$r" = 0 ] && [ -f "$march" ] && [ "$mc" = 0 ] && grep -q -F 'cannot be cleared' "$D/ml.err"; r2=$?
+judge 'create with only the mapping file planted: not a -COMPROMISED- record, with the cannot-be-cleared warning' "$r2" \
+    "rc=$r archive=$(basename "${march:-<none>}")"
 
 echo "== i. self-update mechanisms (nothing installed) =="
 # Every primitive the updater relies on, against a known answer in both directions where one exists.
