@@ -50,12 +50,20 @@ passwords of access points this router has joined — all in cleartext. Handle i
 Full backup: it is a secret, not a settings file. It leaves out the identity a different device
 must not inherit: no GoodCloud binding (`cloud.get_config` is deliberately not captured), no
 SSH host keys, no `authorized_keys`, and no root password. It also carries no device identity
-of the source: no `hardware.json`, no `system.get_info` reply (serial number and WAN MAC), and
-the stored replies have the radios' own addresses (`bssid` in `wifi.get_config`) and each port's
-factory address (`defmacaddr` in `cable.get_ports_config`) removed. What remains are addresses
-the user configured: the MAC-mode settings (`macaddr` in `cable.get_ports_config` and
-`repeater.get_saved_ap_list`, such as a cloned or randomised WAN or repeater MAC) and the DHCP
-reservations, which name the MAC addresses of client devices.
+of the source: no `hardware.json` and no `system.get_info` reply (serial number and WAN MAC).
+The router's factory and radio addresses are removed from every stored reply **by value**: each
+port's factory address (`defmacaddr` in `cable.get_ports_config`), each radio's own address
+(`bssid` in `wifi.get_config`) and every MAC address in the router's `/etc/board.json` are
+collected first, and every field holding one of them, in either letter case and under any field
+name, is removed — including a port's `macaddr` in the default MAC mode, where it equals the
+factory address. What stays: an address the user set that differs from the factory one (a cloned
+or randomised WAN or repeater MAC in `cable.get_ports_config` or `repeater.get_saved_ap_list`),
+and the DHCP reservations, which name the MAC addresses of client devices. A final pass looks for
+every collected address in every stored reply; a file that still holds one (inside a longer value,
+say, or in a reply that would no longer parse once it was removed) is named in a
+`WARNING: a hardware address could not be removed from …` line — the file name, never the address
+— and listed in the manifest's `identity_residue`. When `/etc/board.json` cannot be read, the create
+output says the archive was not checked and the manifest records `"identity_checked": false`.
 
 **Restore is currently limited** to timezone, DNS mode/force_dns, DNS hosts, LED on/off, and DHCP static bindings — and the static-binding restore only runs on firmware that still exposes the `lan` API (on 4.11+ it prints a skip notice, since the equivalent `vlan_subnet` write hasn't been implemented yet). Wi-Fi and LAN restore are placeholders that print a message and make no changes. Full cross-model restore (Profile restore v2) is planned, not yet shipped.
 
@@ -104,7 +112,8 @@ All contents are nested under a `gl-portable-backup/` prefix directory:
 
 ```
 gl-portable-backup/
-├── manifest.json       Metadata: format_version (currently 4), mode, model, firmware, hostname, sections
+├── manifest.json       Metadata: format_version (currently 4), mode, model, firmware, hostname, sections,
+│                       extra_files, suspect_markers; Profile: identity_checked, identity_residue
 ├── backup-info.txt     Human-readable summary, compatibility warning, and the Skipped line
 ├── hardware.json       Source device hardware IDs (reference only; not written in profile mode)
 ├── config/             UCI config files (clone, remote-safe, full modes)
@@ -200,7 +209,7 @@ Custom DDNS operational preferences (check interval, force interval) are preserv
 A **Full** archive carries the source router's dropbear SSH host keys and its `/etc/shadow` (root/admin password hash) — Clone and Remote-Safe never capture either. Restoring a Full archive therefore replaces the target's SSH host keys and its root password with the source's:
 
 - SSH clients will see a changed host key on the next connection. `gl-portable-backup restore` and `gl-portable-backup fingerprint ARCHIVE` both print the fingerprint the archive would install, so you can recognize it when your SSH client warns you. The LuCI restore dialog shows the same fingerprint.
-- `gl-portable-backup inspect ARCHIVE` reports two booleans, `restores_ssh_host_keys` and `restores_root_password`, alongside the manifest.
+- `gl-portable-backup inspect ARCHIVE` prints the archive's manifest with three keys appended: the booleans `restores_ssh_host_keys` and `restores_root_password`, and `startup_and_login_files` (see "Backing Up a Router That May Be Compromised"). All three are worked out from the archive's own file listing, not taken from the manifest; inspect refuses an archive whose manifest is not in the layout this tool writes, so the appended keys cannot be hidden.
 - Pass `--keep-host-keys` on the CLI, or check "Keep this device's SSH host keys" in the LuCI restore dialog, to keep the target's own SSH identity instead. `authorized_keys` is always restored regardless of this flag. There is no equivalent opt-out for `/etc/shadow` in this release — a Full restore always brings back the source's root password.
 
 ## Backing Up a Router That May Be Compromised
@@ -224,17 +233,39 @@ What the plugin does:
   archive's `config/` tree is staged first and no hidden entry is copied, even from an archive made
   by an older version or by hand; symbolic links and other non-regular entries inside `config/` are
   not restored either. Each kind that was dropped gets its own `WARNING: … were NOT restored` line.
+- **The same rule covers the other persistent files.** A file from the sysupgrade lists (keep.d,
+  `/etc/sysupgrade.conf`, changed conffiles) with a dot-named component anywhere in its path is not
+  captured (`Skipped N hidden entries in the persistent-file list`). At restore time nothing under
+  the archive's `extra/` is written when its path has a dot-named component, lies under
+  `etc/config/` (configuration comes from `config/` only), or is not a regular file; each kind gets
+  its own `WARNING: … were NOT restored` line.
+- **An archive that no backup of this tool can produce is refused before anything is extracted.**
+  `restore`, `inspect`, `fingerprint` and `packages` read the archive's listing first and stop with
+  an `Invalid archive` error, naming a count and never a file name, when it holds a hard link, a
+  device node, a fifo or another special member; a member name with a `..` component, a control
+  character or a backslash; or a symbolic link in place of the archive's own `gl-portable-backup/`
+  directory, `manifest.json`, `config`, `extra`, `api`, `packages.json` or `packages.txt`. A
+  manifest that is not in the layout this tool writes is refused the same way. A regular file
+  whose own name contains ` -> ` is refused too, because BusyBox `tar` lists a hard link that way.
 - **Marker paths are announced at backup time.** If either marker path exists, `create` prints a
   warning naming it before anything is captured, and the manifest records it in `suspect_markers`
-  (an empty list when none is found). The backup still runs. When no marker is found, nothing is
-  printed.
-- **Startup and login files are flagged at inspect and restore time.** `gl-portable-backup inspect`
-  adds `startup_and_login_files`: the archive's files under `/etc/rc.local`, `/etc/crontabs/`,
-  `/etc/init.d/`, `/etc/rc.d/`, `/etc/hotplug.d/`, `/etc/uci-defaults/`, `/etc/profile`,
-  `/etc/profile.d/`, `/etc/sysupgrade.conf`, `/etc/shadow`, `/etc/passwd`, `/etc/group`,
-  `/etc/dropbear/authorized_keys` and the dropbear host keys. `restore` lists the same files in a
+  (an empty list when none is found). The warning says what the paths are — paths the cleanup
+  script in GL.iNet's KVM firmware removes — not that the router is compromised. The backup still
+  runs. When no marker is found, nothing is printed.
+- **Startup and login files, and every file outside `/etc`, are flagged at inspect and restore
+  time.** `gl-portable-backup inspect` adds `startup_and_login_files`: the files a restore of the
+  archive would write under `/etc/rc.local`, `/etc/crontabs/`, `/etc/init.d/`, `/etc/rc.d/`,
+  `/etc/hotplug.d/`, `/etc/hotplug-preinit.d/`, `/etc/uci-defaults/`, `/etc/rc.button/`,
+  `/etc/rc.common`, `/etc/preinit`, `/etc/inittab`, `/etc/profile`, `/etc/profile.d/`,
+  `/etc/sysctl.conf`, `/etc/sysctl.d/`, `/etc/firewall.user`, `/etc/opkg/`,
+  `/etc/sysupgrade.conf`, `/etc/shadow`, `/etc/passwd`, `/etc/group`,
+  `/etc/dropbear/authorized_keys` and the dropbear host keys, plus every file outside `/etc` (only
+  an archive made with `--include-plugins` has any). Paths are normalised first, so
+  `etc//rc.local` or `./etc/./rc.local` is listed as `/etc/rc.local`. inspect reads the names from
+  the archive's listing; `restore` reads them from the extracted archive and lists them in a
   warning before anything is written, and also warns when the manifest's `suspect_markers` is not
-  empty. The LuCI restore dialog shows both warnings. Neither blocks the restore.
+  empty. The LuCI restore dialog shows both warnings, and after a restore it repeats every
+  `WARNING` line the restore printed. Neither warning blocks the restore.
 
 What each mode carries, among the files that matter here:
 
@@ -254,12 +285,13 @@ contents of `/etc/board.json`), which no restore writes back.
 Every file mode carries only what OpenWrt's sysupgrade would preserve (keep.d declarations,
 `/etc/sysupgrade.conf`, changed conffiles), and every one of them, `authorized_keys` and the host
 keys included, is skipped when it is identical to the firmware's `/rom` copy. The dot-name rule
-covers `/etc/config` only; a hidden file elsewhere under `/etc` that sysupgrade would preserve is
-still captured and is not flagged unless it sits under one of the paths listed above.
+covers `/etc/config` and the persistent-file lists alike.
 
 If the router may have been compromised:
 
-- Prefer Profile mode. It stores no files.
+- Prefer Profile mode. It stores no files, but it still carries settings an attacker may have
+  changed: the DNS mode and hosts entries, port forwards, WAN access, firewall rules and VPN client
+  configurations. Read those in the archive's `api/` replies before restoring.
 - Treat every key and password in any backup of that router as exposed: VPN keys, Wi-Fi keys, the
   root password, SSH keys. Replace them on the reset router rather than restore them.
 - After a restore, read every file the startup/login warning names before you reboot.
@@ -336,7 +368,7 @@ Output: `build/out/luci-app-gl-portable-backup_<version>_all.ipk`. This is also 
 
 ## Compatibility
 
-- **Firmware**: GL.iNet 4.x. Full backup and restore after a factory reset were tested on a GL-MT3000 at firmware 4.8.2; a Full archive from 4.9.0-beta4 was restored onto the same unit after a clean flash of 4.11.0-beta1 (see Restoring Across Firmware Versions). API module inventories were checked on GL-MT5000 4.8.4 and GL-AXT1800 4.8.2. The on-router smoke test (1.1.0) exercised all four capture modes, Full-mode create/inspect/fingerprint and a restore into a scratch root on a GL-MT3000 at 4.11.0-beta1 — the restore ran against a synthetic source tree, not the live configuration, and no Clone, Remote-Safe or Profile restore was run. Not tested on other models or firmware versions.
+- **Firmware**: GL.iNet 4.x. Full backup and restore after a factory reset were tested on a GL-MT3000 at firmware 4.8.2; a Full archive from 4.9.0-beta4 was restored onto the same unit after a clean flash of 4.11.0-beta1 (see Restoring Across Firmware Versions). API module inventories were checked on GL-MT5000 4.8.4 and GL-AXT1800 4.8.2. The 1.1.0 on-router smoke run on a GL-MT3000 at firmware 4.11.0 exercised all four capture modes, Full-mode inspect and fingerprint, the self-updater's fetch-and-verify path against a fake release, and a restore into a scratch root — the restore ran against a synthetic source tree, not the live configuration, and no Clone, Remote-Safe or Profile restore was run on a router. Not tested on other models or firmware versions.
 - **Models**: Architecture-independent package — installs on any GL.iNet router. Actual behavior is verified only on the models above; Clone, Remote-Safe, and Full restores are hard-blocked to the same model regardless.
 - **Dependencies**: None beyond stock GL.iNet firmware (`jsonfilter`, `uci`, `curl`, `awk`, `tar`, `dropbearkey` for host-key fingerprints)
 - **Package install**: Uses `/usr/libexec/opkg-call` from `luci-app-opkg` (present on all GL.iNet firmware)
