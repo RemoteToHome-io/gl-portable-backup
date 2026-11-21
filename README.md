@@ -199,6 +199,69 @@ A **Full** archive carries the source router's dropbear SSH host keys and its `/
 - `gl-portable-backup inspect ARCHIVE` reports two booleans, `restores_ssh_host_keys` and `restores_root_password`, alongside the manifest.
 - Pass `--keep-host-keys` on the CLI, or check "Keep this device's SSH host keys" in the LuCI restore dialog, to keep the target's own SSH identity instead. `authorized_keys` is always restored regardless of this flag. There is no equivalent opt-out for `/etc/shadow` in this release — a Full restore always brings back the source's root password.
 
+## Backing Up a Router That May Be Compromised
+
+On 2026-11-20 GL.iNet published
+[GL.iNet Security Notice 2026-11-20](https://www.gl-inet.com/en-us/blogs/blog/glinet-security-notice-2026-11-20):
+a flaw in its cloud remote management was used to install malicious software on a subset of routers
+and KVM devices, and owners are told to factory reset and install an upcoming firmware. Many people
+will take a backup before that reset. A backup of a compromised router can carry the attacker's
+changes back onto the reset router.
+
+GL has published no list of indicators for routers. The two marker paths this plugin checks,
+`/etc/config/.gl` and `/etc/glinet/.cache`, come from the cleanup script inside GL's published KVM
+firmware. They are not GL's guidance for routers and they are not a complete list.
+
+What the plugin does:
+
+- **Hidden entries under `/etc/config` are not carried.** At backup time every entry whose name
+  starts with a dot, at any depth under `/etc/config`, is removed from the archive, and the create
+  output says how many (`Skipped N hidden entries under /etc/config`). At restore time the
+  archive's `config/` tree is staged first and no hidden entry is copied, even from an archive made
+  by an older version or by hand; symbolic links and other non-regular entries inside `config/` are
+  not restored either. Each kind that was dropped gets its own `WARNING: … were NOT restored` line.
+- **Marker paths are announced at backup time.** If either marker path exists, `create` prints a
+  warning naming it before anything is captured, and the manifest records it in `suspect_markers`
+  (an empty list when none is found). The backup still runs. When no marker is found, nothing is
+  printed.
+- **Startup and login files are flagged at inspect and restore time.** `gl-portable-backup inspect`
+  adds `startup_and_login_files`: the archive's files under `/etc/rc.local`, `/etc/crontabs/`,
+  `/etc/init.d/`, `/etc/rc.d/`, `/etc/hotplug.d/`, `/etc/uci-defaults/`, `/etc/profile`,
+  `/etc/profile.d/`, `/etc/sysupgrade.conf`, `/etc/shadow`, `/etc/passwd`, `/etc/group`,
+  `/etc/dropbear/authorized_keys` and the dropbear host keys. `restore` lists the same files in a
+  warning before anything is written, and also warns when the manifest's `suspect_markers` is not
+  empty. The LuCI restore dialog shows both warnings. Neither blocks the restore.
+
+What each mode carries, among the files that matter here:
+
+| Item | Full | Clone | Remote-Safe | Profile |
+|------|------|-------|-------------|---------|
+| Hidden entries under `/etc/config` | no | no | no | no |
+| Root crontab `/etc/crontabs/root` | when it differs from the firmware's `/rom` copy | when it differs from `/rom` | when it differs from `/rom` | no |
+| `/etc/rc.local` | when it differs from `/rom` | no | no | no |
+| `/etc/dropbear/authorized_keys` | yes | yes | no | no |
+| `/etc/shadow` | when it differs from `/rom` | no | no | no |
+| SSH host keys | yes | no | no | no |
+| Files outside `/etc` | only with `--include-plugins` | only with `--include-plugins` | only with `--include-plugins` | no |
+
+Profile mode copies no files from the router at all: it stores the replies of the router's own API,
+plus the `hardware.json` reference that every mode writes (MAC addresses and the contents of
+`/etc/board.json`), which no restore writes back.
+Every file mode carries only what OpenWrt's sysupgrade would preserve (keep.d declarations,
+`/etc/sysupgrade.conf`, changed conffiles), and every one of them, `authorized_keys` and the host
+keys included, is skipped when it is identical to the firmware's `/rom` copy. The dot-name rule
+covers `/etc/config` only; a hidden file elsewhere under `/etc` that sysupgrade would preserve is
+still captured and is not flagged unless it sits under one of the paths listed above.
+
+If the router may have been compromised:
+
+- Prefer Profile mode. It stores no files.
+- Treat every key and password in any backup of that router as exposed: VPN keys, Wi-Fi keys, the
+  root password, SSH keys. Replace them on the reset router rather than restore them.
+- After a restore, read every file the startup/login warning names before you reboot.
+- A missing warning is not evidence that the router is clean. The marker check knows two paths, and
+  the flagged list covers only the paths named above.
+
 ## Restoring Across Firmware Versions
 
 One tested data point so far: a Full archive created on a GL-MT3000 running firmware 4.9.0 (beta4) was restored onto the same unit after a clean flash to 4.11.0 (beta1), with GL's "Keep Settings" off. Every item checked came back: LAN/guest/IoT subnets, Wi-Fi SSIDs and passwords, WireGuard and OpenVPN client profiles, ZeroTier and Tailscale node identities, GoodCloud binding, hostname, DNS settings, WAN MAC mode, IPv6 mode, deleted default DHCP domains, and DDNS re-registration.
