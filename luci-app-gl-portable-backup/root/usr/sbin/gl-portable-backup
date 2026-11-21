@@ -601,20 +601,120 @@ capture_api() {   # sid module method outfile
     echo "  WARNING: $2.$3: ${msg:-$(printf '%s' "$reply" | head -c 120)}" >&2
 }
 
+# Commit a stripped copy of a stored JSON reply: FILE is replaced by TMP only when TMP still parses.
+# A strip that changed nothing is not a failure even when the reply was never valid JSON; a strip
+# that would leave the reply unreadable keeps the reply as captured, says so, and returns 2 so the
+# caller records the file as one an address may remain in.
+json_strip_commit() {   # file tmp
+    if cmp -s "$1" "$2"; then rm -f "$2"; return 0; fi
+    if jsonfilter -i "$2" -e '@' >/dev/null 2>&1; then mv "$2" "$1"; return 0; fi
+    rm -f "$2"
+    echo "  WARNING: removing a hardware address from $(basename "$1") would have left it unreadable; the file was kept as captured" >&2
+    return 2
+}
+
 # Remove every "FIELD":"value" pair (string values without quotes) from a stored JSON reply,
 # together with exactly one adjacent comma, so the result is valid JSON whether the field is
 # first, middle, last or alone in its object. Whitespace around the colon and comma is allowed.
 # Newlines become spaces first so a comma on the neighbouring line is still adjacent. FIELD is
 # used as written inside a sed pattern: call it with plain names only. A missing file is a no-op.
+# A value holding a backslash (an escaped quote above all) is not matched, so the pattern can never
+# stop inside it; such a pair stays, and the caller's verify pass reports any address left.
+# Returns 2, keeping the file, when the result would not parse (json_strip_commit).
 strip_json_string_field() {   # file field
     local tmp
     [ -f "$1" ] || return 0
     tmp="$1.strip.$$"
     tr '\n' ' ' < "$1" | sed \
-        -e 's/[ ]*,[ ]*"'"$2"'"[ ]*:[ ]*"[^"]*"//g' \
-        -e 's/"'"$2"'"[ ]*:[ ]*"[^"]*"[ ]*,[ ]*//g' \
-        -e 's/"'"$2"'"[ ]*:[ ]*"[^"]*"//g' > "$tmp" || { rm -f "$tmp"; return 1; }
-    mv "$tmp" "$1"
+        -e 's/[ ]*,[ ]*"'"$2"'"[ ]*:[ ]*"[^"\\]*"//g' \
+        -e 's/"'"$2"'"[ ]*:[ ]*"[^"\\]*"[ ]*,[ ]*//g' \
+        -e 's/"'"$2"'"[ ]*:[ ]*"[^"\\]*"//g' > "$tmp" || { rm -f "$tmp"; return 1; }
+    json_strip_commit "$1" "$tmp"
+}
+
+# MAC address shape in basic regex, as BusyBox grep and sed accept it.
+MAC_BRE='[0-9A-Fa-f][0-9A-Fa-f]\(:[0-9A-Fa-f][0-9A-Fa-f]\)\{5\}'
+
+# Remove every "<any field>":"VALUE" pair whose value is the MAC address VALUE, in either letter
+# case, with one adjacent comma (the comma handling of strip_json_string_field). Inside a JSON
+# string every quote is escaped, so ":" followed by a quote cannot occur there and a value inside
+# another string is never taken for a pair. Returns 2, keeping the file, when the result would not
+# parse — a field name holding an escaped quote can cause that.
+strip_json_string_value() {   # file value
+    local tmp pat
+    [ -f "$1" ] || return 0
+    case "$2" in ''|*[!0-9A-Fa-f:]*) return 1 ;; esac
+    pat=$(printf '%s' "$2" | tr 'a-f' 'A-F' | sed 's/A/[Aa]/g; s/B/[Bb]/g; s/C/[Cc]/g; s/D/[Dd]/g; s/E/[Ee]/g; s/F/[Ff]/g')
+    tmp="$1.strip.$$"
+    tr '\n' ' ' < "$1" | sed \
+        -e 's/[ ]*,[ ]*"[^"]*"[ ]*:[ ]*"'"$pat"'"//g' \
+        -e 's/"[^"]*"[ ]*:[ ]*"'"$pat"'"[ ]*,[ ]*//g' \
+        -e 's/"[^"]*"[ ]*:[ ]*"'"$pat"'"//g' > "$tmp" || { rm -f "$tmp"; return 1; }
+    json_strip_commit "$1" "$tmp"
+}
+
+# The MAC-shaped string values of FIELD in a stored reply, one per line.
+json_mac_values() {   # file field
+    [ -f "$1" ] || return 0
+    tr '\n' ' ' < "$1" | grep -o "\"$2\"[ ]*:[ ]*\"$MAC_BRE\"" | grep -o "$MAC_BRE" || true
+}
+
+# Remove the source router's hardware addresses from every stored reply in DIR, by value: each
+# port's factory address (cable.get_ports_config "defmacaddr" — and so "macaddr" too when the port
+# is in the default MAC mode, where it equals the factory address), each radio's own address
+# (wifi.get_config "bssid") and every MAC-shaped value of /etc/board.json. An address the user set
+# that differs from the factory one is a setting and stays, as do DHCP reservations naming client
+# devices. A verify pass then looks for every collected address in every reply; a file still holding
+# one is named (never the value) and recorded. Sets PROFILE_IDENTITY_JSON to the two manifest lines.
+profile_strip_hardware_addresses() {   # apidir
+    local dir="$1" hw res mac f rc n_board n names checked=true residue_json
+    hw=$(mktemp) || die "cannot create a temporary file"
+    res=$(mktemp) || { rm -f "$hw"; die "cannot create a temporary file"; }
+    if [ -r "$ROOT/etc/board.json" ]; then
+        tr '\n' ' ' < "$ROOT/etc/board.json" | grep -o "$MAC_BRE" > "$hw.board" || true
+    else
+        : > "$hw.board"
+    fi
+    n_board=$(grep -c . "$hw.board") || n_board=0
+    { cat "$hw.board"
+      json_mac_values "$dir/cable.get_ports_config.json" defmacaddr
+      json_mac_values "$dir/wifi.get_config.json" bssid
+    } | tr 'a-f' 'A-F' | sort -u > "$hw"
+    rm -f "$hw.board"
+    if [ "$n_board" -eq 0 ]; then
+        checked=false
+        echo "  WARNING: hardware addresses could not be determined; this Profile archive was not checked for them" >&2
+    fi
+
+    rc=0; strip_json_string_field "$dir/wifi.get_config.json" bssid || rc=$?
+    [ "$rc" -eq 0 ] || basename "$dir/wifi.get_config.json" >> "$res"
+    rc=0; strip_json_string_field "$dir/cable.get_ports_config.json" defmacaddr || rc=$?
+    [ "$rc" -eq 0 ] || basename "$dir/cable.get_ports_config.json" >> "$res"
+    for f in "$dir"/*.json; do
+        [ -f "$f" ] || continue
+        while IFS= read -r mac; do
+            rc=0; strip_json_string_value "$f" "$mac" || rc=$?
+            [ "$rc" -eq 0 ] || basename "$f" >> "$res"
+        done < "$hw"
+    done
+    # Verify: no collected address may remain anywhere, in any letter case, even inside a longer value.
+    while IFS= read -r mac; do
+        for f in "$dir"/*.json; do
+            [ -f "$f" ] || continue
+            if grep -q -i -F "$mac" "$f"; then basename "$f" >> "$res"; fi
+        done
+    done < "$hw"
+    n=$(grep -c . "$hw") || n=0
+    names=$(sort -u "$res" | sed '/^$/d')
+    rm -f "$hw" "$res"
+    residue_json=""
+    if [ -n "$names" ]; then
+        echo "  WARNING: a hardware address could not be removed from $(printf '%s\n' "$names" | tr '\n' ',' | sed 's/,$//; s/,/, /g')" >&2
+        residue_json=$(printf '%s\n' "$names" | while IFS= read -r f; do printf '"%s", ' "$(json_escape "$f")"; done | sed 's/, $//')
+    fi
+    echo "  Removed this router's factory and radio addresses (${n} found) from the API captures, by value; an address you set that differs from the factory one, and DHCP reservations naming client devices, stay" >&2
+    PROFILE_IDENTITY_JSON="  \"identity_checked\": ${checked},
+  \"identity_residue\": [${residue_json}],"
 }
 
 # One file per call, named module.method.json (format 4). Format 3 named files after the setting
@@ -646,12 +746,9 @@ capture_profile() {
               repeater.get_saved_ap_list netmode.get_mode; do
         capture_api "$sid" "${mm%%.*}" "${mm#*.}" "$apidir/$mm.json"
     done
-    # Hardware addresses inside the stored replies: the radios' own BSSIDs (wifi.get_config) and
-    # each port's factory MAC (cable.get_ports_config "defmacaddr"). Deliberately NOT stripped:
-    # "macaddr" in cable.get_ports_config and repeater.get_saved_ap_list, which are the user's
-    # own MAC-mode settings (a cloned or randomised WAN or repeater address they configured).
-    strip_json_string_field "$apidir/wifi.get_config.json" bssid
-    strip_json_string_field "$apidir/cable.get_ports_config.json" defmacaddr
+    # Hardware addresses inside the stored replies are removed by value; see
+    # profile_strip_hardware_addresses for what goes and what stays.
+    profile_strip_hardware_addresses "$apidir"
 }
 
 # ─── Package Capture ───────────────────────────────────────────────────────────
@@ -906,6 +1003,7 @@ write_manifest() {
     local excluded="$5"
     local extra_files="$6"
     local suspect="${7:-}"
+    local identity="${8:-}"
 
     # The two free-text fields are the only ones a user or a hostname can put a quote or a
     # backslash into; unescaped, either ends the JSON string and leaves a manifest jsonfilter
@@ -933,6 +1031,7 @@ write_manifest() {
   "excluded_sections": [${excluded}],
   "extra_files": [${extra_files}],
   "suspect_markers": [${suspect}],
+${identity}
   "notes": "${notes}"
 }
 EOF
@@ -1108,7 +1207,7 @@ cmd_create() {
     fi
 
     # Write manifest
-    write_manifest "$archdir/manifest.json" "$mode" "$notes" "$sections" "$excluded" "$extra_files" "$suspect_json"
+    write_manifest "$archdir/manifest.json" "$mode" "$notes" "$sections" "$excluded" "$extra_files" "$suspect_json" "${PROFILE_IDENTITY_JSON:-}"
 
     # Write human-readable backup info and compatibility warning
     cat > "$archdir/backup-info.txt" <<INFOEOF

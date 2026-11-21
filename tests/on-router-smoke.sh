@@ -304,6 +304,24 @@ tar -xzOf "$pr" gl-portable-backup/api/wifi.get_config.json > "$D/profile.wifi" 
 [ "$wr" = 0 ] && [ -s "$D/profile.wifi" ] && ! grep -q -F '"bssid"' "$D/profile.wifi"; r=$?
 judge 'create profile: the stored wifi.get_config reply contains no "bssid"' "$r" \
     "tar rc=$wr bytes=$(wc -c < "$D/profile.wifi" 2>/dev/null)"
+# No hardware address of this router may remain in any stored reply: every MAC-shaped value of
+# /etc/board.json is looked for, in either letter case, in every api/ member. Counts only — no address
+# and no reply body is printed.
+tr '\n' ' ' < /etc/board.json | grep -o '[0-9A-Fa-f][0-9A-Fa-f]\(:[0-9A-Fa-f][0-9A-Fa-f]\)\{5\}' | tr 'a-f' 'A-F' | sort -u > "$D/board.macs"
+nb=$(grep -c . "$D/board.macs"); mkdir -p "$D/prx"; tar -xzf "$pr" -C "$D/prx" 2>/dev/null
+na=0; hits=0
+for f in "$D"/prx/gl-portable-backup/api/*.json; do
+    [ -f "$f" ] || continue; na=$((na + 1))
+    while IFS= read -r mac; do grep -q -i -F "$mac" "$f" && hits=$((hits + 1)); done < "$D/board.macs"
+done
+[ "$nb" -gt 0 ] && [ "$na" -gt 0 ] && [ "$hits" = 0 ]; r=$?
+judge 'create profile: no MAC-shaped value of /etc/board.json appears in any api/ member' "$r" \
+    "board.json addresses=$nb  api members=$na  address hits=$hits"
+idc=$(jsonfilter -e '@.identity_checked' < "$D/profile.insp" 2>/dev/null)
+idr=$(jsonfilter -e '@.identity_residue' < "$D/profile.insp" 2>/dev/null)
+[ "$idc" = true ] && [ "$(printf '%s' "$idr" | tr -d ' []')" = "" ]; r=$?
+judge 'inspect profile: identity_checked=true and identity_residue empty' "$r" "identity_checked=[$idc] residue entries=$(printf '%s' "$idr" | tr -cd ',' | wc -c)+"
+rm -rf "$D/prx"
 lanmem=$(grep -E '^gl-portable-backup/api/lan\.' "$D/profile.list" | tr '\n' ' ')
 [ "$profile_n" -gt 0 ] && [ -z "$lanmem" ]; r=$?
 judge 'create profile: no lan.* capture on this firmware (4.11 replaced lan with vlan_subnet)' "$r" \
