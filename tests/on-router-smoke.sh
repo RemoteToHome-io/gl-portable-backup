@@ -6,7 +6,8 @@
 # lint-the-instrument gate for a release: every applet the backend depends on is checked against a
 # known answer here, in both directions where a direction exists.
 #
-# Usage: tests/on-router-smoke.sh <router-ip> [user]     (key-based SSH; scp -O, no sftp on GL)
+# Usage: [GPB_SMOKE_SSH_PORT=<port>] tests/on-router-smoke.sh <router-ip> [user]
+#        (key-based SSH; scp -O, no sftp on GL; GPB_SMOKE_SSH_PORT defaults to 22)
 #
 # Writes a full log to tests/smoke-logs/smoke-<YYYYmmdd-HHMMSS>.log. That directory is git-ignored
 # and a log is never committed: it carries the target's hostname, archive names and fingerprints.
@@ -19,7 +20,7 @@
 # before and after and compared as the last check.
 set -u
 
-usage() { echo "usage: tests/on-router-smoke.sh <router-ip> [user]" >&2; exit 2; }
+usage() { echo "usage: [GPB_SMOKE_SSH_PORT=<port>] tests/on-router-smoke.sh <router-ip> [user]" >&2; exit 2; }
 [ $# -ge 1 ] || usage
 IP="$1"
 USER_="${2:-root}"
@@ -30,6 +31,9 @@ BACKEND="$HERE/luci-app-gl-portable-backup/root/usr/sbin/gl-portable-backup"
 [ -f "$BACKEND" ] || { echo "missing backend: $BACKEND" >&2; exit 2; }
 
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+# Every ssh call takes -p and every scp call -P from this one value.
+SSH_PORT="${GPB_SMOKE_SSH_PORT:-22}"
+case "$SSH_PORT" in ''|*[!0-9]*) echo "GPB_SMOKE_SSH_PORT must be a port number" >&2; exit 2 ;; esac
 REMOTE="$USER_@$IP"
 D=/tmp/gpb-smoke
 
@@ -364,6 +368,11 @@ cp /etc/board.json "$S/etc/board.json"
 cp /etc/glversion "$S/etc/glversion"
 cp /etc/openwrt_release "$S/etc/openwrt_release"
 printf 'Package: gpb-smoke-pkg\nStatus: install user installed\n' > "$S/usr/lib/opkg/status"
+# The incident check reads the synthetic root's /proc: one harmless process and an empty TCP table,
+# so the archive below is not made a record by a check that found nothing to read.
+mkdir -p "$S/proc/4243" "$S/proc/net"
+printf '%s\000' /usr/sbin/crond -f -c /etc/crontabs -l 5 > "$S/proc/4243/cmdline"
+head -n 1 /proc/net/tcp > "$S/proc/net/tcp"
 echo "config interface 'smoke'" > "$S/etc/config/network"
 echo '{"smoke":true}' > "$S/etc/config/cellular/x.json"
 echo 'smoke-not-a-certificate' > "$S/etc/config/gl_nas/y.pem"
@@ -434,6 +443,71 @@ judge 'synthetic: plain restore warns about the host keys (with the fingerprint)
 tgt2_md5=$(md5sum "$G2/etc/dropbear/dropbear_ed25519_host_key" | awk '{print $1}')
 [ "$tgt2_md5" = "$srckey_md5" ]; r=$?
 judge 'synthetic: plain restore installed the archive host key' "$r" "target2 md5=$tgt2_md5 source md5=$srckey_md5"
+
+echo "== j. incident check =="
+# ids_of FILE: the indicator ids of a check reply, space-separated (index by index, so no jsonfilter
+# wildcard support is assumed). The details are never printed: only the result and the ids.
+ids_of() {
+    local i=0 id acc=""
+    while id=$(jsonfilter -i "$1" -e "@.indicators[$i].id" 2>/dev/null); do acc="${acc:+$acc }$id"; i=$((i + 1)); done
+    printf '%s' "$acc"
+}
+sh "$GPB" check > "$D/chk.json" 2>"$D/chk.err"; r=$?
+res=$(jsonfilter -i "$D/chk.json" -e '@.result' 2>/dev/null)
+reb=$(jsonfilter -i "$D/chk.json" -e '@.rebooted_since_incident' 2>/dev/null)
+{ [ "$r" = 0 ] && { [ "$res" = none ] || [ "$res" = inconclusive ]; }; } || { [ "$r" = 3 ] && [ "$res" = indicators ]; }; r2=$?
+judge 'check on the live router: parseable JSON, none or inconclusive (exit 0) or indicators (exit 3)' "$r2" \
+    "rc=$r result=[${res:-<unreadable>}] ids=[$(ids_of "$D/chk.json")] rebooted_since_incident=[${reb:-<unreadable>}]"
+
+P="$D/planted"
+mkdir -p "$P/etc/config" "$P/tmp" "$P/usr/lib/opkg"
+cp /etc/board.json "$P/etc/board.json"; cp /etc/glversion "$P/etc/glversion"; cp /etc/openwrt_release "$P/etc/openwrt_release"
+printf 'Package: gpb-smoke-pkg\nStatus: install user installed\n' > "$P/usr/lib/opkg/status"
+echo "config interface 'smoke'" > "$P/etc/config/network"
+# The synthetic root's own /proc: one harmless process and the live table's header line, no rows.
+mkdir -p "$P/proc/4243" "$P/proc/net"
+printf '%s\000' /usr/sbin/crond -f -c /etc/crontabs -l 5 > "$P/proc/4243/cmdline"
+head -n 1 /proc/net/tcp > "$P/proc/net/tcp"
+printf '#!/bin/sh\necho "  PID USER       VSZ STAT COMMAND"\necho " 4242 root      1072 S    crond -i /tmp/.log"\n' > "$D/fakebin/ps"
+mkdir -p "$D/fakebin-quiet"
+printf '#!/bin/sh\necho "  PID USER       VSZ STAT COMMAND"\necho " 4243 root      1072 S    /usr/sbin/crond -f -c /etc/crontabs -l 5"\n' > "$D/fakebin-quiet/ps"
+chmod +x "$D/fakebin/ps" "$D/fakebin-quiet/ps"
+# The fake ps is first on PATH and also named by GPB_TEST_PS, so the check reads it whether or not
+# this BusyBox sh runs its own applet ahead of PATH.
+PATH="$D/fakebin-quiet:$PATH" GPB_TEST_PS="$D/fakebin-quiet/ps" GPB_ROOT="$P" sh "$GPB" check > "$D/chk0.json" 2>&1; r=$?
+[ "$r" = 0 ] && [ "$(jsonfilter -i "$D/chk0.json" -e '@.result' 2>/dev/null)" = none ]; r2=$?
+judge 'check on a synthetic root without plants: exit 0, result none' "$r2" "rc=$r ids=[$(ids_of "$D/chk0.json")]"
+mkfifo "$P/tmp/f"; mkdir -p "$P/etc/config/.gl" "$P/proc/4242"
+printf 'crond\000-i\000/tmp/.log\000' > "$P/proc/4242/cmdline"
+: > "$P/etc/mp_ip_mapping_info"
+# The mapping file counts only while multi-path tunnelling is off, read from the live uci.
+want="proc-crond-log tmp-fifo marker-dir"
+[ "$(uci -q get mptun.global.enable 2>/dev/null)" = 1 ] || want="$want mp-ip-mapping-file"
+PATH="$D/fakebin:$PATH" GPB_TEST_PS="$D/fakebin/ps" GPB_ROOT="$P" sh "$GPB" check > "$D/chk3.json" 2>&1; r=$?
+pids=$(ids_of "$D/chk3.json")
+[ "$r" = 3 ] && [ "$pids" = "$want" ]; r2=$?
+judge 'check on the planted synthetic root (/proc cmdline, fifo, marker, mapping file): exit 3 with the expected ids' "$r2" \
+    "rc=$r ids=[$pids] expected=[$want]"
+
+mkdir -p "$D/out-planted"
+parch=$(PATH="$D/fakebin:$PATH" GPB_TEST_PS="$D/fakebin/ps" GPB_ROOT="$P" sh "$GPB" create --mode full --output "$D/out-planted" 2>"$D/pl.err"); r=$?
+case "$parch" in *-COMPROMISED-*) pc=0 ;; *) pc=1 ;; esac
+[ "$r" = 0 ] && [ -f "$parch" ] && [ "$pc" = 0 ] && grep -q -F 'This backup is a RECORD ONLY.' "$D/pl.err"; r2=$?
+judge 'create in the planted state: a -COMPROMISED- archive and the record-only warning' "$r2" \
+    "rc=$r archive=$(basename "${parch:-<none>}")"
+PG="$D/tgt-planted"
+mkdir -p "$PG/etc/config"; cp /etc/board.json "$PG/etc/board.json"; cp /etc/glversion "$PG/etc/glversion"
+pbefore=$(find "$PG" | sort | md5sum)
+pout=$(GPB_ROOT="$PG" sh "$GPB" restore "$parch" 2>"$D/pr.err"); r=$?
+[ "$r" != 0 ] && grep -q -F 'It is a record only and is not restored' "$D/pr.err" \
+    && [ "$(find "$PG" | sort | md5sum)" = "$pbefore" ] && ! printf '%s' "$pout" | grep -q RESTORE_OK; r2=$?
+judge 'restore of the -COMPROMISED- archive into a scratch root is refused and writes nothing' "$r2" \
+    "rc=$r $(grep -F 'ERROR' "$D/pr.err" | head -c 120)"
+rr1=$(sh "$GPB" inspect "$parch" 2>/dev/null | jsonfilter -e '@.restore_refused' 2>/dev/null)
+rr0=$(sh "$GPB" inspect "$sarch" 2>/dev/null | jsonfilter -e '@.restore_refused' 2>/dev/null)
+[ "$rr1" = true ] && [ "$rr0" = false ]; r=$?
+judge 'inspect restore_refused: true for the record, false for the synthetic archive of section h' "$r" \
+    "record=[${rr1:-<absent>}] synthetic=[${rr0:-<absent>}]"
 
 echo "== i. self-update mechanisms (nothing installed) =="
 # Every primitive the updater relies on, against a known answer in both directions where one exists.
@@ -513,7 +587,7 @@ echo "passed=$pass failed=$fail"
 [ "$fail" = 0 ]
 REMOTE_DRIVER
 
-reach() { ssh $SSH_OPTS "$REMOTE" "mkdir -p $D/tmp" >/dev/null 2>&1; }
+reach() { ssh $SSH_OPTS -p "$SSH_PORT" "$REMOTE" "mkdir -p $D/tmp" >/dev/null 2>&1; }
 attempt=1
 while ! reach; do
     if [ "$attempt" -ge 3 ]; then
@@ -567,8 +641,8 @@ if command -v python3 >/dev/null 2>&1; then
 fi
 trap 'rm -rf "$TMP"; [ -n "${FAKE_PID:-}" ] && kill "$FAKE_PID" 2>/dev/null' EXIT INT TERM
 
-scp -O $SSH_OPTS "$BACKEND" "$REMOTE:$D/gl-portable-backup" >/dev/null || { echo "scp of the backend failed" >&2; exit 3; }
-scp -O $SSH_OPTS "$TMP/driver.sh" "$REMOTE:$D/driver.sh" >/dev/null || { echo "scp of the driver failed" >&2; exit 3; }
+scp -O $SSH_OPTS -P "$SSH_PORT" "$BACKEND" "$REMOTE:$D/gl-portable-backup" >/dev/null || { echo "scp of the backend failed" >&2; exit 3; }
+scp -O $SSH_OPTS -P "$SSH_PORT" "$TMP/driver.sh" "$REMOTE:$D/driver.sh" >/dev/null || { echo "scp of the driver failed" >&2; exit 3; }
 
 {
     echo "gl-portable-backup on-router smoke test"
@@ -577,7 +651,7 @@ scp -O $SSH_OPTS "$TMP/driver.sh" "$REMOTE:$D/driver.sh" >/dev/null || { echo "s
     echo
 } > "$LOG"
 
-ssh $SSH_OPTS -o ControlMaster=no -o ControlPath=none ${FAKE_URL:+-o ExitOnForwardFailure=yes -R 127.0.0.1:$FAKE_PORT:127.0.0.1:$FAKE_PORT} "$REMOTE" "GPB_FAKE='$FAKE_URL' sh $D/driver.sh" 2>&1 | tee -a "$LOG"
+ssh $SSH_OPTS -p "$SSH_PORT" -o ControlMaster=no -o ControlPath=none ${FAKE_URL:+-o ExitOnForwardFailure=yes -R 127.0.0.1:$FAKE_PORT:127.0.0.1:$FAKE_PORT} "$REMOTE" "GPB_FAKE='$FAKE_URL' sh $D/driver.sh" 2>&1 | tee -a "$LOG"
 
 summary=$(tail -n 1 "$LOG")
 echo "log: $LOG"

@@ -9,6 +9,7 @@
 #   gl-portable-backup restore [--keep-host-keys] ARCHIVE
 #   gl-portable-backup inspect ARCHIVE
 #   gl-portable-backup fingerprint ARCHIVE
+#   gl-portable-backup check
 #   gl-portable-backup -v|--verbose <command> ...   (prints each local API call; must come first)
 
 set -e
@@ -956,6 +957,256 @@ suspect_markers() {
     return 0
 }
 
+# ─── Incident Check ────────────────────────────────────────────────────────────
+
+# The indicators of the GL.iNet cloud incident of November 2026, as listed on 2026-11-21 by
+# https://github.com/RemoteToHome-io/gl-security-incident-2026 (README "Check a device",
+# docs/findings.md and docs/router-reverse-shell.md; GL.iNet's notice is the source of the crond
+# process and of the netstat warning). This function is the one place they are defined; add new ones
+# here. Each one found is appended to IC_FOUND as a line "<id><TAB><fixed detail text>". A detail is
+# fixed text and never a process's command line, a connection's address or a rule, which can carry
+# an address or a key.
+#   proc-crond-log       a process whose command line contains "crond -i" (GL.iNet's indicator)
+#   proc-remote-shell    a process whose command line holds mkfifo, "nc <IPv4> <port>", "/bin/sh -i"
+#                        or a bare "sh -i" argument. "sh -i" and "nc" must start a word or follow
+#                        one of / | ; & ( so that `ssh -i KEY HOST` and `bash -i` do not match while
+#                        the pipeline `...|/bin/sh -i 2>&1|nc ...` does.
+#   tmp-fifo             /tmp/f is a named pipe
+#   tmp-log              /tmp/.log exists, of any type
+#   netstat-replaced     a netstat that is neither a link to busybox nor identical to /rom. It is
+#                        read (readlink, cmp), never run: a replaced netstat starts the malware.
+#   marker-dir           /etc/config/.gl or /etc/glinet/.cache (the KVM firmware's cleanup list)
+#   boot-script-changed  /etc/init.d/urandom_seed or /lib/upgrade/keep.d/netifd differs from its /rom
+#                        copy (an unconfirmed report); no /rom copy, no entry
+#   nat-loopback-rule    the nat chain SDWAN_IP_MAPPING holds a DNAT of 127.0.0.1 to 127.0.0.1, the
+#                        rule the attack leaves (iptables -S and nft list ruleset; a missing tool is
+#                        neither an indicator nor an incomplete check)
+#   mp-ip-mapping-file   /etc/mp_ip_mapping_info was modified on or after 2026-11-20 00:00 UTC while
+#                        mptun.global.enable is not 1
+#   conn-attacker-range  a TCP connection to 170.39.226.0/24 in /proc/net/tcp (netstat is not used)
+#   udhcpc-user-changed  a file under /etc/udhcpc.user.d/ that differs from its /rom copy or has none
+#                        (an unconfirmed report)
+#   check-incomplete     something the check needs could not be read; an incomplete check is reported
+#                        as an indicator, never as none
+# Processes are read from /proc/<pid>/cmdline, whose command line is complete. Only when no cmdline
+# under /proc is readable does the check fall back to `ps w` and report check-incomplete: BusyBox
+# cuts `ps w` lines at the terminal width (132 columns read on a router), so a pattern in the tail of
+# a long command line is not seen there. This tool's own process, its parent (the shell of a person
+# running the check over SSH, whose command line can quote the patterns) and any process whose
+# command line contains this tool's name are left out. GPB_TEST_PS names a stand-in for ps in the
+# unit tests, where BusyBox sh would otherwise run its own applet ahead of the mock on PATH.
+# Also sets IC_UPTIME_SINCE (boot time, UTC ISO, or empty) and IC_REBOOTED (true|false|null): when
+# nothing is found but the router started after the attack window opened, the result is
+# "inconclusive", because the remote shell and its traces do not survive a restart.
+# Sets IC_RESULT (none|inconclusive|indicators), IC_FOUND and IC_AT (UTC ISO time).
+
+# Start of the attack window, 2026-11-20 20:48:00 UTC, in seconds since the epoch.
+IC_WINDOW_EPOCH=1795207680
+
+ic_add() {   # id detail — appends one line to IC_FOUND
+    IC_FOUND="${IC_FOUND}${1}$(printf '\t')${2}
+"
+}
+
+# Prints the command lines of the router's processes, NULs turned into spaces, one per line, leaving
+# out this tool's own process, its parent and any process running this tool. Returns 1 when no
+# cmdline under $ROOT/proc could be read.
+ic_proc_cmdlines() {
+    local d pid c n=0
+    for d in "$ROOT"/proc/[0-9]*; do
+        [ -r "$d/cmdline" ] || continue
+        pid=${d##*/}
+        case "$pid" in *[!0-9]*) continue ;; esac
+        c=$(tr '\000' ' ' < "$d/cmdline" 2>/dev/null) || continue
+        [ -n "$c" ] || continue
+        n=$((n + 1))
+        [ "$pid" = "$$" ] && continue
+        [ "$pid" = "${PPID:-}" ] && continue
+        case "$c" in *"$TOOL_NAME"*) continue ;; esac
+        printf '%s\n' "$c"
+    done
+    [ "$n" -gt 0 ]
+}
+
+# The same from `ps w` (the fallback): header, own process, parent and this tool's lines left out.
+ic_ps_cmdlines() {
+    local procs rc=0
+    procs=$("${GPB_TEST_PS:-ps}" w 2>/dev/null) || rc=$?
+    [ "$rc" -eq 0 ] && [ -n "$procs" ] || return 1
+    printf '%s\n' "$procs" | awk -v me="$$" -v parent="${PPID:-}" -v tool="$TOOL_NAME" \
+        '$1 != "PID" && $1 != me && $1 != parent && index($0, tool) == 0'
+    return 0
+}
+
+incident_check() {
+    local procs rc p t f ref now up boot
+    IC_FOUND=""
+    IC_AT=$(get_timestamp)
+
+    rc=0; procs=$(ic_proc_cmdlines) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        ic_add check-incomplete "no process command line could be read under /proc; the process list from ps was used, which can hide the end of a long command line"
+        rc=0; procs=$(ic_ps_cmdlines) || rc=$?
+        [ "$rc" -eq 0 ] || ic_add check-incomplete "the process list could not be read, so running processes were not checked"
+    fi
+    if [ -n "$procs" ]; then
+        if printf '%s\n' "$procs" | grep -q -F 'crond -i'; then
+            ic_add proc-crond-log "a process matching GL.iNet's published indicator (crond -i /tmp/.log) is running"
+        fi
+        if printf '%s\n' "$procs" | grep -q -E 'mkfifo|(^|[ /|;&(])nc [0-9]{1,3}(\.[0-9]{1,3}){3} [0-9]|(^|[ /|;&(])sh -i'; then
+            ic_add proc-remote-shell "a process matching the remote shell seen on GL-AXT1800 routers is running"
+        fi
+    fi
+
+    [ -p "$ROOT/tmp/f" ] && ic_add tmp-fifo "/tmp/f is a named pipe: the remote shell has run since the last boot"
+    if [ -e "$ROOT/tmp/.log" ] || [ -L "$ROOT/tmp/.log" ]; then ic_add tmp-log "/tmp/.log exists"; fi
+
+    for p in /bin/netstat /usr/bin/netstat /sbin/netstat /usr/sbin/netstat; do
+        [ -e "$ROOT$p" ] || [ -L "$ROOT$p" ] || continue
+        if [ -L "$ROOT$p" ]; then
+            t=$(readlink "$ROOT$p" 2>/dev/null) || t=""
+            [ "${t##*/}" = busybox ] && continue
+        elif [ -f "$ROOT/rom$p" ] && cmp -s "$ROOT$p" "$ROOT/rom$p"; then
+            continue
+        fi
+        ic_add netstat-replaced "netstat at $p is not the firmware's own"
+    done
+
+    for p in $(suspect_markers); do
+        ic_add marker-dir "$p exists (removed by the cleanup in GL.iNet's KVM firmware)"
+    done
+
+    for p in /etc/init.d/urandom_seed /lib/upgrade/keep.d/netifd; do
+        [ -e "$ROOT$p" ] && [ -e "$ROOT/rom$p" ] || continue
+        cmp -s "$ROOT$p" "$ROOT/rom$p" && continue
+        ic_add boot-script-changed "$p differs from the firmware's copy (named in an unconfirmed report)"
+    done
+
+    # The rule is matched in the tools' own listing; nothing from it is printed.
+    t=""
+    if command -v iptables >/dev/null 2>&1; then
+        if iptables -t nat -S SDWAN_IP_MAPPING 2>/dev/null \
+                | grep -q -E -e '-d 127\.0\.0\.1(/32)? .*-j DNAT .*--to-destination 127\.0\.0\.1([^0-9]|$)'; then t=1; fi
+    fi
+    if [ -z "$t" ] && command -v nft >/dev/null 2>&1; then
+        if nft list ruleset 2>/dev/null | awk '
+                /^[ \t]*chain SDWAN_IP_MAPPING[ \t]*\{/ { inchain = 1; next }
+                inchain && /^[ \t]*\}/ { inchain = 0; next }
+                inchain && /ip daddr 127\.0\.0\.1([^0-9]|$)/ && /dnat (ip )?to 127\.0\.0\.1([^0-9]|$)/ { found = 1 }
+                END { exit found ? 0 : 1 }'; then t=1; fi
+    fi
+    [ -n "$t" ] && ic_add nat-loopback-rule "a firewall rule left by the remote-shell attack is present (it stays after the shell is stopped, until a reboot)"
+
+    f="$ROOT/etc/mp_ip_mapping_info"
+    if [ -e "$f" ] && [ "$(uci -q get mptun.global.enable 2>/dev/null)" != 1 ]; then
+        # The reference is stamped one second before the window so that "on or after" is inclusive
+        # under find's strict -newer. BusyBox touch accepts this -d form (read on desktop BusyBox
+        # 1.36.1); where it does not, the indicator is reported without the date test.
+        ref=$(mktemp) || ref=""
+        if [ -n "$ref" ] && TZ=UTC0 touch -d '2026-11-19 23:59:59' "$ref" 2>/dev/null; then
+            if [ -n "$(find "$f" -newer "$ref" 2>/dev/null)" ]; then
+                ic_add mp-ip-mapping-file "/etc/mp_ip_mapping_info was written on or after 2026-11-20 although multi-path tunnelling is off (the only trace that survives a reboot)"
+            fi
+        else
+            ic_add mp-ip-mapping-file "/etc/mp_ip_mapping_info exists although multi-path tunnelling is off (date not checked)"
+        fi
+        [ -z "$ref" ] || rm -f "$ref"
+    fi
+
+    # rem_address is the third column: little-endian hex on little-endian routers (170.39.226.x reads
+    # xxE227AA), big-endian on big-endian ones (AA27E2xx).
+    if [ -r "$ROOT/proc/net/tcp" ]; then
+        if awk 'NR > 1 { a = toupper($3)
+                         if (a ~ /^[0-9A-F][0-9A-F]E227AA:/ || a ~ /^AA27E2[0-9A-F][0-9A-F]:/) found = 1 }
+                END { exit found ? 0 : 1 }' "$ROOT/proc/net/tcp"; then
+            ic_add conn-attacker-range "an open connection to the address range used in the remote-shell attack (170.39.226.0/24)"
+        fi
+    else
+        ic_add check-incomplete "the TCP connection table /proc/net/tcp could not be read"
+    fi
+
+    if [ -d "$ROOT/etc/udhcpc.user.d" ]; then
+        # The names are collected first: ic_add must run in this shell, not in a pipeline's subshell.
+        t=$(cd "$ROOT/etc/udhcpc.user.d" && find . ! -type d 2>/dev/null | sed 's|^\./||' | sort | while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            if [ -f "$ROOT/rom/etc/udhcpc.user.d/$p" ] && cmp -s "$p" "$ROOT/rom/etc/udhcpc.user.d/$p"; then continue; fi
+            printf '%s\n' "$p"
+        done) || t=""
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            ic_add udhcpc-user-changed "/etc/udhcpc.user.d/$(printf '%s' "$p" | tr -cd 'A-Za-z0-9._/-') differs from the firmware's copy or has none (named in an unconfirmed report)"
+        done <<UDHCPC_EOF
+$t
+UDHCPC_EOF
+    fi
+
+    # Boot time from the uptime counter and the clock; unknown when either cannot be read.
+    IC_UPTIME_SINCE=""; IC_REBOOTED=null
+    up=$(awk '{ printf "%d", $1 }' "$ROOT/proc/uptime" 2>/dev/null) || up=""
+    now=$(date -u +%s 2>/dev/null) || now=""
+    case "$up$now" in ''|*[!0-9]*) ;; *)
+        if [ -n "$up" ] && [ -n "$now" ]; then
+            boot=$((now - up))
+            IC_UPTIME_SINCE=$(date -u -d "@$boot" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || IC_UPTIME_SINCE=""
+            if [ "$boot" -gt "$IC_WINDOW_EPOCH" ]; then IC_REBOOTED=true; else IC_REBOOTED=false; fi
+        fi ;;
+    esac
+
+    if [ -n "$IC_FOUND" ]; then IC_RESULT=indicators
+    elif [ "$IC_REBOOTED" = true ]; then IC_RESULT=inconclusive
+    else IC_RESULT=none; fi
+    return 0
+}
+
+IC_NOTE_NONE="No known indicator was found. This does not show the router was never compromised: the known remote shell leaves no file and is gone after a reboot."
+IC_NOTE_INCONCLUSIVE="No known indicator was found, but this router has restarted since the attack window (from about 20:48 UTC on 2026-11-20). The remote shell and its traces do not survive a restart, so this check cannot clear it."
+IC_NOTE_FOUND="Indicators of the November 2026 GL.iNet cloud incident were found. Treat every key and password on this router as exposed."
+
+ic_note() {
+    case "$IC_RESULT" in
+        none) printf '%s' "$IC_NOTE_NONE" ;;
+        inconclusive) printf '%s' "$IC_NOTE_INCONCLUSIVE" ;;
+        *) printf '%s' "$IC_NOTE_FOUND" ;;
+    esac
+}
+
+# The ids of IC_FOUND as JSON strings separated by ", "; empty when there are none.
+ic_ids_json() {
+    printf '%s' "$IC_FOUND" | while IFS="$(printf '\t')" read -r id detail; do
+        [ -n "$id" ] && printf '"%s", ' "$(json_escape "$(printf '%s' "$id" | tr -cd ' -~')")"
+    done | sed 's/, $//'
+}
+
+# The fixed detail texts of IC_FOUND, one per line.
+ic_details() {
+    printf '%s' "$IC_FOUND" | while IFS="$(printf '\t')" read -r id detail; do
+        [ -n "$id" ] && printf '%s\n' "$detail"
+    done
+    return 0
+}
+
+# One line of JSON; exit 0 for none and inconclusive, 3 when an indicator was found (check-incomplete
+# included).
+cmd_check() {
+    local list gc since
+    incident_check
+    list=$(printf '%s' "$IC_FOUND" | while IFS="$(printf '\t')" read -r id detail; do
+        [ -n "$id" ] || continue
+        printf '{"id":"%s","detail":"%s"},' "$(json_escape "$(printf '%s' "$id" | tr -cd ' -~')")" \
+            "$(json_escape "$(printf '%s' "$detail" | tr -cd ' -~')")"
+    done | sed 's/,$//')
+    case "$(uci -q get gl-cloud.@cloud[0].enable 2>/dev/null)" in
+        1) gc=true ;;
+        0) gc=false ;;
+        *) gc=null ;;
+    esac
+    if [ -n "$IC_UPTIME_SINCE" ]; then since="\"$(json_escape "$IC_UPTIME_SINCE")\""; else since=null; fi
+    printf '{"result":"%s","indicators":[%s],"goodcloud_enabled":%s,"uptime_since":%s,"rebooted_since_incident":%s,"checked_at":"%s","note":"%s"}\n' \
+        "$IC_RESULT" "$list" "$gc" "$since" "$IC_REBOOTED" "$(json_escape "$IC_AT")" "$(json_escape "$(ic_note)")"
+    [ "$IC_RESULT" = indicators ] || return 0
+    exit 3
+}
+
 # True when $1, a path relative to the archive's extra/ directory (etc/...), is a file that runs at
 # boot or decides who may log in — the places a foothold persists. A directory member (trailing
 # slash) never matches; `*` in a case pattern also matches a slash, so nested files under the
@@ -1004,6 +1255,7 @@ write_manifest() {
     local extra_files="$6"
     local suspect="${7:-}"
     local identity="${8:-}"
+    local incident="${9:-}"
 
     # The two free-text fields are the only ones a user or a hostname can put a quote or a
     # backslash into; unescaped, either ends the JSON string and leaves a manifest jsonfilter
@@ -1031,6 +1283,7 @@ write_manifest() {
   "excluded_sections": [${excluded}],
   "extra_files": [${extra_files}],
   "suspect_markers": [${suspect}],
+${incident}
 ${identity}
   "notes": "${notes}"
 }
@@ -1098,17 +1351,27 @@ cmd_create() {
 
     echo "Creating ${mode} backup..." >&2
 
-    # Announced before capture and recorded in the manifest; the backup still runs. Nothing is
-    # printed when no marker is found, because their absence is not evidence of a clean router.
-    local markers suspect_json="" m
+    # The incident check runs before anything is captured and is recorded in the manifest. A backup
+    # taken while an indicator is present still completes — it is evidence and a settings reference —
+    # but it is named as a record and restore refuses it. "none" is never worded as a clean router:
+    # the known remote shell leaves no file and is gone after a reboot.
+    local markers suspect_json="" m compromised="" incident_json
+    incident_check
+    if [ "$IC_RESULT" = none ]; then
+        echo "  Incident check: no known indicator found (this does not show the router was never compromised)" >&2
+    elif [ "$IC_RESULT" = inconclusive ]; then
+        echo "WARNING: $IC_NOTE_INCONCLUSIVE" >&2
+    else
+        compromised="-COMPROMISED"
+        echo "WARNING: $IC_NOTE_FOUND" >&2
+        ic_details | while IFS= read -r m; do echo "  $m" >&2; done
+        echo "  This backup is a RECORD ONLY. gl-portable-backup will refuse to restore it: VPN keys and configurations, Wi-Fi keys, passwords and SSH keys from this router must be replaced, not restored." >&2
+        echo "  VPN client profiles and SSH client keys that this router held must also be revoked on the server they connect to." >&2
+    fi
+    incident_json="  \"incident_check\": {\"result\": \"${IC_RESULT}\", \"indicators\": [$(ic_ids_json)], \"checked_at\": \"$(json_escape "$IC_AT")\"},"
+    # suspect_markers stays in the manifest for archives read by 1.1.0.
     markers=$(suspect_markers)
     if [ -n "$markers" ]; then
-        echo "WARNING: this router has paths that the cleanup script in GL.iNet's KVM firmware removes after the 2026-11-20 incident. GL.iNet has published no such list for routers." >&2
-        printf '%s\n' "$markers" | while IFS= read -r m; do echo "  $m" >&2; done
-        echo "  A backup of a compromised router can carry the attacker's changes back. Prefer Profile mode. It stores no" >&2
-        echo "  files, but it still carries settings an attacker may have changed (DNS mode and hosts entries, port" >&2
-        echo "  forwards, WAN access, firewall rules, VPN client configurations): read those before restoring." >&2
-        echo "  Treat every key and password in any backup of this router as exposed." >&2
         suspect_json=$(printf '%s\n' "$markers" | while IFS= read -r m; do
             printf '"%s", ' "$(json_escape "$m")"
         done | sed 's/, $//')
@@ -1207,7 +1470,7 @@ cmd_create() {
     fi
 
     # Write manifest
-    write_manifest "$archdir/manifest.json" "$mode" "$notes" "$sections" "$excluded" "$extra_files" "$suspect_json" "${PROFILE_IDENTITY_JSON:-}"
+    write_manifest "$archdir/manifest.json" "$mode" "$notes" "$sections" "$excluded" "$extra_files" "$suspect_json" "${PROFILE_IDENTITY_JSON:-}" "$incident_json"
 
     # Write human-readable backup info and compatibility warning
     cat > "$archdir/backup-info.txt" <<INFOEOF
@@ -1236,7 +1499,7 @@ INFOEOF
 
     # Create archive
     local fw_short=$(get_fw_version | tr '.' '-')
-    output=$(resolve_output_path "$output" "gl-backup-${mode}-${hostname}-${model_short}-fw${fw_short}-${datestamp}.tar.gz")
+    output=$(resolve_output_path "$output" "gl-backup-${mode}${compromised}-${hostname}-${model_short}-fw${fw_short}-${datestamp}.tar.gz")
 
     tar -czf "$output" -C "$tmpdir" "${ARCHIVE_PREFIX}"
     echo "  Archive: $output" >&2
@@ -1244,6 +1507,32 @@ INFOEOF
     # Output the path (for LuCI to read)
     echo "$output"
 }
+
+# ─── Records-Only Archives ─────────────────────────────────────────────────────
+
+# archive_marked_compromised MANIFEST — whether restore refuses this archive as a record of a router
+# that showed indicators of compromise. One implementation, used by restore and by inspect.
+# Returns 0 (refused: incident_check.result is "indicators", or suspect_markers has an entry, which is
+# how 1.1.0 recorded its marker paths), 2 (refused: incident_check is present but its result is
+# none of "none", "inconclusive" and "indicators" — no version of this tool writes that), or 1
+# (restored: the result is "none" or "inconclusive", or the archive carries no incident check and no
+# marker). There is no override.
+archive_marked_compromised() {
+    local m="$1" res
+    if jsonfilter -i "$m" -e '@.suspect_markers[0]' >/dev/null 2>&1; then return 0; fi
+    if jsonfilter -i "$m" -e '@.incident_check' >/dev/null 2>&1; then
+        res=$(jsonfilter -i "$m" -e '@.incident_check.result' 2>/dev/null) || res=""
+        case "$res" in
+            none|inconclusive) return 1 ;;
+            indicators) return 0 ;;
+            *) return 2 ;;
+        esac
+    fi
+    return 1
+}
+
+# True when the manifest records an incident check at all (archives from 1.1.1 on).
+archive_has_incident_check() { jsonfilter -i "$1" -e '@.incident_check' >/dev/null 2>&1; }
 
 # ─── INSPECT ───────────────────────────────────────────────────────────────────
 
@@ -1300,22 +1589,26 @@ cmd_inspect() {
     fi
     # Files a restore writes that run at boot, control logins, or lie outside /etc, as a JSON array.
     # Every name is archive-controlled, so each goes through json_escape; an empty list is [].
+    # Whether restore would refuse this archive, from the same function restore uses.
+    local refused=false rrc=0
+    archive_marked_compromised "$manifest" || rrc=$?
+    [ "$rrc" -eq 1 ] || refused=true
     local startup_json
     startup_json=$(startup_login_members < "$tmpdir/listing" | while IFS= read -r f; do
         printf '"%s", ' "$(json_escape "$f")"
     done | sed 's/, $//')
 
     { sed '$d' "$manifest" | sed '$ s/$/,/'
-      printf '  "restores_ssh_host_keys": %s,\n  "restores_root_password": %s,\n  "startup_and_login_files": [%s]\n}\n' \
-          "$has_keys" "$has_shadow" "$startup_json"
+      printf '  "restores_ssh_host_keys": %s,\n  "restores_root_password": %s,\n  "startup_and_login_files": [%s],\n  "restore_refused": %s\n}\n' \
+          "$has_keys" "$has_shadow" "$startup_json" "$refused"
     } > "$tmpdir/out"
 
     # The keys must read back at the top level exactly as computed; a manifest that nests them inside
     # an object of its own, or leaves the output unparseable, is refused rather than shown.
     # Both sides go through jsonfilter, so its own output format is never assumed.
-    printf '{"k":%s,"p":%s,"v":[%s]}\n' "$has_keys" "$has_shadow" "$startup_json" > "$tmpdir/want"
+    printf '{"k":%s,"p":%s,"v":[%s],"r":%s}\n' "$has_keys" "$has_shadow" "$startup_json" "$refused" > "$tmpdir/want"
     local key want got
-    for key in restores_ssh_host_keys:k restores_root_password:p startup_and_login_files:v; do
+    for key in restores_ssh_host_keys:k restores_root_password:p startup_and_login_files:v restore_refused:r; do
         want=$(jsonfilter -i "$tmpdir/want" -e "@.${key#*:}" 2>/dev/null) || want="<unreadable>"
         got=$(jsonfilter -i "$tmpdir/out" -e "@.${key%%:*}" 2>/dev/null) || got="<absent>"
         [ "$got" = "$want" ] || die "Invalid archive: manifest.json is not in the layout this tool writes"
@@ -1393,6 +1686,17 @@ cmd_restore() {
     [ -f "$tmpdir/manifest.json" ] || die "Invalid archive: no manifest.json"
     manifest_layout_ok "$tmpdir/manifest.json" || die "Invalid archive: manifest.json is not in the layout this tool writes"
 
+    # A backup of a router that showed indicators of compromise is a record only. It is refused here,
+    # before anything is written, and there is no option that restores it anyway.
+    local refused=0
+    archive_marked_compromised "$tmpdir/manifest.json" || refused=$?
+    case "$refused" in
+        0) die "This archive was made on a router that showed indicators of compromise. It is a record only and is not restored: its VPN keys and configurations, passwords and keys must be replaced, not carried back. Nothing was changed." ;;
+        2) die "Invalid archive: its incident check is not in the form this tool writes. Nothing was changed." ;;
+    esac
+    archive_has_incident_check "$tmpdir/manifest.json" \
+        || echo "  Note: this archive carries no incident check (made by an older version)." >&2
+
     local mode=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.mode')
     local backup_model=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.source.model_id')
     local backup_fw=$(jsonfilter -i "$tmpdir/manifest.json" -e '@.source.firmware_version' 2>/dev/null)
@@ -1436,7 +1740,8 @@ cmd_restore() {
     fi
     # Files that run at boot or control logins are where an attacker's changes persist; a restore
     # of an archive from a router that may have been compromised brings them back with root's
-    # rights, so they are named before anything is written. Neither warning blocks the restore.
+    # rights, so they are named before anything is written. The warning does not block the restore;
+    # an archive whose manifest records indicators of compromise was refused above.
     local startup
     startup=$(if [ -d "$tmpdir/extra" ]; then (cd "$tmpdir" && find extra ! -type d); fi | startup_login_members)
     if [ -n "$startup" ]; then
@@ -1444,23 +1749,6 @@ cmd_restore() {
         printf '%s\n' "$startup" | while IFS= read -r f; do echo "  $f" >&2; done
         echo "  If the source router may have been compromised, inspect these before rebooting." >&2
     fi
-    local markers="" marker idx=0
-    while [ "$idx" -lt 64 ]; do
-        marker=$(jsonfilter -i "$tmpdir/manifest.json" -e "@.suspect_markers[$idx]" 2>/dev/null) || marker=""
-        [ -n "$marker" ] || break
-        # Archive-controlled text reaching the terminal: only a plain absolute path is printed, so a
-        # newline or an escape sequence in the value cannot forge a line of this tool's output.
-        case "$marker" in
-            /*) case "$marker" in *[!A-Za-z0-9._/-]*) marker="<unprintable entry>" ;; esac ;;
-            *) marker="<unprintable entry>" ;;
-        esac
-        markers="${markers:+$markers, }$marker"
-        idx=$((idx + 1))
-    done
-    if [ -n "$markers" ]; then
-        echo "WARNING: this archive was made on a router that had paths the cleanup script in GL.iNet's KVM firmware removes after the 2026-11-20 incident: $markers" >&2
-    fi
-
     case "$mode" in
         clone|remote-safe)
             restore_portable "$tmpdir" "$mode"
@@ -2357,6 +2645,10 @@ case "${1:-}" in
         shift
         cmd_fingerprint "$@"
         ;;
+    check)
+        shift
+        cmd_check "$@"
+        ;;
     packages)
         shift
         cmd_packages "$@"
@@ -2384,13 +2676,14 @@ case "${1:-}" in
         echo "${TOOL_NAME} ${VERSION}"
         ;;
     *)
-        echo "Usage: gl-portable-backup {create|restore|inspect|fingerprint|packages|install-package|update-check|update-start|update-install|update-status|version}" >&2
+        echo "Usage: gl-portable-backup {create|restore|inspect|fingerprint|check|packages|install-package|update-check|update-start|update-install|update-status|version}" >&2
         echo "" >&2
         echo "Commands:" >&2
         echo "  create           Create a backup archive" >&2
         echo "  restore          Restore from a backup archive [--keep-host-keys]" >&2
         echo "  inspect          Show manifest from a backup archive" >&2
         echo "  fingerprint      Show the SSH host-key fingerprint an archive would install" >&2
+        echo "  check            Look for indicators of the November 2026 GL.iNet cloud incident (JSON; exit 3 when found)" >&2
         echo "  packages         Compare archive packages vs this device" >&2
         echo "  install-package  Install a single package via opkg" >&2
         echo "  update-check     Report the installed and the newest stable release version (JSON)" >&2

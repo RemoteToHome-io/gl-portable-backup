@@ -9,6 +9,13 @@ T=$(mktemp -d) || exit 2
 [ -n "$T" ] || exit 2
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/root/etc/config" "$T/root/rom/etc" "$T/root/lib/upgrade/keep.d" "$T/root/usr/lib/oui-httpd/rpc"
+# A router's /proc as the incident check reads it: one harmless process and an empty TCP table.
+mkdir -p "$T/root/proc/1" "$T/root/proc/net"
+printf '/sbin/procd\000' > "$T/root/proc/1/cmdline"
+echo '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode' > "$T/root/proc/net/tcp"
+# The ps fallback reads the ps mock under every shell: BusyBox sh runs its own ps applet ahead of
+# PATH, so the mock is named explicitly (the backend honours GPB_TEST_PS).
+export GPB_TEST_PS="$HERE/tests/mocks/ps"
 export MOCK_CURL_LOG="$T/curl.log" MOCK_CURL_DIR="$T/curl" MOCK_UCI_FILE="$T/uci.txt" MOCK_UCI_LOG="$T/uci.log" MOCK_OPKG_CONFFILES="$T/conffiles.txt" MOCK_OPKG_AVAILABLE="$T/available.txt" MOCK_OPKG_STATUS="$T/opkg-status.txt" MOCK_OPKG_LOG="$T/opkg.log"
 mkdir -p "$MOCK_CURL_DIR/get"; : > "$MOCK_UCI_FILE"; : > "$MOCK_OPKG_CONFFILES"; : > "$MOCK_OPKG_AVAILABLE"; : > "$MOCK_OPKG_STATUS"; : > "$MOCK_OPKG_LOG"
 assert_eq() { [ "$1" = "$2" ] && return 0; echo "  assert_eq FAILED (${3:-}): expected [$2] got [$1]"; exit 1; }

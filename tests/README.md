@@ -1,9 +1,13 @@
 Run `tests/run.sh` to execute every `tests/unit/*.sh` (needs `dash` and `python3`; `node` for one optional JS check).
 
 `tests/mocks/` holds laptop-only stand-ins for the BusyBox applets the backend calls
-(`curl`, `jsonfilter`, `uci`, `opkg`, `dropbearkey`); `run.sh` puts them first on `PATH`.
+(`curl`, `jsonfilter`, `uci`, `opkg`, `dropbearkey`, `ps`, `iptables`, `nft`, and a `netstat` that
+leaves a marker file if it is ever run); `run.sh` puts them first on `PATH`. `lib.sh` gives the test root
+a synthetic `/proc` (one process's `cmdline` and an empty `net/tcp`) for the incident check, and names
+the `ps` mock in `GPB_TEST_PS`, because BusyBox `sh` runs its own `ps` applet ahead of `PATH`.
 
-`tests/on-router-smoke.sh <router-ip> [user]` reruns the target-sensitive checks on a real GL
+`tests/on-router-smoke.sh <router-ip> [user]` (set `GPB_SMOKE_SSH_PORT` for a router whose SSH
+server is not on port 22; every `ssh` and `scp` call uses it) reruns the target-sensitive checks on a real GL
 router from `/tmp` without installing anything: BusyBox applet known-answer lints, all four
 create modes against the live configuration, a forced auth failure, and a restore driven from a
 synthetic `GPB_ROOT` tree. It logs to `tests/smoke-logs/smoke-<date>.log`

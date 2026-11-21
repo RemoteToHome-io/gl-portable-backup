@@ -1,0 +1,4 @@
+#!/bin/sh
+# mock nft: prints $MOCK_NFT_FILE (nothing when unset) and exits 0, whatever the arguments.
+if [ -n "${MOCK_NFT_FILE:-}" ] && [ -f "$MOCK_NFT_FILE" ]; then cat "$MOCK_NFT_FILE"; fi
+exit 0

@@ -1,0 +1,5 @@
+#!/bin/sh
+# mock netstat: the tool must never run netstat (a replaced one starts the malware). Running this
+# leaves a marker file that the incident-check test asserts is absent.
+: > "${MOCK_NETSTAT_MARK:-/dev/null}"
+exit 0

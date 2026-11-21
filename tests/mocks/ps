@@ -1,0 +1,11 @@
+#!/bin/sh
+# mock ps (BusyBox `ps w` layout): prints $MOCK_PS_FILE, or two harmless lines when it is unset or
+# missing; "@SELF@" and "@PARENT@" in the file are replaced by $MOCK_PS_SELF and $MOCK_PS_PARENT. Exits ${MOCK_PS_RC:-0}.
+if [ -n "${MOCK_PS_FILE:-}" ] && [ -f "$MOCK_PS_FILE" ]; then
+    sed -e "s/@SELF@/${MOCK_PS_SELF:-0}/g" -e "s/@PARENT@/${MOCK_PS_PARENT:-0}/g" "$MOCK_PS_FILE"
+else
+    printf '%s\n' '  PID USER       VSZ STAT COMMAND' \
+        '    1 root      1500 S    /sbin/procd' \
+        ' 1234 root      1072 S    /usr/sbin/crond -f -c /etc/crontabs -l 5'
+fi
+exit "${MOCK_PS_RC:-0}"

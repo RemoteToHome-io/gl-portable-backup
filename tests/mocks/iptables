@@ -1,0 +1,4 @@
+#!/bin/sh
+# mock iptables: prints $MOCK_IPTABLES_FILE (nothing when unset) and exits 0, whatever the arguments.
+if [ -n "${MOCK_IPTABLES_FILE:-}" ] && [ -f "$MOCK_IPTABLES_FILE" ]; then cat "$MOCK_IPTABLES_FILE"; fi
+exit 0

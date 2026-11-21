@@ -1,8 +1,8 @@
 #!/bin/sh
 # Backups from a router that may be compromised: hidden entries under /etc/config are neither
 # captured nor restored, symlinks inside config/ are never restored, the marker paths are announced
-# at backup time and recorded in the manifest, and startup/login files are flagged at inspect and
-# restore time. Every warning here prints only when something is found, so each one is checked in
+# at backup time (as incident indicators since 1.1.1) and recorded in the manifest, an archive that
+# lists them is refused, and startup/login files are flagged at inspect and restore time. Every warning here prints only when something is found, so each one is checked in
 # both directions.
 . "$(dirname "$0")/../lib.sh"
 load_backend
@@ -43,11 +43,12 @@ assert_contains "$l1" "gl-portable-backup/config/network" "config/network captur
 assert_contains "$l1" "gl-portable-backup/config/sub/visible" "visible nested file captured"
 e1=$(cat "$T/e1")
 assert_contains "$e1" "  Skipped 3 hidden entries under /etc/config" "hidden count"
-assert_contains "$e1" "WARNING: this router has paths that the cleanup script in GL.iNet's KVM firmware removes after the 2026-11-20 incident. GL.iNet has published no such list for routers." "marker warning"
-assert_contains "$e1" "  /etc/config/.gl" "marker path named"
-assert_contains "$e1" "Prefer Profile mode" "marker advice"
-assert_contains "$e1" "port" "marker advice names what Profile still carries"
-assert_contains "$e1" "VPN client configurations): read those before restoring." "Profile is not presented as harmless"
+# 1.1.1: a marker path is one of the incident check's indicators; the 1.1.0 marker-only warning and
+# its "Prefer Profile mode" advice are replaced by the one record-only warning.
+assert_contains "$e1" "WARNING: Indicators of the November 2026 GL.iNet cloud incident were found." "incident warning"
+assert_contains "$e1" "  /etc/config/.gl exists (removed by the cleanup in GL.iNet's KVM firmware)" "marker path named"
+assert_contains "$e1" "This backup is a RECORD ONLY." "record-only line"
+not_contains "$e1" "Prefer Profile mode" "the old advice is gone"
 not_contains "$e1" "signs of" "the paths are not called signs of compromise"
 m1=$(manifest_of "$a1")
 printf '%s' "$m1" | jsonfilter -e '@.mode' >/dev/null || { echo "  manifest is not valid JSON: $m1"; exit 1; }
@@ -59,8 +60,9 @@ mkdir -p "$T/o1b"
 a1b=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode full --output "$T/o1b" 2>"$T/e1b"); rc=$?
 assert_eq "$rc" 0 "create exit code (no marker)"
 e1b=$(cat "$T/e1b")
-not_contains "$e1b" "WARNING: this router has paths" "no marker warning when none found"
-not_contains "$e1b" "compromise" "no compromise line of any kind when none found"
+not_contains "$e1b" "WARNING" "no warning when none found"
+not_contains "$e1b" "Indicators" "no indicator line when none found"
+assert_contains "$e1b" "  Incident check: no known indicator found (this does not show the router was never compromised)" "the none line, which never says clean"
 assert_contains "$e1b" "  Skipped 2 hidden entries under /etc/config" "hidden count (two left)"
 assert_eq "$(manifest_of "$a1b" | jsonfilter -e '@.suspect_markers')" '[]' "manifest suspect_markers empty"
 
@@ -77,7 +79,7 @@ mkdir -p "$T/o2"
 a2=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode clone --output "$T/o2" 2>"$T/e2"); rc=$?
 assert_eq "$rc" 0 "create exit code (clone, glinet cache)"
 e2=$(cat "$T/e2")
-assert_contains "$e2" "WARNING: this router has paths" "marker warning (clone)"
+assert_contains "$e2" "WARNING: Indicators of the November 2026 GL.iNet cloud incident were found." "incident warning (clone)"
 assert_contains "$e2" "  /etc/glinet/.cache" "glinet cache path named"
 not_contains "$e2" "/etc/config/.gl" "only the existing marker is named"
 assert_eq "$(manifest_of "$a2" | jsonfilter -e '@.suspect_markers')" '["/etc/glinet/.cache"]' "manifest suspect_markers (clone)"
@@ -88,7 +90,7 @@ printf '{"id":2,"jsonrpc":"2.0","result":{"sid":"S"}}' > "$MOCK_CURL_DIR/login.j
 mkdir -p "$T/o2p"
 a2p=$(sh -c '. "$0"; cmd_create "$@"' "$BACKEND" --mode profile --output "$T/o2p" 2>"$T/e2p"); rc=$?
 assert_eq "$rc" 0 "create exit code (profile, glinet cache)"
-assert_contains "$(cat "$T/e2p")" "  /etc/glinet/.cache" "marker warning (profile)"
+assert_contains "$(cat "$T/e2p")" "  /etc/glinet/.cache exists" "marker named (profile)"
 assert_eq "$(manifest_of "$a2p" | jsonfilter -e '@.suspect_markers')" '["/etc/glinet/.cache"]' "manifest suspect_markers (profile)"
 rm -rf "$R/etc/glinet"
 
@@ -171,7 +173,8 @@ assert_contains "$e5" "  /etc/crontabs/root" "startup warning names the root cro
 assert_contains "$e5" "  If the source router may have been compromised, inspect these before rebooting." "startup advice"
 not_contains "$e5" "2026-11-20 incident" "no compromise warning without markers"
 
-# The compromise warning comes from the manifest, before anything is written.
+# 1.1.1: an archive whose manifest lists marker paths (how 1.1.0 recorded them) is refused before
+# anything is written; the refusal names no marker value.
 cat > "$H/manifest.json" <<'JSON'
 {
   "format_version": 3,
@@ -183,17 +186,16 @@ JSON
 tar -czf "$T/marked.tar.gz" -C "$T/h" gl-portable-backup
 B6="$T/b6"; mkdir -p "$B6/etc/config"
 cp "$R/etc/board.json" "$B6/etc/board.json"; echo "4.11.0" > "$B6/etc/glversion"
-GPB_ROOT="$B6" sh -c '. "$0"; cmd_restore "$@"' "$BACKEND" "$T/marked.tar.gz" >/dev/null 2>"$T/e6"; rc=$?
-assert_eq "$rc" 0 "restore exit code (marked archive)"
+rc=0; GPB_ROOT="$B6" sh -c '. "$0"; cmd_restore "$@"' "$BACKEND" "$T/marked.tar.gz" >/dev/null 2>"$T/e6" || rc=$?
+[ "$rc" -ne 0 ] || { echo "  a marked archive was restored"; exit 1; }
 e6=$(cat "$T/e6")
-assert_contains "$e6" "WARNING: this archive was made on a router that had paths the cleanup script in GL.iNet's KVM firmware removes after the 2026-11-20 incident: /etc/config/.gl, /etc/glinet/.cache" "compromise warning"
-# "before anything is written": the warning precedes the first config write line.
-w=$(printf '%s\n' "$e6" | command grep -n -F 'removes after the 2026-11-20 incident' | cut -d: -f1)
-r=$(printf '%s\n' "$e6" | command grep -n -F 'Restored ' | head -n 1 | cut -d: -f1)
-[ -n "$w" ] && [ -n "$r" ] && [ "$w" -lt "$r" ] || { echo "  compromise warning not before the first write (warning line ${w:-?}, write line ${r:-?})"; exit 1; }
+assert_contains "$e6" "showed indicators of compromise. It is a record only and is not restored" "marked archive refused"
+not_contains "$e6" "Restored " "nothing written (marked)"
+assert_no_file "$B6/etc/rc.local"
+assert_no_file "$B6/etc/config/network"
 
-# A marker value that is not a plain absolute path is never printed raw: a newline in it would
-# otherwise forge a line of the tool's own output.
+# A marker value that is not a plain path never reaches the output: the archive is refused without
+# printing it, so a newline in it cannot forge a line of the tool's own output.
 cat > "$H/manifest.json" <<'JSON'
 {
   "format_version": 3,
@@ -205,12 +207,13 @@ JSON
 tar -czf "$T/forged.tar.gz" -C "$T/h" gl-portable-backup
 B7="$T/b7"; mkdir -p "$B7/etc/config"
 cp "$R/etc/board.json" "$B7/etc/board.json"; echo "4.11.0" > "$B7/etc/glversion"
-GPB_ROOT="$B7" sh -c '. "$0"; cmd_restore "$@"' "$BACKEND" "$T/forged.tar.gz" >/dev/null 2>"$T/e7"; rc=$?
-assert_eq "$rc" 0 "restore exit code (forged markers)"
+rc=0; GPB_ROOT="$B7" sh -c '. "$0"; cmd_restore "$@"' "$BACKEND" "$T/forged.tar.gz" >/dev/null 2>"$T/e7" || rc=$?
+[ "$rc" -ne 0 ] || { echo "  a forged-marker archive was restored"; exit 1; }
 e7=$(cat "$T/e7")
-assert_contains "$e7" "2026-11-20 incident: /etc/ok-path, <unprintable entry>, <unprintable entry>, <unprintable entry>" "only plain paths printed"
-assert_eq "$(printf '%s\n' "$e7" | command grep -c -F 'Restore complete.')" "1" "no forged line"
+assert_eq "$(printf '%s\n' "$e7" | command grep -c -F 'Restore complete.')" "0" "no forged line"
+not_contains "$e7" "/etc/ok-path" "marker values are not printed"
 printf '%s' "$e7" | command grep -q "$(printf '\033')" && { echo "  escape character reached stderr"; exit 1; }
+assert_no_file "$B7/etc/config/network"
 
 # ─── 6. a quote in a flagged path keeps the inspect output JSON (a backslash is refused) ─
 mkdir -p "$H/extra/etc/init.d"
