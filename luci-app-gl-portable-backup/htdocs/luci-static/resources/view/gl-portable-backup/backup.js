@@ -15,6 +15,12 @@ var BACKEND = '/usr/sbin/gl-portable-backup';
 /* Only release pages under the project are ever rendered as a link; the URL comes from the network. */
 var RELEASES_URL_PREFIX = 'https://github.com/RemoteToHome-io/gl-portable-backup/';
 
+/* The public record of the November 2026 GL.iNet cloud incident: a constant, never a URL from a reply. */
+var INCIDENT_URL = 'https://github.com/RemoteToHome-io/gl-security-incident-2026';
+
+/* The refusal the backend prints for an archive made on a router with indicators of compromise. */
+var REFUSAL_TEXT = 'This archive was made on a router that showed indicators of compromise. It is a record only and is not restored: its VPN keys and configurations, passwords and keys must be replaced, not carried back.';
+
 return view.extend({
 
 	handleCreate: function(ev) {
@@ -282,18 +288,9 @@ return view.extend({
 						_('Hardware identifiers will be preserved. WireGuard keys will need to be regenerated after restore.')));
 				}
 
-				bodyItems.push(E('div', { 'class': 'right' }, [
-					E('button', {
-						'class': 'btn',
-						'click': ui.createHandlerFn(this, function() {
-							return fs.remove('/tmp/gl-portable-restore.tar.gz').finally(ui.hideModal);
-						})
-					}, [ _('Cancel') ]), ' ',
-					E('button', {
-						'class': 'btn cbi-button-action important',
-						'click': ui.createHandlerFn(this, 'handleRestoreConfirm', btn)
-					}, [ _('Restore') ])
-				]));
+				this.renderRestoreActions(manifest, btn).forEach(function(node) {
+					bodyItems.push(node);
+				});
 
 				ui.showModal(_('Restore backup?'), bodyItems);
 
@@ -304,6 +301,31 @@ return view.extend({
 			.finally(L.bind(function(btn) {
 				btn.firstChild.data = _('Upload archive…');
 			}, this, btn));
+	},
+
+	/* The restore dialog's last nodes: Cancel and Restore, or — for an archive the backend's inspect
+	 * marks restore_refused (made on a router with indicators of compromise) — the refusal and Cancel
+	 * only. There is no way to restore such an archive from this page. */
+	renderRestoreActions: function(manifest, btn) {
+		var cancel = E('button', {
+			'class': 'btn',
+			'click': ui.createHandlerFn(this, function() {
+				return fs.remove('/tmp/gl-portable-restore.tar.gz').finally(ui.hideModal);
+			})
+		}, [ _('Cancel') ]);
+		if (manifest && manifest.restore_refused === true) {
+			return [
+				E('div', { 'class': 'alert-message danger' }, [ _(REFUSAL_TEXT) ]),
+				E('div', { 'class': 'right' }, [ cancel ])
+			];
+		}
+		return [ E('div', { 'class': 'right' }, [
+			cancel, ' ',
+			E('button', {
+				'class': 'btn cbi-button-action important',
+				'click': ui.createHandlerFn(this, 'handleRestoreConfirm', btn)
+			}, [ _('Restore') ])
+		]) ];
 	},
 
 	handleRestoreConfirm: function(btn, ev) {
@@ -729,10 +751,103 @@ return view.extend({
 		return !/(^|\/)\.\.?(\/|$)/.test(rest) && !/[\s\\]/.test(rest);
 	},
 
+	/* The backend's `check` reply: exit 0 (none, inconclusive) and 3 (indicators) are both replies.
+	 * Anything else, or a reply that does not parse or carries another result, is {result:'unknown'}. */
+	parseCheck: function(res) {
+		if (!res || (res.code !== 0 && res.code !== 3))
+			return { result: 'unknown' };
+		var st;
+		try { st = JSON.parse((res.stdout || '').trim()); } catch (e) { return { result: 'unknown' }; }
+		if (!st || (st.result !== 'none' && st.result !== 'inconclusive' && st.result !== 'indicators'))
+			return { result: 'unknown' };
+		if (!Array.isArray(st.indicators))
+			st.indicators = [];
+		return st;
+	},
+
 	load: function() {
-		return fs.exec(BACKEND, ['version']).then(L.bind(function(res) {
-			return { version: this.parseVersion(res.stdout) };
-		}, this)).catch(function() { return { version: 'unknown' }; });
+		return Promise.all([
+			fs.exec(BACKEND, ['version']).then(L.bind(function(res) {
+				return this.parseVersion(res.stdout);
+			}, this)).catch(function() { return 'unknown'; }),
+			fs.exec(BACKEND, ['check']).then(L.bind(function(res) {
+				return this.parseCheck(res);
+			}, this)).catch(function() { return { result: 'unknown' }; })
+		]).then(function(r) { return { version: r[0], check: r[1] }; });
+	},
+
+	/* The banner under the page title for one `check` reply. Every detail string came from the backend
+	 * and is an array child of E(); the link is the constant INCIDENT_URL. */
+	renderIncidentBanner: function(check) {
+		var link = E('a', { 'href': INCIDENT_URL, 'target': '_blank', 'rel': 'noopener noreferrer' },
+			[ _('What is known and how to recover') ]);
+		var gc = (check && check.goodcloud_enabled === true)
+			? E('p', {}, [ _('GoodCloud is switched on on this router.') ]) : '';
+		var result = check ? check.result : 'unknown';
+		if (result === 'indicators') {
+			var details = (Array.isArray(check.indicators) ? check.indicators : []).map(function(i) {
+				return E('li', {}, [ '' + ((i && i.detail) || (i && i.id) || '') ]);
+			});
+			return E('div', { 'class': 'alert-message danger' }, [
+				E('strong', {}, [ _('Indicators of the November 2026 GL.iNet cloud incident were found on this router') ]),
+				E('ul', { 'style': 'margin: 0.25em 0 0.5em 1.2em; padding: 0' }, details),
+				E('p', {}, [ _('Treat every key and password on this router as exposed and replace them: VPN keys and profiles (client and server), Wi-Fi passwords, the admin password, DDNS and cloud credentials, SSH keys. VPN client profiles and SSH client keys that this router held must also be revoked on the server they connect to. A backup made now is a record only; this plugin will refuse to restore it.') ]),
+				E('p', {}, [ link ])
+			]);
+		}
+		if (result === 'none') {
+			return E('div', { 'class': 'alert-message' }, [
+				E('p', {}, [ _('Incident check: no known indicator found on this router. This does not show it was never compromised: the known remote shell leaves no file and is gone after a reboot.') ]),
+				gc,
+				E('p', {}, [ link ])
+			]);
+		}
+		if (result === 'inconclusive') {
+			return E('div', { 'class': 'alert-message warning' }, [
+				E('p', {}, [ _('No known indicator was found, but this router has restarted since the attack window (from about 20:48 UTC on 2026-11-20). The remote shell and its traces do not survive a restart, so this check cannot clear it.') ]),
+				gc,
+				E('p', {}, [ link ])
+			]);
+		}
+		return E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The incident check could not be run.') ])
+		]);
+	},
+
+	/* The Backup Mode radios for one `check` reply. With no indicator found (none or inconclusive) Full
+	 * carries the "Security incident backup" tag and is pre-selected; with indicators a line above the
+	 * list says backups are records only; otherwise Clone is the default, as before. */
+	renderModeList: function(check) {
+		var result = check ? check.result : 'unknown';
+		var incident = (result === 'none' || result === 'inconclusive');
+		var nodes = [];
+		if (result === 'indicators')
+			nodes.push(E('p', { 'class': 'alert-message danger' },
+				[ _('Backups made now are records only and cannot be restored with this plugin.') ]));
+		var option = function(value, name, descr, extra) {
+			var input = { type: 'radio', name: 'backup_mode', value: value };
+			if (value === (incident ? 'full' : 'clone'))
+				input.checked = 'checked';
+			var children = [ E('input', input), ' ', E('strong', {}, [ name ]) ];
+			if (extra)
+				children.push(' ', extra);
+			children.push(' — ', descr);
+			return E('div', { 'style': 'margin-bottom: 0.5em' }, [ E('label', {}, children) ]);
+		};
+		var fullDescr = _('Complete raw backup including hardware IDs. For same-device disaster recovery only.');
+		var tag = null;
+		if (incident) {
+			fullDescr += ' ' + _('For the November 2026 incident: take this before you factory reset and install the fixed firmware, then restore it on the same router; read the files the restore dialog flags before rebooting.');
+			if (result === 'inconclusive')
+				fullDescr += ' ' + _('If you have any other reason to suspect this router, treat it as compromised.');
+			tag = E('span', { 'style': 'font-size: 85%; font-weight: bold; border: 1px solid currentColor; border-radius: 3px; padding: 0 0.3em' },
+				[ _('Security incident backup') ]);
+		}
+		nodes.push(option('clone', _('Clone'), _('Full configuration for same-model deployment. Strips hardware IDs, VPN keys and per-device identity (ZeroTier node secret, Tailscale state, TLS and SSH keys). Capture is tested; this mode\'s restore has not yet been run end to end on a router.')));
+		nodes.push(option('remote-safe', _('Remote-Safe'), _('Same as Clone, but preserves the ZeroTier, GoodCloud, Tailscale and SSH config files. Use when restoring a device you are connected to remotely. In this release the target\'s ZeroTier/Tailscale network and firewall sections are NOT preserved — re-enable those services after the restore — and this mode\'s restore has not yet been run end to end on a router.')));
+		nodes.push(option('profile', _('Profile'), _('Complete portable setup for a different GL.iNet model — Wi-Fi, LAN, DNS, firewall, VPN client tunnels and saved access points. Contains Wi-Fi passwords, VPN keys and credentials and saved AP passwords in cleartext; handle like a Full backup. Contains no GoodCloud binding, SSH keys or root password.')));
+		nodes.push(option('full', _('Full'), fullDescr, tag));
+		return nodes;
 	},
 
 	/* The Plugin section's body for one state (the update-check reply plus `installed` and `checked`).
@@ -863,10 +978,14 @@ return view.extend({
 
 	render: function(data) {
 		this.installedVersion = (data && data.version) || 'unknown';
+		this.incidentCheck = (data && data.check) || { result: 'unknown' };
 		var body = [];
 
 		/* ── Header ─────────────────────────────────────────────────── */
 		body.push(E('h2', {}, _('GL Portable Backup')));
+
+		/* ── Incident check banner, directly under the title ───────── */
+		body.push(this.renderIncidentBanner(this.incidentCheck));
 
 		/* ── Create Backup Section ──────────────────────────────────── */
 		body.push(E('div', { 'class': 'cbi-section' }, [
@@ -876,40 +995,7 @@ return view.extend({
 
 			E('div', { 'class': 'cbi-value', 'style': 'margin-bottom: 1em' }, [
 				E('label', { 'class': 'cbi-value-title' }, _('Backup Mode')),
-				E('div', { 'class': 'cbi-value-field' }, [
-
-					E('div', { 'style': 'margin-bottom: 0.5em' }, [
-						E('label', {}, [
-							E('input', { type: 'radio', name: 'backup_mode', value: 'clone', checked: 'checked' }),
-							' ', E('strong', {}, _('Clone')),
-							' — ', _('Full configuration for same-model deployment. Strips hardware IDs, VPN keys and per-device identity (ZeroTier node secret, Tailscale state, TLS and SSH keys). Capture is tested; this mode\'s restore has not yet been run end to end on a router.')
-						])
-					]),
-
-					E('div', { 'style': 'margin-bottom: 0.5em' }, [
-						E('label', {}, [
-							E('input', { type: 'radio', name: 'backup_mode', value: 'remote-safe' }),
-							' ', E('strong', {}, _('Remote-Safe')),
-							' — ', _('Same as Clone, but preserves the ZeroTier, GoodCloud, Tailscale and SSH config files. Use when restoring a device you are connected to remotely. In this release the target\'s ZeroTier/Tailscale network and firewall sections are NOT preserved — re-enable those services after the restore — and this mode\'s restore has not yet been run end to end on a router.')
-						])
-					]),
-
-					E('div', { 'style': 'margin-bottom: 0.5em' }, [
-						E('label', {}, [
-							E('input', { type: 'radio', name: 'backup_mode', value: 'profile' }),
-							' ', E('strong', {}, _('Profile')),
-							' — ', _('Complete portable setup for a different GL.iNet model — Wi-Fi, LAN, DNS, firewall, VPN client tunnels and saved access points. Contains Wi-Fi passwords, VPN keys and credentials and saved AP passwords in cleartext; handle like a Full backup. Contains no GoodCloud binding, SSH keys or root password.')
-						])
-					]),
-
-					E('div', { 'style': 'margin-bottom: 0.5em' }, [
-						E('label', {}, [
-							E('input', { type: 'radio', name: 'backup_mode', value: 'full' }),
-							' ', E('strong', {}, _('Full')),
-							' — ', _('Complete raw backup including hardware IDs. For same-device disaster recovery only.')
-						])
-					])
-				])
+				E('div', { 'class': 'cbi-value-field' }, this.renderModeList(this.incidentCheck))
 			]),
 
 			E('div', { 'class': 'cbi-value' }, [
