@@ -581,6 +581,22 @@ capture_api() {   # sid module method outfile
     echo "  WARNING: $2.$3: ${msg:-$(printf '%s' "$reply" | head -c 120)}" >&2
 }
 
+# Remove every "FIELD":"value" pair (string values without quotes) from a stored JSON reply,
+# together with exactly one adjacent comma, so the result is valid JSON whether the field is
+# first, middle, last or alone in its object. Whitespace around the colon and comma is allowed.
+# Newlines become spaces first so a comma on the neighbouring line is still adjacent. FIELD is
+# used as written inside a sed pattern: call it with plain names only. A missing file is a no-op.
+strip_json_string_field() {   # file field
+    local tmp
+    [ -f "$1" ] || return 0
+    tmp="$1.strip.$$"
+    tr '\n' ' ' < "$1" | sed \
+        -e 's/[ ]*,[ ]*"'"$2"'"[ ]*:[ ]*"[^"]*"//g' \
+        -e 's/"'"$2"'"[ ]*:[ ]*"[^"]*"[ ]*,[ ]*//g' \
+        -e 's/"'"$2"'"[ ]*:[ ]*"[^"]*"//g' > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$1"
+}
+
 # One file per call, named module.method.json (format 4). Format 3 named files after the setting
 # (wifi.json, dhcp_static_binds.json); restore reads either set — see api_file().
 capture_profile() {
@@ -601,14 +617,21 @@ capture_profile() {
     # credentials) and repeater.get_saved_ap_list (the passwords of access points this router has
     # joined) are captured on purpose — they are the setup being moved, and the archive is handled
     # like a Full backup. Device identity stays out: cloud.get_config (this individual device's
-    # GoodCloud binding) is deliberately absent from the list below.
+    # GoodCloud binding) is deliberately absent from the list below, and so is system.get_info,
+    # whose reply carries the serial number and the WAN MAC address.
     for mm in wifi.get_config dns.get_config dns.get_host firewall.get_rule_list firewall.get_port_forward_list \
-              firewall.get_wan_access system.get_timezone_config system.get_info led.get_config ipv6.get_ipv6 \
+              firewall.get_wan_access system.get_timezone_config led.get_config ipv6.get_ipv6 \
               cable.get_ports_config tailscale.get_config zerotier.get_config vpn-client.get_tunnel \
               vpn-client.get_all_config_list timer.get_wifi timer.get_led timer.get_reboot switch-button.get_config \
               repeater.get_saved_ap_list netmode.get_mode; do
         capture_api "$sid" "${mm%%.*}" "${mm#*.}" "$apidir/$mm.json"
     done
+    # Hardware addresses inside the stored replies: the radios' own BSSIDs (wifi.get_config) and
+    # each port's factory MAC (cable.get_ports_config "defmacaddr"). Deliberately NOT stripped:
+    # "macaddr" in cable.get_ports_config and repeater.get_saved_ap_list, which are the user's
+    # own MAC-mode settings (a cloned or randomised WAN or repeater address they configured).
+    strip_json_string_field "$apidir/wifi.get_config.json" bssid
+    strip_json_string_field "$apidir/cable.get_ports_config.json" defmacaddr
 }
 
 # ─── Package Capture ───────────────────────────────────────────────────────────
@@ -859,9 +882,13 @@ cmd_create() {
         done | sed 's/, $//')
     fi
 
-    # Always capture hardware identity
-    capture_hardware_ids "$archdir/hardware.json"
-    echo "  Captured hardware identity" >&2
+    # Hardware identity is recorded in every mode but Profile, which carries no device identity.
+    if [ "$mode" = "profile" ]; then
+        echo "  Profile mode: device identity (hardware IDs, serial) is not captured" >&2
+    else
+        capture_hardware_ids "$archdir/hardware.json"
+        echo "  Captured hardware identity" >&2
+    fi
 
     local sections=""
     local excluded=""

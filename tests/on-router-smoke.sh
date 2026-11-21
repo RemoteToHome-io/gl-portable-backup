@@ -288,18 +288,28 @@ fv=$(jsonfilter -e '@.format_version' < "$D/profile.insp" 2>/dev/null)
 judge 'inspect profile: format_version=4' "$r" "format_version=[$fv]"
 apis=$(sed -n 's|^gl-portable-backup/api/||p' "$D/profile.list" | sort | tr '\n' ' ')
 missing=""
-for want in vlan_subnet.get_subnets.json wifi.get_config.json dns.get_config.json system.get_info.json; do
+for want in vlan_subnet.get_subnets.json wifi.get_config.json dns.get_config.json; do
     case " $apis " in *" $want "*) ;; *) missing="$missing $want" ;; esac
 done
 [ -z "$missing" ]; r=$?
-judge 'create profile: the four required API captures are present' "$r" \
+judge 'create profile: the three required API captures are present' "$r" \
     "missing:${missing:- <none>}   captured: $apis"
+# Profile carries no device identity: no system.get_info reply, no hardware.json, and no radio
+# BSSID in the stored Wi-Fi reply (the member is read straight from the archive, never printed).
+idmem=$(grep -E '^gl-portable-backup/(hardware\.json$|api/system\.get_info\.json$)' "$D/profile.list" | tr '\n' ' ')
+[ "$profile_n" -gt 0 ] && [ -z "$idmem" ]; r=$?
+judge 'create profile: neither system.get_info nor hardware.json is in the archive' "$r" \
+    "listing lines=$profile_n   members: ${idmem:-<none>}"
+tar -xzOf "$pr" gl-portable-backup/api/wifi.get_config.json > "$D/profile.wifi" 2>/dev/null; wr=$?
+[ "$wr" = 0 ] && [ -s "$D/profile.wifi" ] && ! grep -q -F '"bssid"' "$D/profile.wifi"; r=$?
+judge 'create profile: the stored wifi.get_config reply contains no "bssid"' "$r" \
+    "tar rc=$wr bytes=$(wc -c < "$D/profile.wifi" 2>/dev/null)"
 lanmem=$(grep -E '^gl-portable-backup/api/lan\.' "$D/profile.list" | tr '\n' ' ')
 [ "$profile_n" -gt 0 ] && [ -z "$lanmem" ]; r=$?
 judge 'create profile: no lan.* capture on this firmware (4.11 replaced lan with vlan_subnet)' "$r" \
     "listing lines=$profile_n   members: ${lanmem:-<none>}"
 # The argument shape issue #1's B1 broke: gl_api WITH a params object. No capture call passes one,
-# so nothing above exercises it. system.get_info is a getter, so this stays read-only. The reply
+# so nothing above exercises it. system.get_info is a getter (not captured into the archive, see above), so this stays read-only. The reply
 # body is never printed — it carries the hostname and MAC addresses.
 cat > "$D/api4.sh" <<'EOS'
 GPB_LIB_ONLY=1 . "$1" || exit 9

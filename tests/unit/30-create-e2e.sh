@@ -47,6 +47,8 @@ esac
 assert_file "$archive"
 
 listing=$(tar -tzf "$archive")
+assert_contains "$listing" "gl-portable-backup/hardware.json" "full still carries hardware.json"
+assert_contains "$(cat "$T/err")" "Captured hardware identity" "full still reports it"
 assert_contains "$listing" "gl-portable-backup/extra/etc/userconf/a.conf" "user file captured"
 assert_contains "$listing" "gl-portable-backup/extra/etc/gl_crontabs/crontabs.d/user_job" "edited file captured"
 assert_contains "$listing" "gl-portable-backup/config/network" "config copied"
